@@ -1,0 +1,22 @@
+[package]
+name = "medi-ingest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Filesystem scanner + ffprobe metadata worker (subprocess, no libav FFI)."
+
+[dependencies]
+medi-core.workspace = true
+medi-db.workspace = true
+rusqlite.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+notify.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

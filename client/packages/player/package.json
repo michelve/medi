@@ -1,0 +1,6 @@
+{
+  "name": "@medi/player",
+  "version": "0.1.0",
+  "private": true,
+  "description": "react-native-video wrapper + raw remote-event overlay (useTVEventHandler). Phase 5."
+}

@@ -1,0 +1,12 @@
+{
+  "name": "@medi/tv",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Expo react-native-tvos app (appleTV + androidTV via CNG). Scaffolded in Phase 4.",
+  "dependencies": {
+    "@medi/api-client": "*",
+    "@medi/navigation": "*",
+    "@medi/player": "*",
+    "@medi/ui": "*"
+  }
+}

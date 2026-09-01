@@ -1,0 +1,18 @@
+[package]
+name = "medi-transcode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ffmpeg command builder: HWA vendor paths (QSV/NVENC/AMF), DV tone-map, HLS."
+
+[dependencies]
+medi-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

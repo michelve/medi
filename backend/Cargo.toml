@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Shared dependency versions. Individual crates opt in via `dep.workspace = true`.
+# Concrete features/usage land in each phase (see docs/.tasks/10..50).
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mvelis/medi"
+
+[workspace.dependencies]
+# async runtime + web
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors", "compression-full"] }
+
+# persistence
+rusqlite = { version = "0.32", features = ["bundled", "serde_json"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.25"
+refinery = { version = "0.8", features = ["rusqlite"] }
+
+# serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+figment = { version = "0.10", features = ["env"] }
+
+# caching
+moka = { version = "0.12", features = ["future"] }
+
+# opaque pagination cursors + ETag hashing
+base64 = "0.22"
+
+# fs watching
+notify = "6"
+
+# observability + errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+
+# dev / test
+tempfile = "3"
+
+# internal crates
+medi-core = { path = "crates/core" }
+medi-db = { path = "crates/db" }
+medi-ingest = { path = "crates/ingest" }
+medi-transcode = { path = "crates/transcode" }
+medi-assets = { path = "crates/assets" }

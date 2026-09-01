@@ -1,0 +1,13 @@
+[package]
+name = "medi-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared types (MediaProfile, DvProfile, HdrType), config, and errors for medi."
+
+[dependencies]
+serde.workspace = true
+figment.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "medi-assets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Off-peak worker: 720p preview hover clips + trickplay sprites, GPU-idle guarded."
+
+[dependencies]
+medi-core.workspace = true
+medi-db.workspace = true
+medi-transcode.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+# Scratch dirs for trickplay frame extraction (non-test: used in `trickplay::generate`).
+tempfile.workspace = true

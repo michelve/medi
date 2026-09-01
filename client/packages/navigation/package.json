@@ -1,0 +1,6 @@
+{
+  "name": "@medi/navigation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "react-tv-space-navigation setup: focus traps, guides, D-pad grids. Phase 4."
+}

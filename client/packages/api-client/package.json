@@ -1,0 +1,14 @@
+{
+  "name": "@medi/api-client",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Typed fetch client generated from docs/.tasks/02-api-contract.md. Phase 4.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2"
+  }
+}

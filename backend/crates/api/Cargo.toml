@@ -1,0 +1,40 @@
+[package]
+name = "medi-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "axum HTTP + HLS server: routers, DTOs, moka LRU response cache. The binary."
+
+[lib]
+name = "medi_api"
+path = "src/lib.rs"
+
+[[bin]]
+name = "medi"
+path = "src/main.rs"
+
+[dependencies]
+medi-core.workspace = true
+medi-db.workspace = true
+medi-ingest.workspace = true
+medi-transcode.workspace = true
+medi-assets.workspace = true
+
+rusqlite.workspace = true
+
+axum.workspace = true
+tokio.workspace = true
+tower = { workspace = true, features = ["util"] }
+tower-http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+moka.workspace = true
+base64.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+http-body-util = "0.1"
