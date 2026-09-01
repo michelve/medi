@@ -39,19 +39,25 @@ pub struct AssetWorkerConfig {
     /// How many pending files to pull per batch. Progress is checkpointed to the DB
     /// after each file, so a small batch keeps memory flat on a 10k-file backfill.
     pub batch_size: u32,
-    /// Trickplay format to produce (BIF is the `docs/.tasks/30` default).
+    /// Trickplay format to produce. Defaults to **tiled-JPG**: the medi TV client
+    /// (`@medi/player`, `docs/.tasks/50` Part A) renders scrub thumbnails by cropping a
+    /// cell out of a JPEG mosaic — it cannot parse the binary BIF index on-device — and
+    /// `GET /api/trickplay/:id/meta` only serves grid geometry for the tiled-JPG kind.
+    /// `docs/.tasks/30` allowed BIF as an option; it is still selectable here for a
+    /// Roku-style consumer, but the shipping client needs `TiledJpg`.
     pub trickplay_kind: TrickplayKind,
     /// Frame-sampling interval for trickplay sprites, ms.
     pub trickplay_interval_ms: i64,
 }
 
 impl AssetWorkerConfig {
-    /// A sensible default: BIF trickplay at the 10s interval, 32-file batches.
+    /// A sensible default: tiled-JPG trickplay at the 10s interval, 32-file batches.
+    /// Tiled-JPG (not BIF) so the TV client's scrub thumbnails work end-to-end.
     pub fn new(caps: HwCaps) -> Self {
         Self {
             caps,
             batch_size: 32,
-            trickplay_kind: TrickplayKind::Bif,
+            trickplay_kind: TrickplayKind::TiledJpg,
             trickplay_interval_ms: DEFAULT_INTERVAL_MS,
         }
     }

@@ -9,6 +9,7 @@ pub mod cache;
 pub mod cursor;
 pub mod dto;
 pub mod error;
+pub mod libraries;
 pub mod routes;
 pub mod state;
 

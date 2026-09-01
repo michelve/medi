@@ -11,3 +11,8 @@ serde.workspace = true
 figment.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+
+[dev-dependencies]
+# `figment::Jail` (used by the config tests to sandbox env vars) is gated behind
+# figment's `test` feature, which is not part of the runtime `env` feature set.
+figment = { version = "0.10", features = ["env", "test"] }

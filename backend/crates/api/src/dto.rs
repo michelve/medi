@@ -6,7 +6,7 @@
 //! differ from a raw row: the unified library card (which exposes a poster *URL*,
 //! not a stored path) and the stream decision envelope.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use medi_db::models::{LibraryCard, LibraryKind};
 
@@ -62,6 +62,72 @@ pub fn image_url(stored_path: String) -> String {
     format!("/api/images/{}", stored_path.trim_start_matches('/'))
 }
 
+/// Trickplay scrub-thumbnail metadata returned by `GET /api/trickplay/:file_id/meta`.
+///
+/// The sprite *image* is served separately as a static file (`/api/trickplay/<id>.jpg`);
+/// this envelope carries the grid geometry the client needs to crop the right cell out
+/// of the tiled-JPG mosaic while scrubbing (`docs/.tasks/50` Part A; the API contract's
+/// promised "sprite + metadata"). Only the **tiled-JPG** kind is representable here —
+/// a BIF asset has no client-croppable grid, so the handler returns `404` for it and
+/// the player falls back to a plain scrub bar.
+#[derive(Debug, Serialize)]
+pub struct TrickplayMeta {
+    pub file_id: i64,
+    /// Always `"tiled_jpg"` for a served meta (BIF is 404'd — see above).
+    pub kind: String,
+    /// Milliseconds between sampled frames (one tile per interval).
+    pub interval_ms: i64,
+    /// Width of a single thumbnail cell, px.
+    pub tile_w: i64,
+    /// Height of a single thumbnail cell, px.
+    pub tile_h: i64,
+    /// Columns in the mosaic.
+    pub cols: i64,
+    /// Rows in the mosaic.
+    pub rows: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Metadata enrichment (`docs/.tasks/60` Phase A) — refresh / matches / match
+// ---------------------------------------------------------------------------
+
+/// The result of `POST /api/movies/:id/refresh` — a forced re-enrichment.
+#[derive(Debug, Serialize)]
+pub struct RefreshResponse {
+    pub id: i64,
+    /// `"matched"` | `"unmatched"` | `"skipped"`.
+    pub outcome: &'static str,
+    /// The pinned provider token when matched (`tmdb:movie:603`), else `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+}
+
+/// One candidate in `GET /api/movies/:id/matches` — a provider result the client can pin
+/// via `POST /api/movies/:id/match`.
+#[derive(Debug, Serialize)]
+pub struct MatchCandidate {
+    /// Opaque provider token to pass back to `/match` (`tmdb:movie:603`, `imdb:tt…`).
+    pub provider_id: String,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub year: Option<i64>,
+    /// Match confidence in `[0,1]` (title similarity + year agreement).
+    pub score: f64,
+}
+
+/// `GET /api/movies/:id/matches` response: the candidate list, best-first.
+#[derive(Debug, Serialize)]
+pub struct MatchesResponse {
+    pub id: i64,
+    pub candidates: Vec<MatchCandidate>,
+}
+
+/// `POST /api/movies/:id/match` body: the provider token to pin, then re-enrich against.
+#[derive(Debug, Deserialize)]
+pub struct MatchRequest {
+    pub provider_id: String,
+}
+
 /// The playback decision returned by `GET /api/stream/:file_id`.
 ///
 /// `mode` is `"direct"` (client fetches `/api/direct/:file_id` with `Range`) or
@@ -75,4 +141,30 @@ pub struct StreamDecision {
     pub mode: &'static str,
     pub reason: &'static str,
     pub url: String,
+}
+
+// ---------------------------------------------------------------------------
+// Libraries (`docs/.tasks/60` Phase B) — request bodies
+// ---------------------------------------------------------------------------
+
+/// `POST /api/libraries` body: create a library with an initial folder set.
+#[derive(Debug, Deserialize)]
+pub struct CreateLibraryRequest {
+    pub name: String,
+    /// `"movie"` | `"series"`.
+    pub kind: String,
+    #[serde(default)]
+    pub folders: Vec<String>,
+}
+
+/// `PATCH /api/libraries/:id` body: rename and/or add/remove folders. All fields
+/// optional — a request may just rename, just add, or just remove.
+#[derive(Debug, Deserialize)]
+pub struct PatchLibraryRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub add_folders: Vec<String>,
+    #[serde(default)]
+    pub remove_folders: Vec<String>,
 }

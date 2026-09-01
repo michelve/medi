@@ -22,6 +22,10 @@ pub struct AppState {
     /// GPU-less host (software-only caps), so `/api/stream` always has a target.
     pub transcode: SessionManager,
     pub caps: Arc<HwCaps>,
+    /// Metadata enrichment context (`docs/.tasks/60` Phase A). `None` when no provider is
+    /// configured — the manual metadata endpoints (`refresh`/`matches`/`match`) then
+    /// return `501 not_implemented` instead of silently doing nothing.
+    pub enrich: Option<medi_metadata::EnrichContext>,
 }
 
 impl AppState {
@@ -38,6 +42,13 @@ impl AppState {
             config: Arc::new(config),
             transcode,
             caps: Arc::new(caps),
+            enrich: None,
         }
+    }
+
+    /// Attach the metadata enrichment context (built at boot from config).
+    pub fn with_enrichment(mut self, ctx: medi_metadata::EnrichContext) -> Self {
+        self.enrich = Some(ctx);
+        self
     }
 }

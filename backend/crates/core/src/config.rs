@@ -27,6 +27,20 @@ pub struct AppConfig {
     /// Max concurrent asset (preview/trickplay) ffmpeg jobs. Kept low so background
     /// asset generation stays subordinate to live transcodes (`docs/.tasks/30`).
     pub asset_max_concurrency: u32,
+
+    // --- Metadata enrichment (`docs/.tasks/60`) ---------------------------------
+    /// TMDB API key. Unset ⇒ the TMDB provider is unavailable and (if it is the
+    /// selected provider) enrichment is silently skipped — graceful degradation.
+    pub tmdb_api_key: Option<String>,
+    /// OMDb API key. Unset ⇒ the OMDb provider is unavailable.
+    pub omdb_api_key: Option<String>,
+    /// Which provider to use: `"tmdb"` (default) or `"omdb"`.
+    pub metadata_provider: String,
+    /// Master switch for enrichment. `false` ⇒ ingest behaves filename-only even with
+    /// a key configured.
+    pub metadata_enabled: bool,
+    /// Language tag passed to the provider (e.g. `"en-US"`) for overviews/titles.
+    pub metadata_language: String,
 }
 
 impl Default for AppConfig {
@@ -39,6 +53,11 @@ impl Default for AppConfig {
             offpeak_start_hour: 2,
             offpeak_end_hour: 6,
             asset_max_concurrency: 1,
+            tmdb_api_key: None,
+            omdb_api_key: None,
+            metadata_provider: "tmdb".to_string(),
+            metadata_enabled: true,
+            metadata_language: "en-US".to_string(),
         }
     }
 }
@@ -60,6 +79,11 @@ impl AppConfig {
     /// | `OFFPEAK_START_HOUR` | `offpeak_start_hour` | `2`              |
     /// | `OFFPEAK_END_HOUR`   | `offpeak_end_hour`   | `6`              |
     /// | `ASSET_MAX_CONCURRENCY` | `asset_max_concurrency` | `1`        |
+    /// | `TMDB_API_KEY`       | `tmdb_api_key`       | *(unset)*        |
+    /// | `OMDB_API_KEY`       | `omdb_api_key`       | *(unset)*        |
+    /// | `METADATA_PROVIDER`  | `metadata_provider`  | `tmdb`           |
+    /// | `METADATA_ENABLED`   | `metadata_enabled`   | `true`           |
+    /// | `METADATA_LANGUAGE`  | `metadata_language`  | `en-US`          |
     ///
     /// A `MEDI_`-prefixed form of each key is also accepted (e.g. `MEDI_BIND_ADDR`)
     /// so the vars can be namespaced when the container shares an environment.
@@ -74,6 +98,11 @@ impl AppConfig {
             "offpeak_start_hour",
             "offpeak_end_hour",
             "asset_max_concurrency",
+            "tmdb_api_key",
+            "omdb_api_key",
+            "metadata_provider",
+            "metadata_enabled",
+            "metadata_language",
         ];
 
         Figment::new()
@@ -128,6 +157,18 @@ impl AppConfig {
     pub fn images_dir(&self) -> PathBuf {
         self.config_dir.join("images")
     }
+
+    /// The API key for the currently-selected [`Self::metadata_provider`], if one is
+    /// configured. `None` here means "no provider available" ⇒ enrichment is skipped
+    /// (graceful degradation, `docs/.tasks/60` §Requirements).
+    pub fn active_metadata_key(&self) -> Option<&str> {
+        match self.metadata_provider.to_ascii_lowercase().as_str() {
+            "omdb" => self.omdb_api_key.as_deref(),
+            // Default/unknown ⇒ TMDB (the documented default provider).
+            _ => self.tmdb_api_key.as_deref(),
+        }
+        .filter(|k| !k.is_empty())
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +184,32 @@ mod tests {
             assert_eq!(cfg.bind_addr, "0.0.0.0:8096");
             assert_eq!(cfg.db_pool_size, 8);
             assert_eq!(cfg.asset_max_concurrency, 1);
+            // Metadata defaults: provider tmdb, enabled, en-US, no keys.
+            assert_eq!(cfg.metadata_provider, "tmdb");
+            assert!(cfg.metadata_enabled);
+            assert_eq!(cfg.metadata_language, "en-US");
+            assert!(cfg.tmdb_api_key.is_none());
+            assert!(cfg.active_metadata_key().is_none(), "no key ⇒ enrichment off");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn metadata_env_keys_load() {
+        figment::Jail::expect_with(|jail| {
+            jail.set_env("TMDB_API_KEY", "tmdb-secret");
+            jail.set_env("OMDB_API_KEY", "omdb-secret");
+            jail.set_env("METADATA_PROVIDER", "omdb");
+            jail.set_env("METADATA_ENABLED", "false");
+            jail.set_env("METADATA_LANGUAGE", "fr-FR");
+
+            let cfg = AppConfig::from_env().expect("env extract");
+            assert_eq!(cfg.tmdb_api_key.as_deref(), Some("tmdb-secret"));
+            assert_eq!(cfg.metadata_provider, "omdb");
+            assert!(!cfg.metadata_enabled);
+            assert_eq!(cfg.metadata_language, "fr-FR");
+            // active key follows the selected provider.
+            assert_eq!(cfg.active_metadata_key(), Some("omdb-secret"));
             Ok(())
         });
     }

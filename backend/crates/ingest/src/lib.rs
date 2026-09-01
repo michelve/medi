@@ -20,9 +20,11 @@
 //! # Ok(()) }
 //! ```
 
+pub mod enrich;
 pub mod ffprobe;
 pub mod scanner;
 pub mod worker;
 
-pub use scanner::{scan, Classification, DiscoveredFile};
+pub use enrich::run_enrichment;
+pub use scanner::{scan, scan_root, Classification, DiscoveredFile, KindHint};
 pub use worker::{run_scan, watch, Invalidator, WorkerConfig};

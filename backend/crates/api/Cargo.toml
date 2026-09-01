@@ -20,6 +20,7 @@ medi-db.workspace = true
 medi-ingest.workspace = true
 medi-transcode.workspace = true
 medi-assets.workspace = true
+medi-metadata.workspace = true
 
 rusqlite.workspace = true
 

@@ -57,6 +57,13 @@ export type LibrarySort = 'sort_title' | 'added_at';
 // alongside `media_files` / `seasons` / `credits`.
 // ---------------------------------------------------------------------------
 
+/**
+ * Metadata match lifecycle on a `movies`/`series` row (`docs/.tasks/60`).
+ * `pending` → not yet enriched, `matched` → provider details written,
+ * `unmatched` → no candidate cleared the threshold, `failed` → provider error.
+ */
+export type MetadataState = 'pending' | 'matched' | 'unmatched' | 'failed';
+
 /** A row of `movies` (also the flattened head of `MovieDetail`). */
 export interface Movie {
   id: number;
@@ -67,6 +74,12 @@ export interface Movie {
   added_at: number;
   poster_path: string | null;
   backdrop_path: string | null;
+  /** External ids + match state (Phase A, `docs/.tasks/60`). */
+  tmdb_id?: number | null;
+  imdb_id?: string | null;
+  metadata_state?: MetadataState;
+  /** Owning library (Phase B). Null until scoped. */
+  library_id?: number | null;
 }
 
 /** A row of `series` (also the flattened head of `SeriesDetail`). */
@@ -79,6 +92,10 @@ export interface Series {
   added_at: number;
   poster_path: string | null;
   backdrop_path: string | null;
+  tmdb_id?: number | null;
+  imdb_id?: string | null;
+  metadata_state?: MetadataState;
+  library_id?: number | null;
 }
 
 export interface Season {
@@ -170,6 +187,69 @@ export interface StreamHints {
   dv?: boolean;
   /** Explicitly request an SDR result. */
   sdr?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Metadata enrichment (Phase A, `docs/.tasks/60`)
+// ---------------------------------------------------------------------------
+
+/** Outcome of a refresh / match request. */
+export type EnrichOutcome = 'matched' | 'unmatched' | 'skipped';
+
+/**
+ * `POST /api/movies/:id/refresh` and `POST /api/movies/:id/match` response.
+ * `provider_id` is the pinned provider token (`tmdb:movie:603`) when matched.
+ */
+export interface RefreshResponse {
+  id: number;
+  outcome: EnrichOutcome;
+  provider_id?: string;
+}
+
+/** One candidate from `GET /api/movies/:id/matches`. */
+export interface MatchCandidate {
+  /** Opaque provider token to pass to `POST /api/movies/:id/match`. */
+  provider_id: string;
+  title: string;
+  year?: number;
+  /** Match confidence in `[0,1]`. */
+  score: number;
+}
+
+/** `GET /api/movies/:id/matches` response (candidates, best-first). */
+export interface MatchesResponse {
+  id: number;
+  candidates: MatchCandidate[];
+}
+
+// ---------------------------------------------------------------------------
+// Libraries (Phase B, `docs/.tasks/60`)
+// ---------------------------------------------------------------------------
+
+/** A library's kind — matches the catalog `TitleKind`. */
+export type LibraryTypeKind = 'movie' | 'series';
+
+/** A library row with its folder paths (`GET /api/libraries`). */
+export interface Library {
+  id: number;
+  name: string;
+  kind: LibraryTypeKind;
+  created_at: number;
+  folders: string[];
+}
+
+/** `POST /api/libraries` body. */
+export interface CreateLibraryRequest {
+  name: string;
+  kind: LibraryTypeKind;
+  folders: string[];
+}
+
+/** `PATCH /api/libraries/:id` body — all fields optional. */
+export interface PatchLibraryRequest {
+  name?: string;
+  add_folders?: string[];
+  remove_folders?: string[];
 }
 
 /** Structured error body: `{ "error": { "code", "message" } }`. */

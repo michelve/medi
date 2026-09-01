@@ -115,6 +115,10 @@ CREATE TABLE media_files (
     -- decode-fallback flag: TRUE for formats HW cannot decode (e.g. H.264 High 10)
     hw_decode_unsupported     INTEGER NOT NULL DEFAULT 0,
     CHECK ( (movie_id IS NOT NULL) <> (episode_id IS NOT NULL) )
+    -- NOTE: audio is NOT stored here. A file has 1..N audio tracks (commentary, dubs,
+    -- lossless+lossy), so audio lives in the child `audio_streams` table added by
+    -- `V4__audio_streams.sql` (task `70-audio-quality-and-profiles.md`). media_files
+    -- stays the 1:1 home for the single primary VIDEO stream. Do not add audio columns here.
 );
 
 CREATE TABLE people (

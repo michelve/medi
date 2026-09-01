@@ -44,20 +44,47 @@ pub struct DiscoveredFile {
     pub mtime: i64,
     pub size_bytes: i64,
     pub class: Classification,
+    /// The library this file was found under (Phase B). `None` for a legacy single-root
+    /// scan; `Some(id)` when scanned via [`scan_root`] with a library root, so the worker
+    /// can scope the owning movie/series to that library.
+    pub library_id: Option<i64>,
 }
 
-/// Recursively collect every video file under `root`, classified and stat'd.
+/// A hint that forces classification when a library declares its `kind`, overriding the
+/// filename guess (`docs/.tasks/60` §Sub-tasks 10) — a stray `SxxEyy` in a Movies
+/// library stays a movie, matching Plex and removing a misclassification class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindHint {
+    /// Classify by filename (legacy single-root behavior).
+    Guess,
+    /// Force a movie regardless of episode markers.
+    Movie,
+    /// Force a series/episode; if no marker is present, treat the whole file as S01E01
+    /// of a series named from the file/folder (a loose episode in a TV library).
+    Series,
+}
+
+/// Recursively collect every video file under `root`, classified and stat'd, using
+/// filename-only classification and no library scoping (legacy single-root scan).
 ///
 /// Errors reading an individual directory or entry are logged and skipped rather than
 /// aborting the whole scan — one unreadable folder should not stop ingest. Returns the
 /// full set; the worker diffs each against `scan_state` to decide what to (re)probe.
 pub fn scan(root: &Path) -> Vec<DiscoveredFile> {
+    scan_root(root, None, KindHint::Guess)
+}
+
+/// Recursively collect every video file under `root`, tagging each with `library_id` and
+/// classifying under `hint` (`docs/.tasks/60` §Sub-tasks 10). The worker calls this once
+/// per library folder so a file is scoped to its library and the library `kind` overrides
+/// filename guessing.
+pub fn scan_root(root: &Path, library_id: Option<i64>, hint: KindHint) -> Vec<DiscoveredFile> {
     let mut out = Vec::new();
-    walk(root, &mut out);
+    walk(root, library_id, hint, &mut out);
     out
 }
 
-fn walk(dir: &Path, out: &mut Vec<DiscoveredFile>) {
+fn walk(dir: &Path, library_id: Option<i64>, hint: KindHint, out: &mut Vec<DiscoveredFile>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(err) => {
@@ -77,9 +104,9 @@ fn walk(dir: &Path, out: &mut Vec<DiscoveredFile>) {
         };
 
         if file_type.is_dir() {
-            walk(&path, out);
+            walk(&path, library_id, hint, out);
         } else if file_type.is_file() && is_video(&path) {
-            match discover(&path) {
+            match discover(&path, library_id, hint) {
                 Some(f) => out.push(f),
                 None => tracing::debug!(path = %path.display(), "could not stat file; skipping"),
             }
@@ -97,7 +124,7 @@ fn is_video(path: &Path) -> bool {
 
 /// Stat and classify one file into a [`DiscoveredFile`]. `None` if it cannot be
 /// stat'd (e.g. it vanished between the directory listing and here).
-fn discover(path: &Path) -> Option<DiscoveredFile> {
+fn discover(path: &Path, library_id: Option<i64>, hint: KindHint) -> Option<DiscoveredFile> {
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta
         .modified()
@@ -109,7 +136,8 @@ fn discover(path: &Path) -> Option<DiscoveredFile> {
         path: path.to_path_buf(),
         mtime,
         size_bytes: meta.len() as i64,
-        class: classify(path),
+        class: classify_with_hint(path, hint),
+        library_id,
     })
 }
 
@@ -132,6 +160,48 @@ pub fn classify(path: &Path) -> Classification {
 
     let (title, year) = parse_title_year(&stem);
     Classification::Movie { title, year }
+}
+
+/// Classify honoring a library [`KindHint`] (`docs/.tasks/60` §Sub-tasks 10). The library
+/// kind wins over the filename guess:
+/// - `Movie`: always a movie — an episode marker in a Movies library is ignored, and the
+///   whole `Title (YEAR)` is parsed from the filename.
+/// - `Series`: always an episode — if the filename has a marker it is used; if not, the
+///   file is treated as S01E01 of a series named from the file/folder (a loose episode).
+/// - `Guess`: the legacy filename-driven [`classify`].
+pub fn classify_with_hint(path: &Path, hint: KindHint) -> Classification {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    match hint {
+        KindHint::Guess => classify(path),
+        KindHint::Movie => {
+            let (title, year) = parse_title_year(&stem);
+            Classification::Movie { title, year }
+        }
+        KindHint::Series => {
+            // Prefer a real marker; otherwise synthesize S01E01 for a loose file so a TV
+            // library never silently drops a movie-named episode.
+            parse_episode(path, &stem).unwrap_or_else(|| {
+                let folder = show_folder_name(path).unwrap_or_default();
+                let (series_title, series_year) = if folder.trim().is_empty() {
+                    parse_title_year(&stem)
+                } else {
+                    parse_title_year(&folder)
+                };
+                Classification::Episode {
+                    series_title,
+                    series_year,
+                    season: 1,
+                    episode: 1,
+                    title: None,
+                }
+            })
+        }
+    }
 }
 
 /// Try to read a `SxxEyy`-style marker from the filename, falling back to the parent
@@ -349,8 +419,10 @@ fn clean_title(raw: &str) -> String {
         s.truncate(idx);
     }
 
-    // Drop a trailing dash used as a separator ("Show - " → "Show").
-    let s = s.trim().trim_end_matches('-').trim();
+    // Drop dashes used as separators on either end ("Show - " → "Show",
+    // " - Half Loop" → "Half Loop"). A dash here is always a leftover separator
+    // between the marker and the title, never meaningful.
+    let s = s.trim().trim_matches('-').trim();
 
     // Collapse internal whitespace.
     s.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -376,6 +448,44 @@ mod tests {
 
     fn classify_str(p: &str) -> Classification {
         classify(&PathBuf::from(p))
+    }
+
+    #[test]
+    fn movie_library_kind_overrides_stray_episode_marker() {
+        // A file with an SxxEyy marker in a *Movies* library stays a movie (Plex parity).
+        let c = classify_with_hint(
+            &PathBuf::from("/media/Movies/Weird S01E01 Title (2020).mkv"),
+            KindHint::Movie,
+        );
+        assert!(matches!(c, Classification::Movie { .. }), "movie hint forces a movie: {c:?}");
+    }
+
+    #[test]
+    fn series_library_kind_forces_episode_even_without_marker() {
+        // A movie-named file in a TV library becomes S01E01 of a series (no silent drop).
+        let c = classify_with_hint(
+            &PathBuf::from("/media/TV/Some Show/Pilot.mkv"),
+            KindHint::Series,
+        );
+        match c {
+            Classification::Episode { season, episode, series_title, .. } => {
+                assert_eq!((season, episode), (1, 1));
+                assert_eq!(series_title, "Some Show");
+            }
+            other => panic!("series hint must force an episode, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn series_hint_still_honors_a_real_marker() {
+        let c = classify_with_hint(
+            &PathBuf::from("/media/TV/Severance/Season 01/Severance S01E02 - Half Loop.mkv"),
+            KindHint::Series,
+        );
+        match c {
+            Classification::Episode { season, episode, .. } => assert_eq!((season, episode), (1, 2)),
+            other => panic!("expected episode, got {other:?}"),
+        }
     }
 
     #[test]

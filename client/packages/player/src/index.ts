@@ -1,15 +1,43 @@
 /**
  * `@medi/player` — Phase 5 (`docs/.tasks/50-phase5-playback-packaging.md`).
  *
- * This package will hold the full react-native-video wrapper and the custom
- * playback overlay driven by the low-level `useTVEventHandler` hook (README
- * §Video Playback and Overlay Integration — the overlay deliberately bypasses the
- * spatial-navigation focus engine to avoid Android TV focus thrashing), plus
- * trickplay-sprite scrubbing.
+ * Full-length TV playback: a react-native-video wrapper (`VideoScreen`) plus a
+ * custom transport overlay (`PlayerOverlay`) driven entirely by the low-level
+ * `useTVEventHandler` hook via `usePlayerControls` — the overlay deliberately
+ * bypasses the spatial-navigation focus engine to avoid Android TV focus
+ * thrashing / render lag (README §Video Playback and Overlay Integration).
  *
- * Phase 4 ships only the hover *preview* (`@medi/ui` `HoverPreview`), which uses
- * react-native-video directly for the silent 720p clip. Full-length playback is
- * intentionally deferred; this placeholder keeps the workspace resolvable.
+ * Direct-play and HLS are handled uniformly; the transcode-session-cap `409` is
+ * surfaced as a non-fatal notice. Timeline scrubbing renders trickplay thumbnails
+ * from the tiled-JPG mosaic (see `trickplay.ts` and the package README for the
+ * backend metadata endpoint this consumes).
+ *
+ * Phase 4 shipped only the hover *preview* (`@medi/ui` `HoverPreview`); this
+ * package is the full player it deferred.
  */
 
 export const PLAYER_PHASE = 5 as const;
+
+export { VideoScreen } from './VideoScreen';
+export type { VideoScreenProps, ResolvedStream } from './VideoScreen';
+
+export { PlayerOverlay } from './PlayerOverlay';
+export type { PlayerOverlayProps } from './PlayerOverlay';
+
+export {
+  usePlayerControls,
+  SEEK_STEP_MS,
+  HIDE_AFTER_MS,
+  SEEK_SETTLE_MS,
+} from './usePlayerControls';
+export type {
+  PlayerControls,
+  PlayerRemoteEvent,
+  UsePlayerControlsOptions,
+} from './usePlayerControls';
+
+export {
+  tileForPosition,
+  tileCount,
+} from './trickplay';
+export type { TrickplayMeta, TrickplayTile } from './trickplay';

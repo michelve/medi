@@ -1,0 +1,132 @@
+<?xml version="1.0"?>
+<!--
+  medi — Unraid Community Applications template (Phase 5, docs/.tasks/50).
+
+  Pre-configures hardware passthrough and volume mappings so a user never touches
+  the terminal: /dev/dri for Intel/AMD QSV/VA-API, the NVIDIA runtime knobs for
+  NVIDIA hosts, /config (RW appdata) and /media (Read-Only library).
+
+  NVIDIA users: set Extra Parameters to the nvidia runtime flag and keep
+  NVIDIA_VISIBLE_DEVICES=all (both explained in the Description tag below).
+  Intel/AMD users can remove the NVIDIA env if desired; the /dev/dri device is
+  what they need.
+-->
+<Container version="2">
+  <Name>medi</Name>
+  <Repository>ghcr.io/mvelis/medi:latest</Repository>
+  <Registry>https://github.com/mvelis/medi/pkgs/container/medi</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/mvelis/medi/issues</Support>
+  <Project>https://github.com/mvelis/medi</Project>
+
+  <Overview>medi is a self-hosted, hardware-accelerated media server for Unraid: a unified movie + TV library with a 10-foot TV client, Netflix-style hover previews, trickplay scrubbing, and on-the-fly HDR/Dolby Vision-aware transcoding via jellyfin-ffmpeg. Intel QSV and AMD VA-API run through /dev/dri; NVIDIA NVENC runs through the host NVIDIA container runtime. Point it at your movies share (mounted Read-Only) and browse from your TV.</Overview>
+
+  <Category>MediaApp:Video</Category>
+
+  <WebUI>http://[IP]:[PORT:8096]/</WebUI>
+  <Icon>https://raw.githubusercontent.com/mvelis/medi/main/unraid-templates/medi-icon.png</Icon>
+
+  <ExtraParams></ExtraParams>
+  <PostArgs></PostArgs>
+  <DonateText/>
+  <DonateLink/>
+
+  <Description>Self-hosted hardware-accelerated media server with a 10-foot TV client.
+
+INTEL / AMD (QSV / VA-API): keep the "/dev/dri" device mapping below. That is all that is required.
+
+NVIDIA (NVENC): set Extra Parameters to "--runtime=nvidia" (toggle Advanced View) and keep the "NVIDIA_VISIBLE_DEVICES=all" variable. You may remove the "/dev/dri" device if the host has no Intel/AMD GPU.
+
+Volumes: /config is read-write appdata (SQLite library, previews, trickplay, HLS cache). /media is your library, mounted READ-ONLY so no scanner/asset bug can ever touch your files.</Description>
+
+  <!-- Web UI / API port: container 8096 -> host port. -->
+  <Config Name="WebUI Port"
+          Target="8096"
+          Default="8096"
+          Mode="tcp"
+          Description="Web UI / REST API port."
+          Type="Port"
+          Display="always"
+          Required="true"
+          Mask="false">8096</Config>
+
+  <!-- Read-write appdata: SQLite DB + generated assets. -->
+  <Config Name="Appdata (/config)"
+          Target="/config"
+          Default="/mnt/user/appdata/medi"
+          Mode="rw"
+          Description="Read-write appdata: SQLite library, previews, trickplay sprites, HLS cache."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/medi</Config>
+
+  <!-- Read-only media library. RO protects the array from any scanner/asset bug. -->
+  <Config Name="Media Library (/media)"
+          Target="/media"
+          Default="/mnt/user/movies"
+          Mode="ro"
+          Description="Your movie/TV library, mounted READ-ONLY. Point this at your media share."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/movies</Config>
+
+  <!-- Intel/AMD GPU passthrough for QSV/VA-API (and OpenCL DV tone-mapping). -->
+  <Config Name="Intel/AMD GPU (/dev/dri)"
+          Target="/dev/dri"
+          Default="/dev/dri"
+          Mode=""
+          Description="Intel QSV / AMD VA-API render node. Required for Intel/AMD hardware transcoding; harmless to leave for NVIDIA-only hosts (remove if /dev/dri does not exist)."
+          Type="Device"
+          Display="always"
+          Required="false"
+          Mask="false">/dev/dri</Config>
+
+  <!-- NVIDIA: visible devices. Pair with the nvidia runtime in Extra Parameters. -->
+  <Config Name="NVIDIA_VISIBLE_DEVICES"
+          Target="NVIDIA_VISIBLE_DEVICES"
+          Default="all"
+          Mode=""
+          Description="NVIDIA GPUs to expose (NVIDIA hosts only). Also set Extra Parameters to '--runtime=nvidia'. Ignored on non-NVIDIA hosts."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">all</Config>
+
+  <!-- Bind address (rarely changed). -->
+  <Config Name="BIND_ADDR"
+          Target="BIND_ADDR"
+          Default="0.0.0.0:8096"
+          Mode=""
+          Description="Address:port the server binds inside the container. Keep the port matching the WebUI Port mapping."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">0.0.0.0:8096</Config>
+
+  <!-- Concurrent transcode session cap (host GPU capability). -->
+  <Config Name="MAX_TRANSCODES"
+          Target="MAX_TRANSCODES"
+          Default=""
+          Mode=""
+          Description="Optional: max concurrent transcode sessions. Leave blank for the auto default (iGPU ~4, discrete Arc/NVENC higher, software-only 1)."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false"></Config>
+
+  <!-- Log verbosity. -->
+  <Config Name="RUST_LOG"
+          Target="RUST_LOG"
+          Default="info"
+          Mode=""
+          Description="Log level (error|warn|info|debug|trace)."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">info</Config>
+</Container>

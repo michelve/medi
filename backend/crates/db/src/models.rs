@@ -221,6 +221,36 @@ pub struct Person {
     pub name: String,
 }
 
+/// A row of `libraries` (`docs/.tasks/60` Phase B).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Library {
+    pub id: i64,
+    pub name: String,
+    /// `"movie"` | `"series"`.
+    pub kind: String,
+    pub created_at: i64,
+}
+
+impl Library {
+    /// Column order: id, name, kind, created_at.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            kind: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    }
+}
+
+/// A library together with its folder paths — the shape `GET /api/libraries` returns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LibraryWithFolders {
+    #[serde(flatten)]
+    pub library: Library,
+    pub folders: Vec<String>,
+}
+
 /// A joined `credits` + `people` row (billing entry for a title).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credit {

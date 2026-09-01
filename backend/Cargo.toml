@@ -52,3 +52,4 @@ medi-db = { path = "crates/db" }
 medi-ingest = { path = "crates/ingest" }
 medi-transcode = { path = "crates/transcode" }
 medi-assets = { path = "crates/assets" }
+medi-metadata = { path = "crates/metadata" }

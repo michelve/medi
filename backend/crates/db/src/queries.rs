@@ -13,7 +13,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
     Credit, Episode, LibraryCard, MediaFile, Movie, MovieDetail, Season, SeasonWithEpisodes,
-    Series, SeriesDetail,
+    Series, SeriesDetail, TrickplayAsset,
 };
 use crate::{DbError, DbResult};
 
@@ -175,7 +175,7 @@ fn library_select(kind_tag: i64, table: &str, join_col: &str) -> String {
                         WHEN 'hdr10' THEN 2 WHEN 'hlg' THEN 1 ELSE 0 END ) \
                     WHEN 4 THEN 'dolbyvision' WHEN 3 THEN 'hdr10plus' \
                     WHEN 2 THEN 'hdr10' WHEN 1 THEN 'hlg' ELSE NULL END \
-                  FROM media_files mf WHERE mf.{join_col} ) AS hdr \
+                  FROM media_files mf WHERE {join_col} ) AS hdr \
          FROM {table} t"
     )
 }
@@ -294,8 +294,10 @@ pub fn get_series_detail(conn: &Connection, id: i64) -> DbResult<SeriesDetail> {
             "SELECT id, series_id, season_number FROM seasons \
              WHERE series_id = ?1 ORDER BY season_number",
         )?;
-        stmt.query_map(params![id], Season::from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?
+        let rows = stmt
+            .query_map(params![id], Season::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
     };
 
     let mut seasons_with_eps = Vec::with_capacity(seasons.len());
@@ -362,6 +364,27 @@ pub fn get_media_file(conn: &Connection, id: i64) -> DbResult<MediaFile> {
         .ok_or(DbError::NotFound)
 }
 
+/// Explicit `trickplay_assets` column list, in the order [`TrickplayAsset::from_row`]
+/// reads. Kept adjacent to the read so the positions stay aligned.
+const TRICKPLAY_COLUMNS: &str =
+    "media_file_id, kind, path, interval_ms, tile_w, tile_h, cols, rows, generated_at";
+
+/// Fetch the `trickplay_assets` row for a file, or [`DbError::NotFound`] when the
+/// sprite has not been generated yet.
+///
+/// This backs `GET /api/trickplay/:file_id/meta` — the client needs the grid geometry
+/// (`tile_w/h`, `cols`, `rows`) and `interval_ms` to crop the correct cell out of a
+/// tiled-JPG mosaic while scrubbing (`docs/.tasks/50` Part A). The sprite image itself
+/// is served separately as a static file by the `/api/trickplay/:file` route.
+pub fn get_trickplay_asset(conn: &Connection, media_file_id: i64) -> DbResult<TrickplayAsset> {
+    let sql =
+        format!("SELECT {TRICKPLAY_COLUMNS} FROM trickplay_assets WHERE media_file_id = ?1");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    stmt.query_row(params![media_file_id], TrickplayAsset::from_row)
+        .optional()?
+        .ok_or(DbError::NotFound)
+}
+
 // ---------------------------------------------------------------------------
 // Asset generation (Phase 3, `medi-assets`) — pick the next un-done file
 // ---------------------------------------------------------------------------
@@ -416,6 +439,167 @@ pub fn list_pending_assets(conn: &Connection, limit: u32) -> DbResult<Vec<Pendin
                 trickplay_done: r.get::<_, i64>(4)? != 0,
             })
         })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
+// Metadata enrichment (`docs/.tasks/60` Phase A) — pending-title selection
+// ---------------------------------------------------------------------------
+
+/// A title awaiting metadata enrichment: its id and the parsed `(title, year)` the
+/// provider search keys on. Returned by [`list_pending_metadata`] for the enrichment
+/// worker's first-run backfill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingTitle {
+    pub id: i64,
+    pub title: String,
+    pub year: Option<i64>,
+}
+
+/// List movies (or series) still needing enrichment — `metadata_state` in
+/// (`pending`, `failed`) — oldest-added first so a first-run backfill processes the
+/// existing library in insertion order. `limit` bounds the batch a worker tick pulls.
+///
+/// `matched` and `unmatched` rows are intentionally excluded: a matched row is done
+/// (idempotent — no re-fetch without an explicit refresh) and an unmatched row had no
+/// good candidate and should not be retried automatically.
+pub fn list_pending_metadata(
+    conn: &Connection,
+    kind: crate::writes::TitleKind,
+    limit: u32,
+) -> DbResult<Vec<PendingTitle>> {
+    let limit = clamp_limit(limit);
+    let table = match kind {
+        crate::writes::TitleKind::Movie => "movies",
+        crate::writes::TitleKind::Series => "series",
+    };
+    let sql = format!(
+        "SELECT id, title, year FROM {table} \
+         WHERE metadata_state IN ('pending', 'failed') \
+         ORDER BY added_at, id \
+         LIMIT ?1"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params![limit], |r| {
+            Ok(PendingTitle {
+                id: r.get(0)?,
+                title: r.get(1)?,
+                year: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// All ids currently present in the `movies` (or `series`) table. Used by the artwork
+/// orphan sweep (`docs/.tasks/60` §Orphan reaping) to reconcile `/config/images`
+/// against surviving titles: any `images/<kind>/<id>/` dir whose id is not in this set
+/// is orphaned and reclaimable.
+pub fn all_title_ids(conn: &Connection, kind: crate::writes::TitleKind) -> DbResult<Vec<i64>> {
+    let table = match kind {
+        crate::writes::TitleKind::Movie => "movies",
+        crate::writes::TitleKind::Series => "series",
+    };
+    let mut stmt = conn.prepare_cached(&format!("SELECT id FROM {table}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Fetch just the `(title, year)` of a movie for an enrichment search, or
+/// [`DbError::NotFound`]. A lighter read than [`get_movie`] for the worker's hot path.
+pub fn get_title_year(
+    conn: &Connection,
+    kind: crate::writes::TitleKind,
+    id: i64,
+) -> DbResult<(String, Option<i64>)> {
+    let table = match kind {
+        crate::writes::TitleKind::Movie => "movies",
+        crate::writes::TitleKind::Series => "series",
+    };
+    let sql = format!("SELECT title, year FROM {table} WHERE id = ?1");
+    conn.prepare_cached(&sql)?
+        .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?
+        .ok_or(DbError::NotFound)
+}
+
+// ---------------------------------------------------------------------------
+// Libraries (`docs/.tasks/60` Phase B)
+// ---------------------------------------------------------------------------
+
+/// A scan root derived from a library folder: the folder path plus the library it
+/// belongs to and that library's kind. The scanner loops over these instead of a single
+/// `media_dir`, tagging each discovered file with its `library_id`, and the library
+/// `kind` overrides filename guessing (a stray `SxxEyy` in a Movies library stays a
+/// movie).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LibraryRoot {
+    pub library_id: i64,
+    /// `crate::writes::TitleKind` as a string (`"movie"`/`"series"`).
+    pub kind: String,
+    pub path: String,
+}
+
+/// Every (library, folder) pair, as scan roots. Empty when no libraries are defined
+/// (before auto-seed). Ordered by library id for stable iteration.
+pub fn library_roots(conn: &Connection) -> DbResult<Vec<LibraryRoot>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT l.id, l.kind, f.path \
+         FROM libraries l JOIN library_folders f ON f.library_id = l.id \
+         ORDER BY l.id, f.id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(LibraryRoot {
+                library_id: r.get(0)?,
+                kind: r.get(1)?,
+                path: r.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// List all libraries, each with its folder paths. Backs `GET /api/libraries`.
+pub fn list_libraries(conn: &Connection) -> DbResult<Vec<crate::models::LibraryWithFolders>> {
+    let libraries = {
+        let mut stmt =
+            conn.prepare_cached("SELECT id, name, kind, created_at FROM libraries ORDER BY id")?;
+        let rows = stmt
+            .query_map([], crate::models::Library::from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let mut out = Vec::with_capacity(libraries.len());
+    for library in libraries {
+        let folders = folders_for_library(conn, library.id)?;
+        out.push(crate::models::LibraryWithFolders { library, folders });
+    }
+    Ok(out)
+}
+
+/// Fetch one library with its folders, or [`DbError::NotFound`].
+pub fn get_library(conn: &Connection, id: i64) -> DbResult<crate::models::LibraryWithFolders> {
+    let library = conn
+        .prepare_cached("SELECT id, name, kind, created_at FROM libraries WHERE id = ?1")?
+        .query_row(params![id], crate::models::Library::from_row)
+        .optional()?
+        .ok_or(DbError::NotFound)?;
+    let folders = folders_for_library(conn, id)?;
+    Ok(crate::models::LibraryWithFolders { library, folders })
+}
+
+/// The folder paths of one library, ordered by id.
+pub fn folders_for_library(conn: &Connection, library_id: i64) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT path FROM library_folders WHERE library_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map(params![library_id], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }

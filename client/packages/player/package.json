@@ -8,7 +8,18 @@
   "scripts": {
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@medi/api-client": "*"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "react-native-video": "*"
+  },
   "devDependencies": {
+    "@types/react": "~19.1.0",
+    "react": "19.1.0",
+    "react-native-video": "6.19.2",
     "typescript": "~5.9.2"
   }
 }

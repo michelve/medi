@@ -62,7 +62,6 @@ pub fn upsert_scan_state(conn: &Connection, path: &str, stat: FileStat) -> DbRes
          ON CONFLICT(path) DO UPDATE SET \
              mtime = excluded.mtime, \
              size_bytes = excluded.size_bytes, \
-             -- a changed file must be re-probed: clear probed_at when stat differs. \
              probed_at = CASE \
                  WHEN scan_state.mtime = excluded.mtime \
                   AND scan_state.size_bytes = excluded.size_bytes \
@@ -414,6 +413,301 @@ pub fn mark_trickplay_done(conn: &Connection, path: &str, done_at: i64) -> DbRes
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Metadata enrichment (`docs/.tasks/60` Phase A) — external ids, match state,
+// descriptive fields, and credits.
+// ---------------------------------------------------------------------------
+
+/// The `metadata_state` lifecycle value on a `movies`/`series` row
+/// (`60-metadata-and-libraries.md` V2). Kept as a typed enum so callers cannot typo a
+/// state string; [`Self::as_str`] is the persisted form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataState {
+    /// Ingested, not yet enriched.
+    Pending,
+    /// A provider match was found and its details written.
+    Matched,
+    /// No candidate cleared the match threshold (do not auto-retry).
+    Unmatched,
+    /// The provider call errored (transient; a refresh may retry).
+    Failed,
+}
+
+impl MetadataState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetadataState::Pending => "pending",
+            MetadataState::Matched => "matched",
+            MetadataState::Unmatched => "unmatched",
+            MetadataState::Failed => "failed",
+        }
+    }
+}
+
+/// Which catalog table an enrichment write targets. The metadata columns
+/// (`overview`, `poster_path`, `backdrop_path`, `tmdb_id`, `imdb_id`,
+/// `metadata_state`) exist on both `movies` and `series` with identical names, so the
+/// write helpers take this discriminator and interpolate the table name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleKind {
+    Movie,
+    Series,
+}
+
+impl TitleKind {
+    fn table(self) -> &'static str {
+        match self {
+            TitleKind::Movie => "movies",
+            TitleKind::Series => "series",
+        }
+    }
+    /// The `credits` foreign-key column for this kind (`movie_id` / `series_id`).
+    fn credit_col(self) -> &'static str {
+        match self {
+            TitleKind::Movie => "movie_id",
+            TitleKind::Series => "series_id",
+        }
+    }
+}
+
+/// The descriptive fields enrichment writes onto a title row. All optional — a provider
+/// may return only some — and `None` fields are left untouched (so a re-match that lacks
+/// a backdrop does not blank an existing one). Paths are relative to `images_dir()`.
+#[derive(Debug, Clone, Default)]
+pub struct TitleMetadata {
+    pub overview: Option<String>,
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    pub tmdb_id: Option<i64>,
+    pub imdb_id: Option<String>,
+}
+
+/// Write the matched descriptive metadata onto a title and mark it `matched` in one
+/// statement. Uses `COALESCE(?, existing)` per column so a partial `TitleMetadata` only
+/// overwrites the fields it carries. `metadata_state` is always set to `matched`.
+pub fn set_title_metadata(
+    conn: &Connection,
+    kind: TitleKind,
+    id: i64,
+    meta: &TitleMetadata,
+) -> DbResult<()> {
+    let sql = format!(
+        "UPDATE {} SET \
+             overview       = COALESCE(?2, overview), \
+             poster_path    = COALESCE(?3, poster_path), \
+             backdrop_path  = COALESCE(?4, backdrop_path), \
+             tmdb_id        = COALESCE(?5, tmdb_id), \
+             imdb_id        = COALESCE(?6, imdb_id), \
+             metadata_state = 'matched' \
+         WHERE id = ?1",
+        kind.table()
+    );
+    conn.execute(
+        &sql,
+        params![
+            id,
+            meta.overview,
+            meta.poster_path,
+            meta.backdrop_path,
+            meta.tmdb_id,
+            meta.imdb_id,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Set only the `metadata_state` of a title (e.g. → `unmatched` when no candidate clears
+/// the threshold, or → `failed` on a provider error).
+pub fn set_metadata_state(
+    conn: &Connection,
+    kind: TitleKind,
+    id: i64,
+    state: MetadataState,
+) -> DbResult<()> {
+    let sql = format!("UPDATE {} SET metadata_state = ?2 WHERE id = ?1", kind.table());
+    conn.execute(&sql, params![id, state.as_str()])?;
+    Ok(())
+}
+
+/// Read the `metadata_state` of a title, or `None` if the id does not exist.
+pub fn get_metadata_state(conn: &Connection, kind: TitleKind, id: i64) -> DbResult<Option<String>> {
+    let sql = format!("SELECT metadata_state FROM {} WHERE id = ?1", kind.table());
+    let state = conn
+        .prepare_cached(&sql)?
+        .query_row(params![id], |r| r.get::<_, String>(0))
+        .optional()?;
+    Ok(state)
+}
+
+/// Find-or-create a `people` row by its unique `name`, returning its id. People de-dupe
+/// on the `UNIQUE(name)` constraint, so two titles sharing an actor reference one row.
+pub fn find_or_create_person(conn: &Connection, name: &str) -> DbResult<i64> {
+    conn.execute(
+        "INSERT INTO people (name) VALUES (?1) ON CONFLICT(name) DO NOTHING",
+        params![name],
+    )?;
+    let id: i64 = conn
+        .prepare_cached("SELECT id FROM people WHERE name = ?1")?
+        .query_row(params![name], |r| r.get(0))?;
+    Ok(id)
+}
+
+/// Replace the credits of a title with a fresh billed cast/crew list.
+///
+/// A re-enrichment (refresh / fix-match) supplies the authoritative current cast, so we
+/// delete this title's existing `credits` rows first, then insert the new ones — this
+/// keeps ordering (`ord`) correct and never leaves a stale credit from an old wrong
+/// match. `people` rows are *not* deleted (they may be shared with other titles);
+/// find-or-create de-dupes them.
+pub fn replace_credits(
+    conn: &Connection,
+    kind: TitleKind,
+    id: i64,
+    credits: &[CreditWrite],
+) -> DbResult<()> {
+    let col = kind.credit_col();
+    conn.execute(
+        &format!("DELETE FROM credits WHERE {col} = ?1"),
+        params![id],
+    )?;
+    let insert = format!(
+        "INSERT INTO credits (person_id, {col}, role, character, ord) VALUES (?1, ?2, ?3, ?4, ?5)"
+    );
+    for c in credits {
+        let person_id = find_or_create_person(conn, &c.name)?;
+        conn.execute(
+            &insert,
+            params![person_id, id, c.role, c.character, c.ord],
+        )?;
+    }
+    Ok(())
+}
+
+/// One billing entry to persist via [`replace_credits`]. Mirrors the provider's
+/// `CreditIn` but lives in `medi-db` so the write path has no dependency on the
+/// metadata crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreditWrite {
+    pub name: String,
+    pub role: String,
+    pub character: Option<String>,
+    pub ord: i64,
+}
+
+// ---------------------------------------------------------------------------
+// Libraries (`docs/.tasks/60` Phase B) — Plex-style named libraries + folders.
+// ---------------------------------------------------------------------------
+
+/// Create a library row and return its id. `kind` is the [`TitleKind`] string
+/// (`"movie"`/`"series"`); folders are added separately via [`add_library_folder`] so a
+/// caller can validate each path (MEDIA_DIR containment) before inserting.
+pub fn create_library(
+    conn: &Connection,
+    name: &str,
+    kind: TitleKind,
+    created_at: i64,
+) -> DbResult<i64> {
+    let kind_str = match kind {
+        TitleKind::Movie => "movie",
+        TitleKind::Series => "series",
+    };
+    conn.execute(
+        "INSERT INTO libraries (name, kind, created_at) VALUES (?1, ?2, ?3)",
+        params![name, kind_str, created_at],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Rename a library.
+pub fn rename_library(conn: &Connection, id: i64, name: &str) -> DbResult<()> {
+    conn.execute("UPDATE libraries SET name = ?2 WHERE id = ?1", params![id, name])?;
+    Ok(())
+}
+
+/// Add a folder to a library. The `path` MUST already be validated as canonical and
+/// under MEDIA_DIR by the caller (the API layer) — this function only persists. The
+/// `UNIQUE(library_id, path)` constraint makes a duplicate add a no-op.
+pub fn add_library_folder(conn: &Connection, library_id: i64, path: &str) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO library_folders (library_id, path) VALUES (?1, ?2) \
+         ON CONFLICT(library_id, path) DO NOTHING",
+        params![library_id, path],
+    )?;
+    Ok(())
+}
+
+/// Remove a folder from a library by its path.
+pub fn remove_library_folder(conn: &Connection, library_id: i64, path: &str) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM library_folders WHERE library_id = ?1 AND path = ?2",
+        params![library_id, path],
+    )?;
+    Ok(())
+}
+
+/// Delete a library. Its folders cascade (FK `ON DELETE CASCADE`), and its movies/series
+/// cascade too (the `library_id` FK on those tables is `ON DELETE CASCADE`), which in
+/// turn cascades their media_files/credits — so a library delete removes its whole
+/// subtree. The caller reaps the corresponding artwork directories afterward.
+pub fn delete_library(conn: &Connection, id: i64) -> DbResult<()> {
+    conn.execute("DELETE FROM libraries WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+/// Scope a movie/series row to a library. Called by the scanner when a file is
+/// discovered under one of a library's folders (Phase B). Idempotent.
+pub fn set_movie_library(conn: &Connection, movie_id: i64, library_id: i64) -> DbResult<()> {
+    conn.execute(
+        "UPDATE movies SET library_id = ?2 WHERE id = ?1",
+        params![movie_id, library_id],
+    )?;
+    Ok(())
+}
+
+/// Scope a series row to a library.
+pub fn set_series_library(conn: &Connection, series_id: i64, library_id: i64) -> DbResult<()> {
+    conn.execute(
+        "UPDATE series SET library_id = ?2 WHERE id = ?1",
+        params![series_id, library_id],
+    )?;
+    Ok(())
+}
+
+/// Count how many libraries exist — used at boot to decide whether to auto-seed.
+pub fn library_count(conn: &Connection) -> DbResult<i64> {
+    let n: i64 = conn.query_row("SELECT COUNT(*) FROM libraries", [], |r| r.get(0))?;
+    Ok(n)
+}
+
+/// Auto-seed a default `movie` and `series` library, each rooted at `media_dir`, and
+/// back-fill `library_id` on any pre-existing rows so a single-`/media` deployment keeps
+/// working with no config change (`docs/.tasks/60` §DB migrations). A no-op if libraries
+/// already exist. Returns `(movie_library_id, series_library_id)`.
+pub fn seed_default_libraries(
+    conn: &Connection,
+    media_dir: &str,
+    created_at: i64,
+) -> DbResult<Option<(i64, i64)>> {
+    if library_count(conn)? > 0 {
+        return Ok(None);
+    }
+    let movie_lib = create_library(conn, "Movies", TitleKind::Movie, created_at)?;
+    add_library_folder(conn, movie_lib, media_dir)?;
+    let series_lib = create_library(conn, "TV Shows", TitleKind::Series, created_at)?;
+    add_library_folder(conn, series_lib, media_dir)?;
+
+    // Back-fill existing rows so they show up scoped to the seeded libraries.
+    conn.execute(
+        "UPDATE movies SET library_id = ?1 WHERE library_id IS NULL",
+        params![movie_lib],
+    )?;
+    conn.execute(
+        "UPDATE series SET library_id = ?1 WHERE library_id IS NULL",
+        params![series_lib],
+    )?;
+    Ok(Some((movie_lib, series_lib)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +859,168 @@ mod tests {
             )
             .unwrap();
         assert_eq!((pd, td), (Some(111), Some(222)));
+    }
+
+    #[test]
+    fn metadata_write_marks_matched_and_dedupes_people() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "Arrival", "arrival", Some(2016), 0).unwrap();
+
+        // Fresh movies default to 'pending'.
+        assert_eq!(
+            get_metadata_state(&conn, TitleKind::Movie, movie).unwrap().as_deref(),
+            Some("pending")
+        );
+
+        let meta = TitleMetadata {
+            overview: Some("Aliens arrive.".into()),
+            poster_path: Some("movies/1/poster.jpg".into()),
+            tmdb_id: Some(329865),
+            imdb_id: Some("tt2543164".into()),
+            ..Default::default()
+        };
+        set_title_metadata(&conn, TitleKind::Movie, movie, &meta).unwrap();
+
+        let credits = vec![
+            CreditWrite { name: "Amy Adams".into(), role: "actor".into(), character: Some("Louise".into()), ord: 0 },
+            CreditWrite { name: "Jeremy Renner".into(), role: "actor".into(), character: Some("Ian".into()), ord: 1 },
+        ];
+        replace_credits(&conn, TitleKind::Movie, movie, &credits).unwrap();
+
+        // State flipped to matched; fields written.
+        assert_eq!(
+            get_metadata_state(&conn, TitleKind::Movie, movie).unwrap().as_deref(),
+            Some("matched")
+        );
+        let m = crate::queries::get_movie(&conn, movie).unwrap();
+        assert_eq!(m.overview.as_deref(), Some("Aliens arrive."));
+        assert_eq!(m.poster_path.as_deref(), Some("movies/1/poster.jpg"));
+
+        let listed = crate::queries::credits_for_movie(&conn, movie).unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].person_name, "Amy Adams");
+        assert_eq!(listed[0].ord, Some(0));
+
+        // A second person shared across a title de-dupes: reuse Amy Adams for another movie.
+        let m2 = find_or_create_movie(&conn, "Nocturnal", "nocturnal", Some(2016), 0).unwrap();
+        replace_credits(
+            &conn,
+            TitleKind::Movie,
+            m2,
+            &[CreditWrite { name: "Amy Adams".into(), role: "actor".into(), character: None, ord: 0 }],
+        )
+        .unwrap();
+        let people_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM people WHERE name = 'Amy Adams'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(people_count, 1, "shared actor is one people row");
+    }
+
+    #[test]
+    fn replace_credits_overwrites_prior_cast() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "X", "x", None, 0).unwrap();
+
+        replace_credits(
+            &conn,
+            TitleKind::Movie,
+            movie,
+            &[CreditWrite { name: "Wrong Actor".into(), role: "actor".into(), character: None, ord: 0 }],
+        )
+        .unwrap();
+        // A corrected match replaces the whole cast — the stale credit is gone.
+        replace_credits(
+            &conn,
+            TitleKind::Movie,
+            movie,
+            &[CreditWrite { name: "Right Actor".into(), role: "actor".into(), character: None, ord: 0 }],
+        )
+        .unwrap();
+        let listed = crate::queries::credits_for_movie(&conn, movie).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].person_name, "Right Actor");
+    }
+
+    #[test]
+    fn metadata_state_transitions_to_unmatched() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "Obscure", "obscure", None, 0).unwrap();
+        set_metadata_state(&conn, TitleKind::Movie, movie, MetadataState::Unmatched).unwrap();
+        assert_eq!(
+            get_metadata_state(&conn, TitleKind::Movie, movie).unwrap().as_deref(),
+            Some("unmatched")
+        );
+    }
+
+    #[test]
+    fn seed_default_libraries_backfills_existing_rows() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        // Pre-existing rows from a single-/media deployment.
+        let m = find_or_create_movie(&conn, "Old Movie", "old movie", None, 0).unwrap();
+        let s = find_or_create_series(&conn, "Old Show", "old show", None, 0).unwrap();
+
+        let seeded = seed_default_libraries(&conn, "/media", 100).unwrap();
+        let (movie_lib, series_lib) = seeded.expect("seeded on empty libraries");
+
+        // Two libraries, each with the /media root.
+        let libs = crate::queries::list_libraries(&conn).unwrap();
+        assert_eq!(libs.len(), 2);
+        assert!(libs.iter().any(|l| l.library.kind == "movie" && l.folders == vec!["/media".to_string()]));
+        assert!(libs.iter().any(|l| l.library.kind == "series"));
+
+        // Existing rows back-filled to the matching library.
+        let movie_lib_id: i64 = conn
+            .query_row("SELECT library_id FROM movies WHERE id = ?1", params![m], |r| r.get(0))
+            .unwrap();
+        assert_eq!(movie_lib_id, movie_lib);
+        let series_lib_id: i64 = conn
+            .query_row("SELECT library_id FROM series WHERE id = ?1", params![s], |r| r.get(0))
+            .unwrap();
+        assert_eq!(series_lib_id, series_lib);
+
+        // Idempotent: a second call is a no-op (returns None).
+        assert!(seed_default_libraries(&conn, "/media", 200).unwrap().is_none());
+    }
+
+    #[test]
+    fn library_folders_crud_and_roots() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let lib = create_library(&conn, "Films", TitleKind::Movie, 0).unwrap();
+        add_library_folder(&conn, lib, "/media/movies").unwrap();
+        add_library_folder(&conn, lib, "/media/movies").unwrap(); // dup no-op
+        add_library_folder(&conn, lib, "/media/more-movies").unwrap();
+
+        let got = crate::queries::get_library(&conn, lib).unwrap();
+        assert_eq!(got.folders.len(), 2);
+
+        remove_library_folder(&conn, lib, "/media/more-movies").unwrap();
+        assert_eq!(crate::queries::folders_for_library(&conn, lib).unwrap().len(), 1);
+
+        let roots = crate::queries::library_roots(&conn).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].kind, "movie");
+        assert_eq!(roots[0].path, "/media/movies");
+    }
+
+    #[test]
+    fn delete_library_cascades_titles() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+        let lib = create_library(&conn, "Films", TitleKind::Movie, 0).unwrap();
+        let m = find_or_create_movie(&conn, "A", "a", None, 0).unwrap();
+        set_movie_library(&conn, m, lib).unwrap();
+
+        delete_library(&conn, lib).unwrap();
+        // The movie cascaded away with its library.
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM movies WHERE id = ?1", params![m], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

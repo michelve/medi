@@ -43,6 +43,11 @@ pub struct WorkerConfig {
     /// Maximum concurrent ffprobe subprocesses. A small multiple of CPU cores keeps a
     /// 10k-file first scan from spawning thousands of processes.
     pub probe_concurrency: usize,
+    /// Optional metadata enrichment context (`docs/.tasks/60` Phase A). `None` when no
+    /// provider is configured — ingest then behaves filename-only (graceful degradation).
+    pub enrich: Option<medi_metadata::EnrichContext>,
+    /// Max concurrent enrichment provider round-trips, mirroring `probe_concurrency`.
+    pub enrich_concurrency: usize,
 }
 
 impl WorkerConfig {
@@ -51,7 +56,15 @@ impl WorkerConfig {
             media_dir,
             // Conservative default; the caller may raise it based on core count.
             probe_concurrency: 4,
+            enrich: None,
+            enrich_concurrency: 4,
         }
+    }
+
+    /// Attach a metadata enrichment context so `run_scan` enriches newly-ingested titles.
+    pub fn with_enrichment(mut self, ctx: medi_metadata::EnrichContext) -> Self {
+        self.enrich = Some(ctx);
+        self
     }
 }
 
@@ -61,12 +74,42 @@ impl WorkerConfig {
 /// Idempotent: unchanged, already-probed files are skipped via `scan_state`
 /// (mtime + size), so a re-scan of an unchanged library re-probes nothing.
 pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> anyhow::Result<()> {
-    let media_dir = cfg.media_dir.clone();
-    tracing::info!(root = %media_dir.display(), "starting ingest scan");
+    // Phase B: scan per library folder so files are scoped to a library and the library
+    // `kind` overrides filename guessing. When no libraries are defined (a bare
+    // pre-Phase-B DB), fall back to a single filename-guessed scan of `media_dir`.
+    let roots = {
+        let db = db.clone();
+        tokio::task::spawn_blocking(move || -> medi_db::DbResult<Vec<_>> {
+            let conn = db.conn()?;
+            medi_db::queries::library_roots(&conn)
+        })
+        .await??
+    };
 
-    // Walk the filesystem on the blocking pool (synchronous std::fs recursion).
-    let discovered =
-        tokio::task::spawn_blocking(move || scanner::scan(&media_dir)).await?;
+    let discovered = if roots.is_empty() {
+        let media_dir = cfg.media_dir.clone();
+        tracing::info!(root = %media_dir.display(), "starting ingest scan (single root)");
+        tokio::task::spawn_blocking(move || scanner::scan(&media_dir)).await?
+    } else {
+        tracing::info!(roots = roots.len(), "starting ingest scan (multi-library)");
+        let roots2 = roots.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut all = Vec::new();
+            for r in &roots2 {
+                let hint = match r.kind.as_str() {
+                    "series" => scanner::KindHint::Series,
+                    _ => scanner::KindHint::Movie,
+                };
+                all.extend(scanner::scan_root(
+                    std::path::Path::new(&r.path),
+                    Some(r.library_id),
+                    hint,
+                ));
+            }
+            all
+        })
+        .await?
+    };
     tracing::info!(count = discovered.len(), "scan found candidate files");
 
     // Diff against scan_state to find what actually needs probing.
@@ -138,6 +181,19 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
     if written > 0 {
         // `invalidate: &Arc<dyn Fn()>` — deref through the Arc to call the closure.
         (**invalidate)();
+
+        // Auto-enrichment (`docs/.tasks/60` Phase A sub-task 6): a scan that wrote new
+        // titles kicks a bounded enrichment pass over everything still `pending`. This is
+        // what makes dropping a file into a watched folder fetch its metadata with no
+        // manual step — `watch` → incremental `run_scan` → here. Enrichment invalidates
+        // the cache again itself once art/overview land.
+        if let Some(ctx) = &cfg.enrich {
+            if let Err(err) =
+                crate::enrich::run_enrichment(db, ctx, cfg.enrich_concurrency, invalidate).await
+            {
+                tracing::error!(error = %err, "metadata enrichment pass failed");
+            }
+        }
     }
     Ok(())
 }
@@ -202,7 +258,7 @@ async fn write_one(db: &Db, probed: Probed) -> anyhow::Result<()> {
             },
         )?;
 
-        let owner = resolve_owner(&tx, &probed.file.class, now)?;
+        let owner = resolve_owner(&tx, &probed.file.class, probed.file.library_id, now)?;
         writes::upsert_media_file(&tx, &path, owner, &probed.data)?;
         writes::mark_probed(&tx, &path, now)?;
 
@@ -214,16 +270,21 @@ async fn write_one(db: &Db, probed: Probed) -> anyhow::Result<()> {
 }
 
 /// Find-or-create the owning movie/episode for a classification and return the
-/// [`FileOwner`] the media_files row attaches to.
+/// [`FileOwner`] the media_files row attaches to. When `library_id` is set (Phase B),
+/// the owning movie/series is scoped to that library so scans and reaps are per-library.
 fn resolve_owner(
     conn: &rusqlite::Connection,
     class: &Classification,
+    library_id: Option<i64>,
     now: i64,
 ) -> medi_db::DbResult<FileOwner> {
     match class {
         Classification::Movie { title, year } => {
             let sort = scanner::sort_title(title);
             let id = writes::find_or_create_movie(conn, title, &sort, *year, now)?;
+            if let Some(lib) = library_id {
+                writes::set_movie_library(conn, id, lib)?;
+            }
             Ok(FileOwner::Movie(id))
         }
         Classification::Episode {
@@ -236,6 +297,9 @@ fn resolve_owner(
             let sort = scanner::sort_title(series_title);
             let series_id =
                 writes::find_or_create_series(conn, series_title, &sort, *series_year, now)?;
+            if let Some(lib) = library_id {
+                writes::set_series_library(conn, series_id, lib)?;
+            }
             let season_id = writes::find_or_create_season(conn, series_id, *season)?;
             let episode_id =
                 writes::find_or_create_episode(conn, season_id, *episode, title.as_deref())?;
@@ -375,6 +439,7 @@ mod tests {
                     title: "Arrival".into(),
                     year: Some(2016),
                 },
+                library_id: None,
             },
             data: MediaFileWrite {
                 container: Some("mkv".into()),
@@ -421,6 +486,7 @@ mod tests {
                 title: "Arrival".into(),
                 year: Some(2016),
             },
+            library_id: None,
         };
         let changed = filter_changed(&db, vec![same]).await.unwrap();
         assert!(changed.is_empty(), "unchanged probed file is skipped");
@@ -434,6 +500,7 @@ mod tests {
                 title: "Arrival".into(),
                 year: Some(2016),
             },
+            library_id: None,
         };
         // The stat has to be recorded (as a fresh scan would) before the diff sees it.
         {
@@ -464,6 +531,7 @@ mod tests {
                     episode: 1,
                     title: Some("Good News About Hell".into()),
                 },
+                library_id: None,
             },
             data: MediaFileWrite {
                 video_codec: Some("hevc".into()),
@@ -501,5 +569,51 @@ mod tests {
 
         let conn = db.conn().unwrap();
         assert!(writes::get_scan_state(&conn, "/media/gone.mkv").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn write_one_scopes_owner_to_library() {
+        // A discovered file tagged with a library_id scopes its owning movie to that
+        // library (Phase B). No ffprobe needed — write_one takes an already-probed file.
+        let (db, _dir) = temp_db();
+        let lib = {
+            let conn = db.conn().unwrap();
+            writes::create_library(&conn, "Films", writes::TitleKind::Movie, 0).unwrap()
+        };
+        let mut probed = probed_movie("/media/movies/arrival.mkv", "hdr10", None);
+        probed.file.library_id = Some(lib);
+        write_one(&db, probed).await.unwrap();
+
+        let conn = db.conn().unwrap();
+        let movies = medi_db::queries::list_movies(&conn, None, 10).unwrap();
+        assert_eq!(movies.len(), 1);
+        let scoped: Option<i64> = conn
+            .query_row(
+                "SELECT library_id FROM movies WHERE id = ?1",
+                rusqlite::params![movies[0].id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(scoped, Some(lib), "movie scoped to its library");
+    }
+
+    #[tokio::test]
+    async fn scan_root_tags_library_and_applies_kind_override() {
+        // A Movies-library scan of a real temp tree tags every file with the library id
+        // and forces movie classification even for an episode-marked filename.
+        let tmp = tempfile::tempdir().unwrap();
+        let movies_dir = tmp.path().join("movies");
+        std::fs::create_dir_all(&movies_dir).unwrap();
+        // An episode-marked file that must still classify as a movie under a Movies lib.
+        std::fs::write(movies_dir.join("Weird S01E01 (2020).mkv"), b"x").unwrap();
+
+        let discovered = scanner::scan_root(&movies_dir, Some(42), scanner::KindHint::Movie);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].library_id, Some(42));
+        assert!(
+            matches!(discovered[0].class, Classification::Movie { .. }),
+            "kind override forces movie: {:?}",
+            discovered[0].class
+        );
     }
 }

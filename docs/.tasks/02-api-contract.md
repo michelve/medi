@@ -15,7 +15,10 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
 - All catalog responses are JSON, `Content-Type: application/json`.
 - Keyset pagination for large lists (no deep `OFFSET`).
 - The stream endpoint decides direct-play vs transcode using `media_files` metadata
-  (see `01-db-schema.md`) and the decision table in `20-phase2-hwa-transcode.md`.
+  (see `01-db-schema.md`) and the decision table in `20-phase2-hwa-transcode.md`. The
+  **audio** half of that decision and the client capability hints (`platform`,
+  `max_channels`, `audio`, `atmos`, `max_bitrate`, `quality`) are specified in
+  `70-audio-quality-and-profiles.md`; the `MediaFile` detail carries an `audio_streams` list.
 - Transcoded output is HLS (playlist + segments) produced by the `transcode` crate.
 - Generated assets (`/config/previews`, `/config/trickplay`) are served by dedicated routes.
 
@@ -32,13 +35,22 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
 | `GET /api/library?cursor=&limit=&sort=` | Paginated unified catalog (movies + series cards) | Keyset cursor; `sort=sort_title\|added_at`. Cached. |
 | `GET /api/movies/:id` | Movie detail + media_files + credits | Cached; ETag. |
 | `GET /api/series/:id` | Series detail + seasons + episodes + credits | Cached; ETag. |
-| `GET /api/stream/:file_id` | Playback decision for a media file | Returns `{ "mode": "direct" \| "hls", "url": ... }`. |
+| `GET /api/stream/:file_id` | Playback decision for a media file | Returns `{ "mode": "direct" \| "hls", "url": ... }`. Client hints: `hdr`, `dv`, `sdr` (video) plus `platform`, `max_channels`, `audio`, `atmos`, `max_bitrate`, `quality` (audio + capability negotiation — see `70-audio-quality-and-profiles.md`). |
 | `GET /api/direct/:file_id` | Direct-play byte-range stream of the source | Supports `Range`; no transcode. |
 | `GET /api/hls/:session_id/index.m3u8` | HLS master/media playlist for a transcode session | Session created by `/api/stream`. |
 | `GET /api/hls/:session_id/:segment.ts` | HLS media segment | Served as generated. |
 | `GET /api/preview/:file_id` | 720p silent hover clip (mp4) | From `/config/previews`; 404 if not yet generated. |
-| `GET /api/trickplay/:file_id` | Trickplay sprite (BIF or tiled JPG) + metadata | From `/config/trickplay`. |
+| `GET /api/trickplay/:file_id` | Trickplay sprite (BIF or tiled JPG) | Static file from `/config/trickplay` (`<file_id>.{bif,jpg}`). |
+| `GET /api/trickplay/:file_id/meta` | Trickplay grid geometry (tiled-JPG) | `{ interval_ms, tile_w, tile_h, cols, rows }` from `trickplay_assets`. `404` when absent or BIF (no croppable grid). Consumed by the TV player's scrub bar (`50-phase5`). |
 | `GET /api/images/*path` | Posters / backdrops | `ServeDir` over allowed image roots. |
+| `POST /api/movies/:id/refresh` | Force re-enrichment of one movie | Returns `{ id, outcome, provider_id? }`. `501` when no provider configured. Cache-invalidating. (`60-metadata-and-libraries.md` Phase A) |
+| `GET /api/movies/:id/matches?query=` | Candidate provider matches | `{ id, candidates: [{ provider_id, title, year?, score }] }`, best-first. `query` overrides the parsed title. `501` when no provider. |
+| `POST /api/movies/:id/match` | Pin `{ provider_id }` and re-enrich | Body `{ "provider_id": "tmdb:movie:329865" }`. Returns the refresh envelope. Cache-invalidating. |
+| `GET /api/libraries` | List libraries + their folders | `[{ id, name, kind, created_at, folders: [] }]`. (`60` Phase B) |
+| `POST /api/libraries` | Create `{ name, kind, folders[] }` | `201` with the created library. Every folder must canonicalize inside `MEDIA_DIR`; a `..`/symlink/outside path is `400 bad_request`. |
+| `PATCH /api/libraries/:id` | Rename / add / remove folders | Body `{ name?, add_folders?[], remove_folders?[] }`. Added folders are containment-checked. `404` if unknown. |
+| `DELETE /api/libraries/:id` | Remove a library (cascades its rows) | `204`; also reaps the removed titles' artwork. |
+| `POST /api/libraries/:id/scan` | Trigger an immediate scan of one library | `202 Accepted`; the incremental scan is idempotent. |
 | `GET /api/health` | Liveness | For Docker healthcheck. |
 
 ## Representative response shapes

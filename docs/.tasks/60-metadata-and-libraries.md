@@ -1,5 +1,13 @@
 # 60 — Metadata Enrichment & Plex-style Libraries
 
+> **Status (2026-09-01): backend Phases A + B IMPLEMENTED and cargo-tested.** New crate
+> `medi-metadata` (provider trait + TMDB/OMDb + matcher + enrichment + artwork reaping),
+> migrations `V2__metadata.sql` / `V3__libraries.sql`, config keys, DB write/read helpers,
+> ingest auto-enrichment + multi-library scan with kind-override, and the 8 API endpoints
+> are all live. `medi-metadata` 22/22 tests pass; new db/ingest/api/core tests pass. The
+> RN Settings→Libraries + richer Detail **client screens (sub-task 12)** are the deferred
+> follow-up; `client/packages/api-client` types + methods for every new endpoint are done.
+
 > New cross-cutting phase. Closes the gap between what the narrative docs assume and
 > what any task actually specs. `README.md` promises a "background metadata scrape" and
 > `AppConfig::images_dir()` documents an artwork "metadata pipeline" — but no `NN-*.md`
@@ -118,6 +126,11 @@ ALTER TABLE series ADD COLUMN library_id INTEGER REFERENCES libraries(id) ON DEL
 Migrations stay idempotent via refinery's version records (`01-db-schema.md`). On first
 boot with **no** libraries defined, auto-seed one `movie` and one `series` library rooted
 at `MEDIA_DIR`, so existing single-mount deployments keep working with no config change.
+
+> **Version coordination.** This task reserves migration versions **V2** and **V3**;
+> `70-audio-quality-and-profiles.md` uses **V4**. refinery versions must stay gapless and
+> monotonic, so whichever of `60`/`70` ships later renumbers to keep the sequence
+> contiguous — the ordering constraint is refinery's; the numbers are not load-bearing.
 
 ## Config additions
 

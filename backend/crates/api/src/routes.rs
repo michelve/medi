@@ -6,8 +6,9 @@
 //! `/api/stream` runs the direct-play-vs-transcode decision (tuned for Apple TV),
 //! starting an fMP4/CMAF HLS session on a transcode; `/api/direct` byte-range-streams
 //! the source; `/api/hls/*` serves a session's playlist/segments. Preview/trickplay
-//! *generation* is Phase 3 (the serving routes are static `ServeDir`s already). Static
-//! roots (`/api/images` and the asset dirs) are served via `tower_http::ServeDir`.
+//! *generation* is Phase 3. `/api/preview` and `/api/images` are static `ServeDir`s;
+//! `/api/trickplay/:file` is a small `ServeFile` handler so the sibling
+//! `/api/trickplay/:file_id/meta` grid-metadata route can coexist (Phase 5 Part A).
 //!
 //! Every DB call runs under `tokio::task::spawn_blocking` — rusqlite is synchronous
 //! and must never block the async runtime (`01-db-schema.md` §Scaling notes).
@@ -28,15 +29,20 @@ use medi_transcode::{
 };
 
 use crate::cursor;
-use crate::dto::{LibraryItem, LibraryPage, StreamDecision};
+use crate::dto::{
+    LibraryItem, LibraryPage, MatchCandidate, MatchRequest, MatchesResponse, RefreshResponse,
+    StreamDecision, TrickplayMeta,
+};
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
+
+use medi_db::writes::TitleKind;
+use medi_metadata::{EnrichOutcome, ProviderId};
 
 /// Build the full application router over the shared [`AppState`].
 pub fn router(state: AppState) -> Router {
     let images = ServeDir::new(state.config.images_dir());
     let previews = ServeDir::new(state.config.previews_dir());
-    let trickplay = ServeDir::new(state.config.trickplay_dir());
 
     Router::new()
         // Liveness (no state needed, but uniform under /api).
@@ -45,6 +51,26 @@ pub fn router(state: AppState) -> Router {
         .route("/api/library", get(library))
         .route("/api/movies/:id", get(movie_detail))
         .route("/api/series/:id", get(series_detail))
+        // Metadata enrichment — Phase A (`docs/.tasks/60`). Manual controls over the
+        // background enrichment: force a refresh, list candidate matches, pin a match.
+        .route("/api/movies/:id/refresh", axum::routing::post(movie_refresh))
+        .route("/api/movies/:id/matches", get(movie_matches))
+        .route("/api/movies/:id/match", axum::routing::post(movie_match))
+        // Libraries — Phase B (`docs/.tasks/60`). CRUD + per-library scan.
+        .route(
+            "/api/libraries",
+            get(crate::libraries::list_libraries)
+                .post(crate::libraries::create_library),
+        )
+        .route(
+            "/api/libraries/:id",
+            axum::routing::patch(crate::libraries::patch_library)
+                .delete(crate::libraries::delete_library),
+        )
+        .route(
+            "/api/libraries/:id/scan",
+            axum::routing::post(crate::libraries::scan_library),
+        )
         // Playback — Phase 2 (transcode crate).
         .route("/api/stream/:file_id", get(stream_decision))
         .route("/api/direct/:file_id", get(direct_play))
@@ -52,7 +78,12 @@ pub fn router(state: AppState) -> Router {
         // Generated assets — Phase 3 (assets crate). Served as static files; a
         // missing file is a natural 404 from ServeDir.
         .nest_service("/api/preview", previews)
-        .nest_service("/api/trickplay", trickplay)
+        // Trickplay (`docs/.tasks/50` Part A). Two *plain* routes with different segment
+        // counts — they do not overlap, so no wildcard-nest conflict:
+        //   /api/trickplay/:file        → the sprite file (e.g. `88.jpg`, `88.bif`)
+        //   /api/trickplay/:file_id/meta → the tiled-JPG grid geometry (JSON)
+        .route("/api/trickplay/:file", get(trickplay_file))
+        .route("/api/trickplay/:file_id/meta", get(trickplay_meta))
         // Artwork.
         .nest_service("/api/images", images)
         .with_state(state)
@@ -216,6 +247,126 @@ async fn series_detail(
 }
 
 // ---------------------------------------------------------------------------
+// Metadata enrichment — Phase A (`docs/.tasks/60`).
+// ---------------------------------------------------------------------------
+
+/// Borrow the enrichment context or return `501` when no provider is configured — so a
+/// client can tell "metadata is off (no API key)" from an outright failure.
+fn require_enrich(state: &AppState) -> ApiResult<&medi_metadata::EnrichContext> {
+    state.enrich.as_ref().ok_or_else(|| {
+        ApiError::not_implemented("metadata provider not configured (set TMDB_API_KEY)")
+    })
+}
+
+/// `POST /api/movies/:id/refresh` — force re-enrichment of one movie, overwriting any
+/// prior match (and its artwork, in place). Invalidates the response cache on success.
+async fn movie_refresh(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let ctx = require_enrich(&state)?;
+    let outcome = medi_metadata::enrich_movie(ctx, id, true)
+        .await
+        .map_err(map_enrich_err)?;
+    // Overview/art/cast may have changed → drop cached catalog + detail responses.
+    state.cache.invalidate_all();
+
+    let (outcome_str, provider_id) = match outcome {
+        EnrichOutcome::Matched { provider_id } => ("matched", Some(provider_id)),
+        EnrichOutcome::Unmatched => ("unmatched", None),
+        EnrichOutcome::Skipped => ("skipped", None),
+    };
+    Ok(Json(RefreshResponse {
+        id,
+        outcome: outcome_str,
+        provider_id,
+    })
+    .into_response())
+}
+
+/// Query params for `GET /api/movies/:id/matches`.
+#[derive(Debug, Deserialize)]
+pub struct MatchesQuery {
+    /// Optional corrected search term overriding the filename-parsed title.
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// `GET /api/movies/:id/matches?query=` — list provider candidates for a movie so the
+/// client can pick the right one when auto-match got it wrong (or left it `unmatched`).
+async fn movie_matches(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(q): Query<MatchesQuery>,
+) -> ApiResult<Response> {
+    let ctx = require_enrich(&state)?;
+    let candidates = medi_metadata::candidates_for(ctx, TitleKind::Movie, id, q.query.as_deref())
+        .await
+        .map_err(map_enrich_err)?;
+    let body = MatchesResponse {
+        id,
+        candidates: candidates
+            .into_iter()
+            .map(|m| MatchCandidate {
+                provider_id: m.provider_id.to_token(),
+                title: m.title,
+                year: m.year,
+                score: m.score,
+            })
+            .collect(),
+    };
+    Ok(Json(body).into_response())
+}
+
+/// `POST /api/movies/:id/match` — pin a specific provider id and re-enrich against it.
+/// Body: `{ "provider_id": "tmdb:movie:329865" }`. Invalidates the cache on success.
+async fn movie_match(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<MatchRequest>,
+) -> ApiResult<Response> {
+    let ctx = require_enrich(&state)?;
+    let provider_id = ProviderId::from_token(&body.provider_id)
+        .ok_or_else(|| ApiError::bad_request(format!("malformed provider_id '{}'", body.provider_id)))?;
+
+    let outcome = medi_metadata::enrich_with_id(ctx, TitleKind::Movie, id, &provider_id)
+        .await
+        .map_err(map_enrich_err)?;
+    state.cache.invalidate_all();
+
+    let (outcome_str, pinned) = match outcome {
+        EnrichOutcome::Matched { provider_id } => ("matched", Some(provider_id)),
+        EnrichOutcome::Unmatched => ("unmatched", None),
+        EnrichOutcome::Skipped => ("skipped", None),
+    };
+    Ok(Json(RefreshResponse {
+        id,
+        outcome: outcome_str,
+        provider_id: pinned,
+    })
+    .into_response())
+}
+
+/// Map a metadata-enrichment error onto the API error model. A `NotFound` from the DB
+/// read (unknown title id) is a `404`; a provider/HTTP failure is a `502`-style upstream
+/// error surfaced as `503 unavailable` (transient — the client may retry).
+fn map_enrich_err(e: medi_metadata::Error) -> ApiError {
+    use medi_metadata::Error;
+    match e {
+        Error::Db(medi_db::DbError::NotFound) => ApiError::not_found("no such title"),
+        Error::Db(other) => ApiError::from(other),
+        Error::Provider(msg) | Error::Http(msg) => {
+            tracing::warn!(error = %msg, "metadata provider error");
+            ApiError::unavailable("metadata provider unavailable")
+        }
+        other => {
+            tracing::error!(error = %other, "metadata enrichment error");
+            ApiError::internal("metadata error")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Playback — Phase 2 (transcode crate).
 // ---------------------------------------------------------------------------
 
@@ -366,6 +517,79 @@ async fn hls_asset(
     Ok(resp.into_response())
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/trickplay/:file_id/meta  — Phase 3 asset, Phase 5 client consumer.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/trickplay/:file` — serve a trickplay sprite file (`<id>.jpg` / `<id>.bif`).
+///
+/// Replaces the former `ServeDir` nest so a sibling `/meta` route can coexist without an
+/// axum wildcard-nest conflict. `file` is a single path segment; we reject anything with a
+/// separator or `..` and serve only the basename from the trickplay dir (no traversal).
+async fn trickplay_file(
+    State(state): State<AppState>,
+    Path(file): Path<String>,
+    req: Request,
+) -> ApiResult<Response> {
+    // A single URL segment never legitimately contains a slash or `..`; refuse if it does.
+    if file.contains('/') || file.contains('\\') || file.contains("..") {
+        return Err(ApiError::not_found("invalid trickplay path"));
+    }
+    let path = state.config.trickplay_dir().join(&file);
+    let serve = ServeFile::new(&path);
+    let resp = serve
+        .oneshot(req)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(resp.into_response())
+}
+
+/// `GET /api/trickplay/:file_id/meta` — grid geometry for scrub thumbnails.
+///
+/// Reads the `trickplay_assets` row and returns the tiled-JPG mosaic's geometry
+/// (`interval_ms`, `tile_w/h`, `cols`, `rows`) so the client can crop the cell that
+/// covers a scrub position (`docs/.tasks/50` Part A). The mosaic image itself is served
+/// by the static `/api/trickplay` route as `<file_id>.jpg`.
+///
+/// A `404` is returned when the file has no trickplay asset yet, **or** when the asset
+/// is a BIF (no client-croppable grid). The player treats `404` as "no thumbnails" and
+/// falls back to a plain scrub bar, so this is a graceful, expected outcome.
+///
+/// Not cached in the moka layer: it is a tiny single-row read that changes only when the
+/// asset worker (re)generates the sprite, and it carries no ETag machinery.
+async fn trickplay_meta(
+    State(state): State<AppState>,
+    Path(file_id): Path<i64>,
+) -> ApiResult<Response> {
+    let db = state.db.clone();
+    let asset =
+        run_blocking(&db, move |conn| queries::get_trickplay_asset(conn, file_id)).await?;
+
+    // Only the tiled-JPG kind carries a grid the client can crop. A BIF row (or a row
+    // somehow missing its grid dims) has nothing to serve here → 404, client falls back.
+    if asset.kind != "tiled_jpg" {
+        return Err(ApiError::not_found(
+            "trickplay asset is not a tiled-JPG mosaic (no croppable grid)",
+        ));
+    }
+    let (Some(tile_w), Some(tile_h), Some(cols), Some(rows)) =
+        (asset.tile_w, asset.tile_h, asset.cols, asset.rows)
+    else {
+        return Err(ApiError::not_found("trickplay asset has no grid metadata"));
+    };
+
+    let body = TrickplayMeta {
+        file_id,
+        kind: asset.kind,
+        interval_ms: asset.interval_ms,
+        tile_w,
+        tile_h,
+        cols,
+        rows,
+    };
+    Ok(Json(body).into_response())
+}
+
 /// Map a transcode session error onto the API error model. A full session table is a
 /// `409` (`docs/.tasks/20` §Scaling); an unknown session is a `404`.
 fn map_session_err(e: medi_transcode::SessionError) -> ApiError {
@@ -389,7 +613,7 @@ fn map_session_err(e: medi_transcode::SessionError) -> ApiError {
 /// Run a synchronous rusqlite closure on the blocking pool and map its errors into
 /// the API error model. Checks out a pooled connection inside the blocking task so
 /// the checkout itself never touches the async runtime.
-async fn run_blocking<T, F>(db: &medi_db::Db, f: F) -> ApiResult<T>
+pub(crate) async fn run_blocking<T, F>(db: &medi_db::Db, f: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&rusqlite::Connection) -> medi_db::DbResult<T> + Send + 'static,

@@ -1,0 +1,13 @@
+# Keep the Docker build context small and fast for Unraid pulls (docs/.tasks/50
+# §Scaling). Only `backend/` (compiled in the build stage) and `docker/` are needed.
+**/target
+**/node_modules
+client
+docs
+unraid-templates
+.git
+.github
+**/*.md
+!backend/**/*.sql
+.gitignore
+.gitattributes

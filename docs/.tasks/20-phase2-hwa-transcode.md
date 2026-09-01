@@ -38,6 +38,12 @@ crates/transcode/src/
 
 ## Playback decision table (implement in `decision.rs`)
 
+> **This table is the VIDEO axis only.** The AUDIO axis (per-device passthrough vs
+> downmix/re-encode, channel caps, immersive-audio handling) and the combined video × audio
+> matrix live in `70-audio-quality-and-profiles.md`. `decide()` takes the default audio
+> track's descriptor and `AudioTarget` carries a channel count; the two axes decide
+> independently (a video full-transcode does not force an audio transcode, and vice versa).
+
 | Source | Client/display | Decision |
 |---|---|---|
 | Codec+profile client supports, SDR or matching HDR | capable | **Direct play** (`/api/direct`) |

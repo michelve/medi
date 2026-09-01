@@ -48,7 +48,15 @@ fn seeded_app() -> (axum::Router, tempfile::TempDir) {
              INSERT INTO media_files \
                 (id, episode_id, path, container, video_codec, width, height, bit_depth, \
                  hdr_type) \
-                VALUES (90, 7, '/media/sev-s01e01.mkv', 'mkv', 'hevc', 3840, 2160, 10, 'hdr10');",
+                VALUES (90, 7, '/media/sev-s01e01.mkv', 'mkv', 'hevc', 3840, 2160, 10, 'hdr10');
+             -- Trickplay assets: a tiled-JPG mosaic on file 88 (client-croppable), and a
+             -- BIF on file 89 (no client grid). File 90 has none. Drives the meta tests.
+             INSERT INTO trickplay_assets \
+                (media_file_id, kind, path, interval_ms, tile_w, tile_h, cols, rows, generated_at) \
+                VALUES (88, 'tiled_jpg', '/config/trickplay/88.jpg', 10000, 320, 180, 10, 6, 111);
+             INSERT INTO trickplay_assets \
+                (media_file_id, kind, path, interval_ms, generated_at) \
+                VALUES (89, 'bif', '/config/trickplay/89.bif', 10000, 222);",
         )
         .unwrap();
     }
@@ -69,6 +77,28 @@ fn seeded_app() -> (axum::Router, tempfile::TempDir) {
 async fn body_json(resp: axum::response::Response) -> Value {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+/// Build a fresh app whose MEDIA_DIR is a real temp directory (with a `movies` subdir),
+/// for the Phase B library tests. Returns the app, its tempdir guard, and the canonical
+/// media root path. No enrichment context is attached.
+fn app_with_media() -> (axum::Router, tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(media.join("movies")).unwrap();
+    std::fs::create_dir_all(media.join("tv")).unwrap();
+
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config.config_dir).unwrap();
+    config.media_dir = media.clone();
+
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(config.config_dir.join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    let canonical = media.canonicalize().unwrap();
+    (router(state), dir, canonical)
 }
 
 #[tokio::test]
@@ -302,4 +332,275 @@ async fn stream_dv_to_sdr_display_transcodes_via_hls() {
     let url = json["url"].as_str().unwrap();
     assert!(url.starts_with("/api/hls/"));
     assert!(url.ends_with("/index.m3u8"), "fMP4 HLS playlist url: {url}");
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/trickplay/:file_id/meta  (Phase 5 Part A: scrub-thumbnail geometry)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Metadata enrichment endpoints (Phase A) — behavior with no provider configured
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn metadata_refresh_501_without_provider() {
+    // seeded_app has no enrichment context → the manual metadata endpoints return 501
+    // not_implemented (distinct from a failure), so a client knows metadata is simply off.
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(
+            Request::post("/api/movies/12/refresh")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "not_implemented");
+}
+
+#[tokio::test]
+async fn metadata_matches_501_without_provider() {
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/movies/12/matches")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+// ---------------------------------------------------------------------------
+// Libraries CRUD + MEDIA_DIR containment (Phase B)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn libraries_seed_absent_until_created() {
+    // A fresh app with no seeding done here has no libraries.
+    let (app, _guard, _media) = app_with_media();
+    let resp = app
+        .oneshot(Request::get("/api/libraries").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn create_library_inside_media_succeeds() {
+    let (app, _guard, media) = app_with_media();
+    let folder = media.join("movies");
+    let body = serde_json::json!({
+        "name": "Films",
+        "kind": "movie",
+        "folders": [folder.to_string_lossy()],
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/libraries")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp).await;
+    assert_eq!(json["name"], "Films");
+    assert_eq!(json["kind"], "movie");
+    assert_eq!(json["folders"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_library_outside_media_is_400() {
+    let (app, _guard, _media) = app_with_media();
+    // A path clearly outside MEDIA_DIR (a second temp dir).
+    let outside = tempfile::tempdir().unwrap();
+    let body = serde_json::json!({
+        "name": "Escape",
+        "kind": "movie",
+        "folders": [outside.path().to_string_lossy()],
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/libraries")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn create_library_dotdot_escape_is_400() {
+    let (app, _guard, media) = app_with_media();
+    // A `..` traversal out of MEDIA_DIR resolves outside → rejected.
+    let escape = media.join("movies").join("..").join("..");
+    let body = serde_json::json!({
+        "name": "Escape",
+        "kind": "movie",
+        "folders": [escape.to_string_lossy()],
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/libraries")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn library_bad_kind_is_400() {
+    let (app, _guard, media) = app_with_media();
+    let body = serde_json::json!({
+        "name": "Weird",
+        "kind": "audiobook",
+        "folders": [media.join("movies").to_string_lossy()],
+    });
+    let resp = app
+        .oneshot(
+            Request::post("/api/libraries")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn delete_library_returns_204() {
+    let (app, _guard, media) = app_with_media();
+    // Create then delete.
+    let body = serde_json::json!({
+        "name": "Films", "kind": "movie",
+        "folders": [media.join("movies").to_string_lossy()],
+    });
+    let created = app
+        .clone()
+        .oneshot(
+            Request::post("/api/libraries")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let id = body_json(created).await["id"].as_i64().unwrap();
+
+    let resp = app
+        .oneshot(
+            Request::delete(format!("/api/libraries/{id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn patch_missing_library_is_404() {
+    let (app, _guard, _media) = app_with_media();
+    let resp = app
+        .oneshot(
+            Request::patch("/api/libraries/999")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"name":"x"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trickplay_meta_returns_grid_for_tiled_jpg() {
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/trickplay/88/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/json"
+    );
+    let json = body_json(resp).await;
+    assert_eq!(json["file_id"], 88);
+    assert_eq!(json["kind"], "tiled_jpg");
+    assert_eq!(json["interval_ms"], 10000);
+    assert_eq!(json["tile_w"], 320);
+    assert_eq!(json["tile_h"], 180);
+    assert_eq!(json["cols"], 10);
+    assert_eq!(json["rows"], 6);
+}
+
+#[tokio::test]
+async fn trickplay_meta_404s_for_bif_asset() {
+    // A BIF row has no client-croppable grid → 404 so the player falls back cleanly.
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/trickplay/89/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trickplay_meta_404s_when_absent() {
+    // File 90 has no trickplay asset at all.
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/trickplay/90/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn trickplay_sprite_static_route_still_served() {
+    // The `:file` sprite route and the `:file_id/meta` route coexist (different segment
+    // counts). A request for the image path hits the sprite handler (404 here since no
+    // file exists on disk in the test tempdir), NOT the JSON meta handler, and the router
+    // builds without a wildcard-nest conflict panic.
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/trickplay/88.jpg")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // No file on disk → ServeDir 404. (If the /meta route had wrongly captured this,
+    // we'd get a JSON 404 from the DB handler; either way it's 404, but the point of
+    // this test is that the route table accepts the static path without a panic.)
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

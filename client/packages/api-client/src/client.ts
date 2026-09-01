@@ -15,9 +15,14 @@
 import { ApiError } from './errors';
 import type {
   ApiErrorBody,
+  CreateLibraryRequest,
+  Library,
   LibraryPage,
   LibrarySort,
+  MatchesResponse,
   MovieDetail,
+  PatchLibraryRequest,
+  RefreshResponse,
   SeriesDetail,
   StreamDecision,
   StreamHints,
@@ -119,6 +124,67 @@ export class ApiClient {
     );
   }
 
+  // -- Metadata enrichment (Phase A, `docs/.tasks/60`) ---------------------
+
+  /** `POST /api/movies/:id/refresh` — force re-enrichment of one movie. */
+  refreshMovie(id: number, opts: RequestOptions = {}): Promise<RefreshResponse> {
+    return this.sendJson<RefreshResponse>('POST', `/api/movies/${id}/refresh`, undefined, opts);
+  }
+
+  /**
+   * `GET /api/movies/:id/matches?query=` — candidate provider matches to choose
+   * from. `query` overrides the filename-parsed title (a corrected search term).
+   */
+  movieMatches(id: number, query?: string, opts: RequestOptions = {}): Promise<MatchesResponse> {
+    const qs = query ? `?query=${encodeURIComponent(query)}` : '';
+    return this.getJson<MatchesResponse>(`/api/movies/${id}/matches${qs}`, opts, false);
+  }
+
+  /** `POST /api/movies/:id/match` — pin a provider id and re-enrich against it. */
+  matchMovie(id: number, providerId: string, opts: RequestOptions = {}): Promise<RefreshResponse> {
+    return this.sendJson<RefreshResponse>(
+      'POST',
+      `/api/movies/${id}/match`,
+      { provider_id: providerId },
+      opts,
+    );
+  }
+
+  // -- Libraries (Phase B, `docs/.tasks/60`) -------------------------------
+
+  /** `GET /api/libraries` — all libraries with their folders. */
+  libraries(opts: RequestOptions = {}): Promise<Library[]> {
+    return this.getJson<Library[]>('/api/libraries', opts, false);
+  }
+
+  /** `POST /api/libraries` — create a library. Folders must be inside MEDIA_DIR. */
+  createLibrary(body: CreateLibraryRequest, opts: RequestOptions = {}): Promise<Library> {
+    return this.sendJson<Library>('POST', '/api/libraries', body, opts);
+  }
+
+  /** `PATCH /api/libraries/:id` — rename / add / remove folders. */
+  patchLibrary(id: number, body: PatchLibraryRequest, opts: RequestOptions = {}): Promise<Library> {
+    return this.sendJson<Library>('PATCH', `/api/libraries/${id}`, body, opts);
+  }
+
+  /** `DELETE /api/libraries/:id` — remove a library (cascades its titles). */
+  async deleteLibrary(id: number, opts: RequestOptions = {}): Promise<void> {
+    const res = await this.doFetch(this.abs(`/api/libraries/${id}`), {
+      method: 'DELETE',
+      signal: opts.signal,
+    });
+    if (!res.ok) throw await ApiError.fromResponse(res);
+  }
+
+  /** `POST /api/libraries/:id/scan` — trigger an immediate scan of one library. */
+  async scanLibrary(id: number, opts: RequestOptions = {}): Promise<void> {
+    const res = await this.doFetch(this.abs(`/api/libraries/${id}/scan`), {
+      method: 'POST',
+      signal: opts.signal,
+    });
+    if (!res.ok) throw await ApiError.fromResponse(res);
+  }
+
   /** `GET /api/health` — liveness probe. Resolves to `true` on `200`. */
   async health(opts: RequestOptions = {}): Promise<boolean> {
     const res = await this.doFetch(this.abs('/api/health'), {
@@ -203,6 +269,31 @@ export class ApiClient {
       if (etag) this.cache.set(path, { etag, body });
     }
     return body;
+  }
+
+  /**
+   * Send a mutating request (`POST`/`PATCH`) with an optional JSON body and parse
+   * the JSON response. Never ETag-cached — these are writes. A write also drops the
+   * local catalog cache, since the backend invalidates its own after enrichment /
+   * library mutations and stale detail bodies would otherwise replay.
+   */
+  private async sendJson<T>(
+    method: 'POST' | 'PATCH',
+    path: string,
+    body: unknown,
+    opts: RequestOptions,
+  ): Promise<T> {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (body !== undefined) headers['Content-Type'] = 'application/json';
+    const res = await this.doFetch(this.abs(path), {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: opts.signal,
+    });
+    if (!res.ok) throw await ApiError.fromResponse(res);
+    this.clearCache();
+    return (await res.json()) as T;
   }
 
   /** Drop all cached ETags/bodies (e.g. after a known ingest write). */

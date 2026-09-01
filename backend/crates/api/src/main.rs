@@ -56,6 +56,43 @@ async fn main() -> anyhow::Result<()> {
     let cache = ResponseCache::new(CACHE_CAPACITY);
     let bind_addr = config.bind_addr.clone();
     let media_dir = config.media_dir.clone();
+    let images_dir = config.images_dir();
+
+    // Auto-seed the default movie/series libraries rooted at MEDIA_DIR on first boot
+    // (`docs/.tasks/60` Phase B) so an existing single-`/media` deployment keeps working
+    // with no config change. Idempotent — a no-op once libraries exist.
+    {
+        let seed_db = db.clone();
+        let media = media_dir.to_string_lossy().into_owned();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        tokio::task::spawn_blocking(move || {
+            let conn = seed_db.conn()?;
+            medi_db::writes::seed_default_libraries(&conn, &media, now)
+        })
+        .await??;
+    }
+
+    // Build the metadata provider from config (`docs/.tasks/60` Phase A). `None` when
+    // metadata is disabled or no key is set — ingest then runs filename-only with no
+    // error (graceful degradation). When present, an `EnrichContext` is shared by the
+    // ingest worker (auto-enrichment) and the API's manual metadata endpoints.
+    let enrich_ctx = medi_metadata::build_provider(&config).and_then(|provider| {
+        match medi_metadata::HttpFetcher::new() {
+            Ok(fetcher) => Some(medi_metadata::EnrichContext {
+                db: db.clone(),
+                provider,
+                fetcher: std::sync::Arc::new(fetcher),
+                images_dir: images_dir.clone(),
+            }),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to build image fetcher; enrichment disabled");
+                None
+            }
+        }
+    });
 
     // Probe host HWA capabilities (Phase 2) and build the transcode session manager.
     // A GPU-less host yields software-only caps, so `/api/stream` always has a target.
@@ -71,13 +108,22 @@ async fn main() -> anyhow::Result<()> {
     // moved into `AppState`.
     let asset_caps = caps.clone();
 
-    let state = AppState::new(db.clone(), cache.clone(), config, transcode, caps);
+    let mut state = AppState::new(db.clone(), cache.clone(), config, transcode, caps);
+    if let Some(ctx) = &enrich_ctx {
+        state = state.with_enrichment(ctx.clone());
+    }
 
     // Ingestion worker (Phase 1 sub-tasks 3–5,7). The API cache's invalidate_all is
     // passed as the opaque callback so ingest can flush the catalog after a write
     // without depending on the `api` crate.
     let invalidate: Invalidator = Arc::new(move || cache.invalidate_all());
-    let worker_cfg = WorkerConfig::new(media_dir.clone());
+    let mut worker_cfg = WorkerConfig::new(media_dir.clone());
+    if let Some(ctx) = enrich_ctx.clone() {
+        // Auto-enrichment (`docs/.tasks/60` Phase A): a scan that writes new titles
+        // enriches everything still pending, so dropping a file into a watched folder
+        // fetches its metadata with no manual step.
+        worker_cfg = worker_cfg.with_enrichment(ctx);
+    }
     if media_dir.is_dir() {
         // Kick off an initial scan in the background, then keep watching for changes,
         // so the HTTP server starts serving immediately (health check stays green on a
@@ -111,6 +157,26 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             if let Err(err) = medi_assets::run(asset_db, scheduler, asset_cfg).await {
                 tracing::error!(error = %err, "asset worker stopped");
+            }
+        });
+    }
+
+    // Artwork orphan sweep (`docs/.tasks/60` §Orphan reaping): a low-frequency backstop
+    // that reconciles `/config/images` against surviving title ids, reclaiming art left
+    // behind by a reap or a manual DB edit. Runs off the request path.
+    {
+        let sweep_db = db.clone();
+        let sweep_images = images_dir.clone();
+        tokio::spawn(async move {
+            // First sweep shortly after boot, then hourly.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                if let Err(err) =
+                    medi_metadata::sweep_orphan_images(&sweep_db, &sweep_images).await
+                {
+                    tracing::warn!(error = %err, "periodic artwork sweep failed");
+                }
             }
         });
     }

@@ -49,6 +49,9 @@ backend/
    parse video codec, profile, bit depth, `color_transfer`, `color_space`, and the Dolby
    Vision side-data (`dv_profile`, `dv_bl_signal_compatibility_id`). Set `hw_decode_unsupported`
    for H.264 High 10 (see `20`). Write rows via `db`, update `scan_state.probed_at`.
+   > The same `-show_streams` output also carries every **audio** stream. `70-audio-quality-and-profiles.md`
+   > widens this parser (no new invocation) to persist all audio tracks into the `audio_streams`
+   > table; this task remains video-only.
 5. **Watch mode** (`notify`): watch `/media` for changes to trigger incremental re-scans.
 6. **API skeleton** (`api`): implement `/api/health`, `/api/library`, `/api/movies/:id`,
    `/api/series/:id` from `02-api-contract.md`, backed by `db` + moka; run all DB calls under

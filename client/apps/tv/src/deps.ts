@@ -40,3 +40,6 @@ export {
   theme,
 } from '@medi/ui';
 export type { PosterItem } from '@medi/ui';
+
+export { VideoScreen } from '@medi/player';
+export type { ResolvedStream, TrickplayMeta } from '@medi/player';

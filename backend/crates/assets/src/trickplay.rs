@@ -289,11 +289,25 @@ async fn generate_tiled(
         });
     }
 
+    // Derive the *exact* per-tile height from the finished mosaic instead of assuming a
+    // square tile. Frames are scaled `320:-1`, so tile height is aspect-dependent (≈180
+    // for 16:9); the client offsets rows by `row * tile_h`, so a wrong value misaligns
+    // every row after the first. One cheap ffprobe of the sheet gives the truth.
+    let tile_h = match probe_sheet_dimensions(&out).await {
+        // The mosaic is exactly `rows` cells tall, so the per-tile height is the sheet
+        // height divided by the row count. (Tile width stays THUMB_WIDTH — fixed by our
+        // `scale=320:-1` filter.)
+        Some((_sheet_w, sheet_h)) if rows > 0 => (sheet_h / rows).max(1) as i64,
+        // Fallback: assume 16:9 from the known width. Better than a square proxy.
+        _ => ((THUMB_WIDTH as f64) * 9.0 / 16.0).round() as i64,
+    };
+
     tracing::info!(
         media_file_id,
         frames = n,
         cols,
         rows,
+        tile_h,
         path = %out.display(),
         "generated tiled-JPG trickplay",
     );
@@ -302,15 +316,53 @@ async fn generate_tiled(
         path: out,
         interval_ms,
         grid: Some(TrickplayGrid {
-            // Individual tile size is the thumbnail size; height is source-dependent so
-            // we record the known width and leave height as the same (square-ish) proxy.
-            // A client reads cols/rows to crop; exact tile height comes from the sheet.
+            // Tile width is fixed by our `scale=320:-1` filter; tile height is the exact
+            // measured cell height (aspect-derived), so the client crops each row cleanly.
             tile_w: THUMB_WIDTH as i64,
-            tile_h: THUMB_WIDTH as i64,
+            tile_h,
             cols: cols as i64,
             rows: rows as i64,
         }),
     })
+}
+
+/// The ffprobe binary. jellyfin-ffmpeg installs it alongside ffmpeg on PATH inside the
+/// container (`docs/.tasks/50`); overridable via `FFPROBE_BIN` for tests / dev.
+fn ffprobe_bin() -> String {
+    std::env::var("FFPROBE_BIN").unwrap_or_else(|_| "ffprobe".to_string())
+}
+
+/// ffprobe the finished mosaic for its pixel `(width, height)`. Returns `None` on any
+/// failure — the caller then falls back to an aspect estimate, so a missing/odd ffprobe
+/// never fails trickplay generation (the sprite is already written).
+async fn probe_sheet_dimensions(sheet: &Path) -> Option<(u32, u32)> {
+    let sheet_arg = sheet.to_string_lossy().into_owned();
+    let argv = [
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+        &sheet_arg,
+    ];
+    let output = Command::new(ffprobe_bin())
+        .args(argv)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Expect a single line `WxH` (e.g. `3200x180`).
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.trim();
+    let (w, h) = line.split_once('x')?;
+    Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
 /// Write `bytes` to `path` atomically: to a `.tmp` sibling then rename into place, so an
