@@ -2,5 +2,22 @@
   "name": "@medi/navigation",
   "version": "0.1.0",
   "private": true,
-  "description": "react-tv-space-navigation setup: focus traps, guides, D-pad grids. Phase 4."
+  "description": "react-tv-space-navigation setup: focus traps, guides, D-pad grids. Phase 4.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": "*",
+    "react-native": "*",
+    "react-native-tvos": "*",
+    "react-tv-space-navigation": "*"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.0",
+    "react": "19.1.0",
+    "react-tv-space-navigation": "5.2.0",
+    "typescript": "~5.9.2"
+  }
 }

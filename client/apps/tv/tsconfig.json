@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": ["react", "react-native"],
+    "paths": {
+      "@medi/api-client": ["../../packages/api-client/src"],
+      "@medi/navigation": ["../../packages/navigation/src"],
+      "@medi/ui": ["../../packages/ui/src"],
+      "@medi/player": ["../../packages/player/src"]
+    }
+  },
+  "include": ["index.js", "app.config.ts", "src/**/*.ts", "src/**/*.tsx"]
+}

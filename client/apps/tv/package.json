@@ -3,10 +3,32 @@
   "version": "0.1.0",
   "private": true,
   "description": "Expo react-native-tvos app (appleTV + androidTV via CNG). Scaffolded in Phase 4.",
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "prebuild": "expo prebuild --clean",
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
     "@medi/api-client": "*",
     "@medi/navigation": "*",
     "@medi/player": "*",
-    "@medi/ui": "*"
+    "@medi/ui": "*",
+    "expo": "~54.0.37",
+    "expo-constants": "~18.0.14",
+    "expo-status-bar": "~3.0.0",
+    "react": "19.1.0",
+    "react-native": "npm:react-native-tvos@0.81.5-2",
+    "react-native-video": "6.19.2",
+    "react-tv-space-navigation": "5.2.0",
+    "xstate": "5.32.6",
+    "@xstate/react": "6.1.0"
+  },
+  "devDependencies": {
+    "@react-native-tvos/config-tv": "0.1.6",
+    "@types/react": "~19.1.0",
+    "typescript": "~5.9.2"
   }
 }

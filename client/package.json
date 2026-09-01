@@ -4,5 +4,12 @@
   "workspaces": [
     "apps/*",
     "packages/*"
-  ]
+  ],
+  "scripts": {
+    "typecheck": "yarn workspaces run typecheck",
+    "tv": "yarn workspace @medi/tv start",
+    "tv:ios": "yarn workspace @medi/tv ios",
+    "tv:android": "yarn workspace @medi/tv android",
+    "tv:prebuild": "yarn workspace @medi/tv prebuild"
+  }
 }
