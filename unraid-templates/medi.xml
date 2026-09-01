@@ -13,21 +13,21 @@
 -->
 <Container version="2">
   <Name>medi</Name>
-  <Repository>ghcr.io/mvelis/medi:latest</Repository>
-  <Registry>https://github.com/mvelis/medi/pkgs/container/medi</Registry>
+  <Repository>ghcr.io/michelve/medi:latest</Repository>
+  <Registry>https://github.com/michelve/medi/pkgs/container/medi</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>
-  <Support>https://github.com/mvelis/medi/issues</Support>
-  <Project>https://github.com/mvelis/medi</Project>
+  <Support>https://github.com/michelve/medi/issues</Support>
+  <Project>https://github.com/michelve/medi</Project>
 
   <Overview>medi is a self-hosted, hardware-accelerated media server for Unraid: a unified movie + TV library with a 10-foot TV client, Netflix-style hover previews, trickplay scrubbing, and on-the-fly HDR/Dolby Vision-aware transcoding via jellyfin-ffmpeg. Intel QSV and AMD VA-API run through /dev/dri; NVIDIA NVENC runs through the host NVIDIA container runtime. Point it at your movies share (mounted Read-Only) and browse from your TV.</Overview>
 
   <Category>MediaApp:Video</Category>
 
   <WebUI>http://[IP]:[PORT:8096]/</WebUI>
-  <Icon>https://raw.githubusercontent.com/mvelis/medi/main/unraid-templates/medi-icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/michelve/medi/main/unraid-templates/medi-icon.png</Icon>
 
   <ExtraParams></ExtraParams>
   <PostArgs></PostArgs>

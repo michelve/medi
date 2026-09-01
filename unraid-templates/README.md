@@ -8,9 +8,9 @@ Unraid **Community Applications** templates for medi (Phase 5, `docs/.tasks/50`)
 | `ca_profile.xml` | Maintainer profile CA scrapes for attribution + support links. |
 
 The Community Applications plugin scrapes the repo to list the app in its store,
-so these may also live in a **dedicated** GitHub repo (e.g. `mvelis/unraid-templates`)
+so these may also live in a **dedicated** GitHub repo (e.g. `michelve/unraid-templates`)
 with `ca_profile.xml` at that repo's root. The `<Repository>` pulls the image from
-GHCR: `ghcr.io/mvelis/medi:latest` (publish `:latest` **and** version tags so users
+GHCR: `ghcr.io/michelve/medi:latest` (publish `:latest` **and** version tags so users
 can pin — `docs/.tasks/50` §Scaling).
 
 ## Install (per the task's verification)
@@ -35,6 +35,6 @@ can pin — `docs/.tasks/50` §Scaling).
 
 `medi-icon.png` (256×256) ships in this directory and both `medi.xml` and
 `ca_profile.xml` reference it via its raw GitHub URL:
-`https://raw.githubusercontent.com/mvelis/medi/main/unraid-templates/medi-icon.png`.
+`https://raw.githubusercontent.com/michelve/medi/main/unraid-templates/medi-icon.png`.
 That URL resolves once this repo is pushed to `main` (or adjust the path if the
 templates move to a dedicated repo).

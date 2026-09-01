@@ -54,7 +54,7 @@ pub struct HttpFetcher {
 impl HttpFetcher {
     pub fn new() -> Result<Self> {
         let client = reqwest::Client::builder()
-            .user_agent("medi/0.1 (+https://github.com/mvelis/medi)")
+            .user_agent("medi/0.1 (+https://github.com/michelve/medi)")
             .build()
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(Self { client })

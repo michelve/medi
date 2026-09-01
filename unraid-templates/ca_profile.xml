@@ -7,14 +7,14 @@
   lives at the repo root alongside medi.xml; here it sits under unraid-templates/.
 -->
 <Profile>
-  <Author>mvelis</Author>
+  <Author>michelve</Author>
   <Language>en_US</Language>
-  <Repository>https://github.com/mvelis/medi</Repository>
+  <Repository>https://github.com/michelve/medi</Repository>
 
-  <Support>https://github.com/mvelis/medi/issues</Support>
-  <Project>https://github.com/mvelis/medi</Project>
+  <Support>https://github.com/michelve/medi/issues</Support>
+  <Project>https://github.com/michelve/medi</Project>
 
-  <Icon>https://raw.githubusercontent.com/mvelis/medi/main/unraid-templates/medi-icon.png</Icon>
+  <Icon>https://raw.githubusercontent.com/michelve/medi/main/unraid-templates/medi-icon.png</Icon>
 
-  <Description>medi — a self-hosted, hardware-accelerated media server for Unraid with a 10-foot TV client. Templates maintained by mvelis. File issues on GitHub for support.</Description>
+  <Description>medi — a self-hosted, hardware-accelerated media server for Unraid with a 10-foot TV client. Templates maintained by michelve. File issues on GitHub for support.</Description>
 </Profile>

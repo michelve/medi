@@ -44,7 +44,7 @@ impl TmdbProvider {
     /// client cannot be constructed (rustls init).
     pub fn new(api_key: impl Into<String>, language: impl Into<String>) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .user_agent("medi/0.1 (+https://github.com/mvelis/medi)")
+            .user_agent("medi/0.1 (+https://github.com/michelve/medi)")
             .build()
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(Self {
