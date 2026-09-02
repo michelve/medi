@@ -11,4 +11,7 @@ pub mod profile;
 
 pub use config::AppConfig;
 pub use error::{Error, Result};
-pub use profile::{DvProfile, HdrType, MediaProfile, VideoCodec};
+pub use profile::{
+    AudioCodec, ClientCapabilities, DvProfile, HdrType, ImmersiveAudio, MediaProfile, Platform,
+    QualityProfile, VideoCodec,
+};

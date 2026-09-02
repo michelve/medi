@@ -20,9 +20,9 @@
 
 use std::path::Path;
 
-use medi_core::VideoCodec;
+use medi_core::{AudioCodec, VideoCodec};
 
-use crate::decision::{AudioCodec, TranscodeTarget, Vendor};
+use crate::decision::{TranscodeTarget, Vendor};
 
 /// Names of the generated HLS artifacts, shared with `session.rs` and the `/api/hls`
 /// route so the playlist/segment/init filenames stay in one place.
@@ -77,6 +77,15 @@ pub fn build_argv(
     for arg in hw.quality_args(target) {
         a.push(arg);
     }
+    // QualityProfile::Capped ceiling (`docs/.tasks/70`): bound the output bitrate with a
+    // VBV so the stream stays under the client's `MaxStreamingBitrate`. `-bufsize` is a
+    // conventional 2× the ceiling.
+    if let Some(cap) = target.max_bitrate {
+        push(&mut a, "-maxrate");
+        a.push(cap.to_string());
+        push(&mut a, "-bufsize");
+        a.push((cap.saturating_mul(2)).to_string());
+    }
     // SDR output after tone-mapping should carry BT.709 tags so the client renders it
     // correctly rather than assuming BT.2020.
     if target.tone_map {
@@ -93,14 +102,15 @@ pub fn build_argv(
             push(&mut a, "-c:a");
             push(&mut a, "copy");
         }
-        AudioTarget::Transcode(codec) => {
+        AudioTarget::Transcode { codec, channels } => {
             push(&mut a, "-c:a");
             push(&mut a, audio_encoder(codec));
             push(&mut a, "-b:a");
             push(&mut a, audio_bitrate(codec));
-            // Preserve surround channel count where the codec supports it.
+            // Channel count comes from the resolved `AudioPlan` (downmix-aware), not a
+            // hard-coded 2/6 (`docs/.tasks/70`).
             push(&mut a, "-ac");
-            push(&mut a, if matches!(codec, AudioCodec::Aac) { "2" } else { "6" });
+            a.push(channels.max(1).to_string());
         }
     }
 
@@ -110,12 +120,12 @@ pub fn build_argv(
     a
 }
 
-/// Whether the transcode copies or re-encodes audio (resolved by the caller from the
-/// source codec + client profile via `decision::audio_target`).
+/// Whether the transcode copies or re-encodes audio, and to how many channels (resolved
+/// by the caller from the source track + client profile via `decision::audio_plan`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioTarget {
     Copy,
-    Transcode(AudioCodec),
+    Transcode { codec: AudioCodec, channels: u8 },
 }
 
 /// The HW pipeline plan derived from a [`TranscodeTarget`]: which device to init, how
@@ -333,6 +343,7 @@ mod tests {
             dv_tone_map: dv,
             video_codec: VideoCodec::H264,
             audio_transcode_to: None,
+            max_bitrate: None,
         }
     }
 
@@ -416,10 +427,32 @@ mod tests {
     fn audio_transcode_to_eac3_surround() {
         let a = argv(
             &target(Some(Vendor::Intel), false, false, false),
-            AudioTarget::Transcode(AudioCodec::Eac3),
+            AudioTarget::Transcode { codec: AudioCodec::Eac3, channels: 6 },
         );
         let s = joined(&a);
         assert!(s.contains("-c:a eac3"));
         assert!(s.contains("-ac 6"));
+    }
+
+    #[test]
+    fn audio_downmix_emits_resolved_channel_count() {
+        // A 7.1 → 5.1 downmix carries the resolved channel count, not a hard-coded 6.
+        let a = argv(
+            &target(Some(Vendor::Intel), false, false, false),
+            AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2 },
+        );
+        let s = joined(&a);
+        assert!(s.contains("-c:a aac"));
+        assert!(s.contains("-ac 2"), "AAC stereo fallback: {s}");
+    }
+
+    #[test]
+    fn capped_emits_maxrate_and_bufsize() {
+        let mut t = target(Some(Vendor::Intel), false, false, false);
+        t.max_bitrate = Some(8_000_000);
+        let a = argv(&t, AudioTarget::Copy);
+        let s = joined(&a);
+        assert!(s.contains("-maxrate 8000000"), "capped sets -maxrate: {s}");
+        assert!(s.contains("-bufsize 16000000"));
     }
 }

@@ -24,7 +24,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, Semaphore};
 
-use medi_db::writes::{self, FileOwner, FileStat, MediaFileWrite};
+use medi_db::writes::{self, AudioStreamWrite, FileOwner, FileStat, MediaFileWrite};
 use medi_db::Db;
 
 use crate::ffprobe;
@@ -147,17 +147,18 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
             // Acquire before spawning ffprobe so at most `concurrency` run at once.
             let _permit = permit_sem.acquire_owned().await.expect("semaphore open");
             match ffprobe::probe(&file.path).await {
-                Ok(data) => {
+                Ok((data, audio)) => {
                     tracing::info!(
                         path = %file.path.display(),
                         codec = data.video_codec.as_deref().unwrap_or("?"),
                         hdr = data.hdr_type.as_deref().unwrap_or("?"),
                         dv_profile = data.dv_profile.unwrap_or(-1),
                         hw_decode_unsupported = data.hw_decode_unsupported,
+                        audio_tracks = audio.len(),
                         "probed file",
                     );
                     // A closed receiver just means we're shutting down.
-                    let _ = tx.send(Probed { file, data }).await;
+                    let _ = tx.send(Probed { file, data, audio }).await;
                 }
                 Err(err) => {
                     tracing::warn!(path = %file.path.display(), error = %err, "ffprobe failed; skipping");
@@ -198,10 +199,12 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
     Ok(())
 }
 
-/// A probed file plus its parsed metadata, on its way to the writer task.
+/// A probed file plus its parsed metadata (video row + audio tracks), on its way to the
+/// writer task.
 struct Probed {
     file: DiscoveredFile,
     data: MediaFileWrite,
+    audio: Vec<AudioStreamWrite>,
 }
 
 /// Diff discovered files against `scan_state`: keep only those never seen, changed
@@ -259,7 +262,10 @@ async fn write_one(db: &Db, probed: Probed) -> anyhow::Result<()> {
         )?;
 
         let owner = resolve_owner(&tx, &probed.file.class, probed.file.library_id, now)?;
-        writes::upsert_media_file(&tx, &path, owner, &probed.data)?;
+        let media_file_id = writes::upsert_media_file(&tx, &path, owner, &probed.data)?;
+        // Audio tracks are a child table (Task 70); overwrite them in the same
+        // transaction so a re-probe replaces the whole set atomically.
+        writes::replace_audio_streams(&tx, media_file_id, &probed.audio)?;
         writes::mark_probed(&tx, &path, now)?;
 
         tx.commit()?;
@@ -451,6 +457,15 @@ mod tests {
                 dv_profile: dv,
                 ..Default::default()
             },
+            audio: vec![AudioStreamWrite {
+                stream_index: 1,
+                codec: Some("eac3".into()),
+                channels: Some(6),
+                channel_layout: Some("5.1".into()),
+                immersive: "none".into(),
+                is_default: true,
+                ..Default::default()
+            }],
         }
     }
 
@@ -472,6 +487,10 @@ mod tests {
             let files = medi_db::queries::media_files_for_movie(&conn, movies[0].id).unwrap();
             assert_eq!(files.len(), 1);
             assert_eq!(files[0].dv_profile, Some(5));
+            // The default audio track was persisted and read back (Task 70).
+            assert_eq!(files[0].audio_streams.len(), 1);
+            assert_eq!(files[0].audio_streams[0].codec.as_deref(), Some("eac3"));
+            assert!(files[0].audio_streams[0].is_default);
             let (_stat, probed_at) =
                 writes::get_scan_state(&conn, "/media/arrival.mkv").unwrap().unwrap();
             assert!(probed_at.is_some(), "probed_at stamped after write");
@@ -540,6 +559,7 @@ mod tests {
                 height: Some(2160),
                 ..Default::default()
             },
+            audio: Vec::new(),
         };
         write_one(&db, probed).await.unwrap();
 

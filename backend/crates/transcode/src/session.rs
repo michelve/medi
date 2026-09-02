@@ -258,6 +258,7 @@ mod tests {
             dv_tone_map: false,
             video_codec: VideoCodec::H264,
             audio_transcode_to: None,
+            max_bitrate: None,
         }
     }
 
@@ -304,9 +305,19 @@ mod tests {
         let second = mgr.start(&input, &target(), AudioTarget::Copy).await;
         assert!(matches!(second, Err(SessionError::CapacityReached(1))));
 
-        // Reaping the (already-exited `true`) process frees the slot.
-        let reaped = mgr.reap_idle().await;
-        assert!(reaped >= 1);
+        // Reaping the (already-exited `true`) process frees the slot. The child exits
+        // almost immediately, but there is a spawn→exit scheduling race: `reap_idle`
+        // only reaps once `try_wait()` observes the exit, so poll a few times rather
+        // than assume the first sweep sees it.
+        let mut reaped = 0;
+        for _ in 0..50 {
+            reaped += mgr.reap_idle().await;
+            if reaped >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(reaped >= 1, "the exited fake-ffmpeg session should be reaped");
         assert_eq!(mgr.active_count().await, 0);
 
         std::env::remove_var("FFMPEG_BIN");

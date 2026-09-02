@@ -303,6 +303,71 @@ pub fn upsert_media_file(
 }
 
 // ---------------------------------------------------------------------------
+// audio_streams — one row per audio track of a media file (Task 70)
+// ---------------------------------------------------------------------------
+
+/// One audio track's probed fields, ready to persist via [`replace_audio_streams`].
+/// A file has 1..N of these (commentary, dubs, a lossless+lossy pair). `codec` and
+/// `immersive` are the normalized strings the transcode decision reads back
+/// (`docs/.tasks/70`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioStreamWrite {
+    /// ffprobe stream index — what react-native-video's `selectedAudioTrack` selects by.
+    pub stream_index: i64,
+    pub codec: Option<String>,
+    pub profile: Option<String>,
+    pub channels: Option<i64>,
+    pub channel_layout: Option<String>,
+    pub bitrate: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    /// `none` | `dolby_atmos` | `dts_x`.
+    pub immersive: String,
+    pub is_default: bool,
+}
+
+/// Replace all `audio_streams` rows of a media file with a freshly probed set.
+///
+/// Delete-then-insert so a re-probe overwrites cleanly, mirroring the overwrite-in-place
+/// contract of [`upsert_media_file`]. Call this **inside the same transaction** as
+/// `upsert_media_file`, passing the media file id it returned, so a file's audio and
+/// video metadata commit atomically.
+pub fn replace_audio_streams(
+    conn: &Connection,
+    media_file_id: i64,
+    streams: &[AudioStreamWrite],
+) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM audio_streams WHERE media_file_id = ?1",
+        params![media_file_id],
+    )?;
+    for s in streams {
+        conn.execute(
+            "INSERT INTO audio_streams ( \
+                 media_file_id, stream_index, codec, profile, channels, channel_layout, \
+                 bitrate, sample_rate, language, title, immersive, is_default \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                media_file_id,
+                s.stream_index,
+                s.codec,
+                s.profile,
+                s.channels,
+                s.channel_layout,
+                s.bitrate,
+                s.sample_rate,
+                s.language,
+                s.title,
+                s.immersive,
+                s.is_default as i64,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Generated assets — preview clips + trickplay sprites (Phase 3, `medi-assets`)
 // ---------------------------------------------------------------------------
 
@@ -859,6 +924,80 @@ mod tests {
             )
             .unwrap();
         assert_eq!((pd, td), (Some(111), Some(222)));
+    }
+
+    #[test]
+    fn audio_streams_replace_and_read_back() {
+        // A file with three audio tracks yields three rows in stream_index order; a
+        // re-probe replaces the whole set (Task 70).
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "T", "t", None, 0).unwrap();
+        let data = MediaFileWrite {
+            container: Some("mkv".into()),
+            width: Some(3840),
+            height: Some(2160),
+            ..Default::default()
+        };
+        let file_id = upsert_media_file(&conn, "/media/t.mkv", FileOwner::Movie(movie), &data).unwrap();
+
+        let streams = vec![
+            AudioStreamWrite {
+                stream_index: 1,
+                codec: Some("truehd".into()),
+                channels: Some(8),
+                channel_layout: Some("7.1".into()),
+                immersive: "dolby_atmos".into(),
+                is_default: true,
+                ..Default::default()
+            },
+            AudioStreamWrite {
+                stream_index: 2,
+                codec: Some("dtshd".into()),
+                channels: Some(6),
+                immersive: "none".into(),
+                ..Default::default()
+            },
+            AudioStreamWrite {
+                stream_index: 3,
+                codec: Some("aac".into()),
+                channels: Some(2),
+                title: Some("Commentary".into()),
+                immersive: "none".into(),
+                ..Default::default()
+            },
+        ];
+        replace_audio_streams(&conn, file_id, &streams).unwrap();
+
+        let read = crate::queries::get_audio_streams(&conn, file_id).unwrap();
+        assert_eq!(read.len(), 3);
+        assert_eq!(read[0].stream_index, 1);
+        assert_eq!(read[0].codec.as_deref(), Some("truehd"));
+        assert_eq!(read[0].immersive, "dolby_atmos");
+        assert!(read[0].is_default);
+        assert_eq!(read[2].title.as_deref(), Some("Commentary"));
+
+        // A re-probe with a single stereo track replaces the whole set.
+        replace_audio_streams(
+            &conn,
+            file_id,
+            &[AudioStreamWrite {
+                stream_index: 1,
+                codec: Some("eac3".into()),
+                channels: Some(6),
+                immersive: "none".into(),
+                is_default: true,
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let read2 = crate::queries::get_audio_streams(&conn, file_id).unwrap();
+        assert_eq!(read2.len(), 1, "re-probe replaces the whole set");
+        assert_eq!(read2[0].codec.as_deref(), Some("eac3"));
+
+        // And they surface on the MediaFile read model.
+        let mf = crate::queries::get_media_file(&conn, file_id).unwrap();
+        assert_eq!(mf.audio_streams.len(), 1);
     }
 
     #[test]

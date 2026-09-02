@@ -140,10 +140,16 @@ pub struct MediaFile {
     pub dv_bl_compatible_id: Option<i64>,
     pub dv_level: Option<i64>,
     pub hw_decode_unsupported: bool,
+    /// Audio tracks of this file (Task 70). A child table, not `media_files` columns —
+    /// a file is 1:N in audio. Empty when unprobed or read without the audio join;
+    /// [`MediaFile::from_row`] leaves it empty and the query layer fills it in.
+    #[serde(default)]
+    pub audio_streams: Vec<AudioStream>,
 }
 
 impl MediaFile {
-    /// Column order matches [`crate::queries::MEDIA_FILE_COLUMNS`].
+    /// Column order matches [`crate::queries::MEDIA_FILE_COLUMNS`]. `audio_streams` is a
+    /// child table filled in separately by the query layer, so it starts empty here.
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
@@ -167,6 +173,7 @@ impl MediaFile {
             dv_level: row.get(18)?,
             // stored as 0/1
             hw_decode_unsupported: row.get::<_, i64>(19)? != 0,
+            audio_streams: Vec::new(),
         })
     }
 
@@ -210,6 +217,53 @@ impl MediaFile {
             hdr,
             dv,
             hw_decode_unsupported: self.hw_decode_unsupported,
+            // Drives the QualityProfile::Capped decision (Task 70); negatives (never
+            // stored) are ignored.
+            bitrate: self.bitrate.and_then(|b| u64::try_from(b).ok()),
+        })
+    }
+}
+
+/// A row of `audio_streams` — one audio track of a media file (Task 70).
+///
+/// `codec` / `immersive` are the normalized strings the transcode decision reads back;
+/// `stream_index` is what react-native-video's `selectedAudioTrack` selects by.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioStream {
+    pub id: i64,
+    pub media_file_id: i64,
+    pub stream_index: i64,
+    pub codec: Option<String>,
+    pub profile: Option<String>,
+    pub channels: Option<i64>,
+    pub channel_layout: Option<String>,
+    pub bitrate: Option<i64>,
+    pub sample_rate: Option<i64>,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    /// `none` | `dolby_atmos` | `dts_x`.
+    pub immersive: String,
+    pub is_default: bool,
+}
+
+impl AudioStream {
+    /// Column order: id, media_file_id, stream_index, codec, profile, channels,
+    /// channel_layout, bitrate, sample_rate, language, title, immersive, is_default.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            media_file_id: row.get(1)?,
+            stream_index: row.get(2)?,
+            codec: row.get(3)?,
+            profile: row.get(4)?,
+            channels: row.get(5)?,
+            channel_layout: row.get(6)?,
+            bitrate: row.get(7)?,
+            sample_rate: row.get(8)?,
+            language: row.get(9)?,
+            title: row.get(10)?,
+            immersive: row.get(11)?,
+            is_default: row.get::<_, i64>(12)? != 0,
         })
     }
 }

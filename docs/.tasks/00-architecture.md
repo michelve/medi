@@ -74,10 +74,11 @@ medi/
 │   │   └── core/              # shared types (MediaProfile, DvProfile enum), config, errors
 │   ├── migrations/            # SQL migration files (embedded via refinery)
 │   └── tests/                 # integration tests + sample media fixtures metadata
-├── client/                    # Yarn workspaces monorepo (Expo react-native-tvos)
+├── client/                    # Yarn workspaces monorepo (Expo react-native-tvos + web)
 │   ├── package.json           # "workspaces": ["apps/*", "packages/*"]
 │   ├── apps/
-│   │   └── tv/                # the TV app (Expo CNG target: appleTV + androidTV)
+│   │   ├── tv/                # the TV app (Expo CNG target: appleTV + androidTV)
+│   │   └── web/               # browser SPA (Vite + React DOM), served by the binary at / — see 80-web-ui-client.md
 │   └── packages/
 │       ├── ui/                # shared components: PosterGrid, Carousel, HoverPreview
 │       ├── navigation/        # react-tv-space-navigation setup, focus traps, guides
@@ -93,6 +94,11 @@ medi/
 
 > **Backend crate boundaries matter.** `core` holds the shared `DvProfile`/`MediaProfile`
 > types that flow schema → ingest → transcode → api. Do not duplicate these enums per crate.
+
+> **The binary serves a browser UI at `/`** (`80-web-ui-client.md`). The same `api` crate that
+> serves `/api/*` also serves the built `client/apps/web` SPA via a static fallback, on the
+> same port (`0.0.0.0:8096`). The web assets ship **in the image** at `/usr/share/medi/web`
+> (`AppConfig::web_dir`), never under `/config` or `/media` — see the contract below.
 
 ## The `/config` vs `/media` contract (used by every phase)
 

@@ -66,7 +66,11 @@ States (README §Deterministic State Management):
 
 1. Scaffold the Yarn-workspace monorepo from `template-tv`; configure Expo CNG for both TV
    targets; verify `react-native-tvos` version matches the Expo SDK exactly.
-2. `api-client`: typed client for the catalog/detail/preview/trickplay endpoints.
+2. `api-client`: typed client for the catalog/detail/preview/trickplay endpoints. This
+   package owns the hand-written wire types (its `types.ts` is the single source of truth).
+   The browser SPA (`client/apps/web`, `80-web-ui-client.md`) consumes `@medi/api-client`
+   **unchanged** and must not fork these types — extend them here, in lockstep with the
+   backend DTOs, so TV and web stay in sync.
 3. `navigation`: wrap the app in react-tv-space-navigation; build focus-trap + directional
    override helpers + TVFocusGuideView wrappers.
 4. `ui`: PosterGrid, horizontal Carousels, HeroBanner; wire the xstate HoverPreview FSM.

@@ -103,7 +103,9 @@ export class ApiClient {
 
   /**
    * `GET /api/stream/:file_id` — the direct-vs-HLS playback decision.
-   * `hints` map to the `?hdr=0&dv=0&sdr=1` query the backend honors.
+   * `hints` map to the query the backend honors: the video axis
+   * (`?hdr=0&dv=0&sdr=1`) plus the Task 70 audio/quality axis
+   * (`platform`, `max_channels`, `audio`, `max_bitrate`, `quality`).
    */
   stream(
     fileId: number,
@@ -115,6 +117,15 @@ export class ApiClient {
     if (hints.hdr === false) params.set('hdr', '0');
     if (hints.dv === false) params.set('dv', '0');
     if (hints.sdr === true) params.set('sdr', '1');
+    // Task 70 audio + quality hints (`docs/.tasks/70`).
+    if (hints.platform) params.set('platform', hints.platform);
+    if (hints.maxChannels != null) params.set('max_channels', String(hints.maxChannels));
+    // `atmos` is sugar for the `eac3_joc` encoding token.
+    const audio = [...(hints.audio ?? [])];
+    if (hints.atmos && !audio.includes('eac3_joc')) audio.push('eac3_joc');
+    if (audio.length) params.set('audio', audio.join(','));
+    if (hints.maxBitrate != null) params.set('max_bitrate', String(hints.maxBitrate));
+    if (hints.quality) params.set('quality', hints.quality);
     const qs = params.toString();
     // Not cached: a stream decision may spin up a transcode session.
     return this.getJson<StreamDecision>(

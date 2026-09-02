@@ -12,8 +12,8 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
-    Credit, Episode, LibraryCard, MediaFile, Movie, MovieDetail, Season, SeasonWithEpisodes,
-    Series, SeriesDetail, TrickplayAsset,
+    AudioStream, Credit, Episode, LibraryCard, MediaFile, Movie, MovieDetail, Season,
+    SeasonWithEpisodes, Series, SeriesDetail, TrickplayAsset,
 };
 use crate::{DbError, DbResult};
 
@@ -331,17 +331,45 @@ pub fn episodes_for_season(conn: &Connection, season_id: i64) -> DbResult<Vec<Ep
 // Media files
 // ---------------------------------------------------------------------------
 
-/// All media files attached to a movie. Uses `idx_files_movie`.
+/// Explicit `audio_streams` column list, in the order [`AudioStream::from_row`] reads.
+const AUDIO_STREAM_COLUMNS: &str = "\
+    id, media_file_id, stream_index, codec, profile, channels, channel_layout, \
+    bitrate, sample_rate, language, title, immersive, is_default";
+
+/// All audio tracks of a media file, ordered by `stream_index` (Task 70). Empty when the
+/// file has not been probed (or was probed before Task 70). Uses `idx_audio_streams_file`.
+pub fn get_audio_streams(conn: &Connection, media_file_id: i64) -> DbResult<Vec<AudioStream>> {
+    let sql = format!(
+        "SELECT {AUDIO_STREAM_COLUMNS} FROM audio_streams \
+         WHERE media_file_id = ?1 ORDER BY stream_index"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params![media_file_id], AudioStream::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Attach each file's `audio_streams` child rows (Task 70). Kept in one place so every
+/// path that hydrates a `MediaFile` returns its audio track list.
+fn attach_audio_streams(conn: &Connection, mut files: Vec<MediaFile>) -> DbResult<Vec<MediaFile>> {
+    for f in &mut files {
+        f.audio_streams = get_audio_streams(conn, f.id)?;
+    }
+    Ok(files)
+}
+
+/// All media files attached to a movie, each with its audio tracks. Uses `idx_files_movie`.
 pub fn media_files_for_movie(conn: &Connection, movie_id: i64) -> DbResult<Vec<MediaFile>> {
     let sql = format!("SELECT {MEDIA_FILE_COLUMNS} FROM media_files WHERE movie_id = ?1 ORDER BY id");
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map(params![movie_id], MediaFile::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    attach_audio_streams(conn, rows)
 }
 
-/// All media files attached to an episode. Uses `idx_files_episode`.
+/// All media files attached to an episode, each with its audio tracks. Uses `idx_files_episode`.
 pub fn media_files_for_episode(conn: &Connection, episode_id: i64) -> DbResult<Vec<MediaFile>> {
     let sql =
         format!("SELECT {MEDIA_FILE_COLUMNS} FROM media_files WHERE episode_id = ?1 ORDER BY id");
@@ -349,19 +377,23 @@ pub fn media_files_for_episode(conn: &Connection, episode_id: i64) -> DbResult<V
     let rows = stmt
         .query_map(params![episode_id], MediaFile::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
+    attach_audio_streams(conn, rows)
 }
 
-/// Fetch a single media file by id, or [`DbError::NotFound`].
+/// Fetch a single media file by id (with its audio tracks), or [`DbError::NotFound`].
 ///
 /// This is the row `GET /api/stream/:file_id` reads to make the transcode
-/// decision; call [`MediaFile::profile`] on the result.
+/// decision; call [`MediaFile::profile`] on the result and pick the default audio track
+/// from `audio_streams`.
 pub fn get_media_file(conn: &Connection, id: i64) -> DbResult<MediaFile> {
     let sql = format!("SELECT {MEDIA_FILE_COLUMNS} FROM media_files WHERE id = ?1");
     let mut stmt = conn.prepare_cached(&sql)?;
-    stmt.query_row(params![id], MediaFile::from_row)
+    let mut file = stmt
+        .query_row(params![id], MediaFile::from_row)
         .optional()?
-        .ok_or(DbError::NotFound)
+        .ok_or(DbError::NotFound)?;
+    file.audio_streams = get_audio_streams(conn, file.id)?;
+    Ok(file)
 }
 
 /// Explicit `trickplay_assets` column list, in the order [`TrickplayAsset::from_row`]

@@ -24,7 +24,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use medi_core::{HdrType, MediaProfile, VideoCodec};
+use medi_core::{
+    AudioCodec, ClientCapabilities, HdrType, ImmersiveAudio, MediaProfile, Platform, QualityProfile,
+    VideoCodec,
+};
 
 use crate::caps::HwCaps;
 
@@ -37,20 +40,27 @@ pub enum Vendor {
     Amd,
 }
 
-/// Audio codec of a source or target track (the subset AVPlayer/ExoPlayer care about).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum AudioCodec {
-    Aac,
-    Ac3,
-    /// Dolby Digital Plus (E-AC-3), also the carrier for Atmos (JOC).
-    Eac3,
-    /// Not decodable by AVPlayer — must be transcoded for Apple TV.
-    Dts,
-    TrueHd,
-    Flac,
-    Opus,
-    Other,
+/// The source audio track's decision-relevant descriptor: what `decide` / [`audio_plan`]
+/// read (`docs/.tasks/70`). The `api` layer maps a `medi_db::models::AudioStream` (the
+/// default track) into this so `transcode` stays free of a `db` dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioTrack {
+    pub codec: AudioCodec,
+    /// Source channel count (2, 6, 8). 0/unknown is treated as within any cap.
+    pub channels: u8,
+    pub immersive: ImmersiveAudio,
+}
+
+impl AudioTrack {
+    /// The AAC-safe default for an un-probed file (`docs/.tasks/70` §Backward compat):
+    /// a client-supported stereo track that never forces a needless remux.
+    pub fn unknown_safe() -> Self {
+        Self {
+            codec: AudioCodec::Aac,
+            channels: 2,
+            immersive: ImmersiveAudio::None,
+        }
+    }
 }
 
 /// What the client (and its connected display) can natively play. Sent by the client
@@ -69,6 +79,11 @@ pub struct ClientProfile {
     pub dolby_vision: bool,
     /// Audio codecs the client can decode / passthrough.
     pub audio_codecs: Vec<AudioCodec>,
+    /// Max audio channels the sink accepts (`EXTRA_MAX_CHANNEL_COUNT`). A source with
+    /// more channels is downmixed to this (`docs/.tasks/70`).
+    pub max_channels: u8,
+    /// Whether the sink passes lossy Atmos (E-AC-3 JOC) through (`ENCODING_E_AC3_JOC`).
+    pub atmos_passthrough: bool,
     /// Containers the client can open directly (for the direct-play remux decision).
     pub containers: Vec<String>,
 }
@@ -79,7 +94,8 @@ impl ClientProfile {
     /// Reflects AVPlayer on tvOS: H.264 + HEVC (incl. 10-bit, HDR10, HLG, Dolby Vision
     /// P5/P8) and AV1 (A15/A17 models); AAC / AC-3 / E-AC-3 (Atmos) audio; MP4/MOV and
     /// fragmented-MP4 HLS containers. DTS/TrueHD are **not** listed — they force an
-    /// audio transcode.
+    /// audio transcode. Apple TV passes **lossy** E-AC-3 JOC Atmos through but never
+    /// bitstreams the lossless formats (`docs/.tasks/70`).
     pub fn apple_tv_4k() -> Self {
         Self {
             video_codecs: vec![VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1],
@@ -87,7 +103,54 @@ impl ClientProfile {
             hdr_display: true,
             dolby_vision: true,
             audio_codecs: vec![AudioCodec::Aac, AudioCodec::Ac3, AudioCodec::Eac3],
+            max_channels: 8,
+            atmos_passthrough: true,
             containers: vec!["mp4".into(), "mov".into(), "m4v".into(), "hls".into()],
+        }
+    }
+
+    /// The NVIDIA Shield default (`docs/.tasks/70`): everything Apple TV does **plus**
+    /// the lossless bitstream formats (DTS, DTS-HD MA, TrueHD) and the MKV container —
+    /// Shield bitstreams TrueHD/DTS:X/DTS-HD MA losslessly over HDMI.
+    pub fn nvidia_shield() -> Self {
+        Self {
+            video_codecs: vec![VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1],
+            bit_depth_10: true,
+            hdr_display: true,
+            dolby_vision: true,
+            audio_codecs: vec![
+                AudioCodec::Aac,
+                AudioCodec::Ac3,
+                AudioCodec::Eac3,
+                AudioCodec::Dts,
+                AudioCodec::DtsHd,
+                AudioCodec::TrueHd,
+            ],
+            max_channels: 8,
+            atmos_passthrough: true,
+            containers: vec![
+                "mp4".into(),
+                "mov".into(),
+                "m4v".into(),
+                "mkv".into(),
+                "hls".into(),
+            ],
+        }
+    }
+
+    /// The generic Android TV default (`docs/.tasks/70`): deliberately **pessimistic**
+    /// (stereo, no passthrough) because capabilities vary by the attached AVR. The
+    /// client is expected to upgrade it with a detected `AudioCapabilities` payload.
+    pub fn generic_android_tv() -> Self {
+        Self {
+            video_codecs: vec![VideoCodec::H264, VideoCodec::Hevc],
+            bit_depth_10: true,
+            hdr_display: false,
+            dolby_vision: false,
+            audio_codecs: vec![AudioCodec::Aac, AudioCodec::Ac3, AudioCodec::Eac3],
+            max_channels: 2,
+            atmos_passthrough: false,
+            containers: vec!["mp4".into(), "mkv".into(), "hls".into()],
         }
     }
 
@@ -100,7 +163,20 @@ impl ClientProfile {
             hdr_display: false,
             dolby_vision: false,
             audio_codecs: vec![AudioCodec::Aac],
+            max_channels: 2,
+            atmos_passthrough: false,
             containers: vec!["mp4".into(), "hls".into()],
+        }
+    }
+
+    /// Select the static per-platform default (`docs/.tasks/70` §capability defaults).
+    pub fn for_platform(platform: Platform) -> Self {
+        match platform {
+            Platform::AppleTv => Self::apple_tv_4k(),
+            Platform::Shield => Self::nvidia_shield(),
+            Platform::AndroidTv => Self::generic_android_tv(),
+            // Unknown: fall back to the Apple TV baseline (its authoritative, safe set).
+            Platform::Unknown => Self::apple_tv_4k(),
         }
     }
 
@@ -114,8 +190,33 @@ impl ClientProfile {
         self.containers.iter().any(|x| x.eq_ignore_ascii_case(&c))
     }
 
-    fn supports_audio(&self, codec: AudioCodec) -> bool {
+    /// Does the client's codec list include this audio codec?
+    pub fn supports_audio(&self, codec: AudioCodec) -> bool {
         self.audio_codecs.contains(&codec)
+    }
+
+    /// Can the client bitstream this lossless format as-is? Only a sink that lists the
+    /// lossless codec (Shield lists TrueHd/DtsHd; Apple TV does not).
+    fn can_bitstream(&self, codec: AudioCodec) -> bool {
+        !codec.is_lossless_bitstream() || self.supports_audio(codec)
+    }
+}
+
+impl From<ClientCapabilities> for ClientProfile {
+    /// Build the decision-input profile from a detected/defaulted capability payload
+    /// (`docs/.tasks/70`). The `QualityProfile` and `max_bitrate` are carried separately
+    /// into `decide` and are not part of the static profile.
+    fn from(c: ClientCapabilities) -> Self {
+        Self {
+            video_codecs: c.video_codecs,
+            bit_depth_10: c.bit_depth_10,
+            hdr_display: c.hdr_display,
+            dolby_vision: c.dolby_vision,
+            audio_codecs: c.audio_codecs,
+            max_channels: c.max_channels.max(2),
+            atmos_passthrough: c.atmos_passthrough,
+            containers: c.containers,
+        }
     }
 }
 
@@ -135,6 +236,52 @@ pub struct TranscodeTarget {
     pub video_codec: VideoCodec,
     /// Target audio: `Some(codec)` to transcode audio, `None` to copy it through.
     pub audio_transcode_to: Option<AudioCodec>,
+    /// `QualityProfile::Capped` bitrate ceiling (bits/sec) applied to video via
+    /// `-maxrate`/`-bufsize` in `command.rs`. `None` = uncapped (`docs/.tasks/70`).
+    pub max_bitrate: Option<u64>,
+}
+
+/// The audio plan for a track + client: copy through (passthrough / within cap) or
+/// re-encode and/or downmix (`docs/.tasks/70`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioPlan {
+    /// Passthrough — supported codec, bitstreamable, channels ≤ cap.
+    Copy,
+    /// Re-encode and/or downmix to `codec` at `channels`.
+    Transcode { codec: AudioCodec, channels: u8 },
+}
+
+/// Decide how to serve one audio track to a client (`docs/.tasks/70` §decision matrix).
+///
+/// Copies when the client supports the codec, can bitstream it (Shield vs Apple TV on
+/// TrueHD/DTS-HD), passes its immersive form, and the channel count is within the cap.
+/// Otherwise re-encodes to E-AC-3 (surround-preserving) — or AAC stereo when the client
+/// lacks E-AC-3 — downmixing to the channel cap.
+pub fn audio_plan(track: AudioTrack, client: &ClientProfile) -> AudioPlan {
+    let bitstreamable = client.can_bitstream(track.codec);
+    // Lossy Atmos (E-AC-3 JOC) passes only where the sink advertises it.
+    let atmos_ok = track.immersive != ImmersiveAudio::DolbyAtmos || client.atmos_passthrough;
+    let supported = client.supports_audio(track.codec) && bitstreamable && atmos_ok;
+    // A 0/unknown channel count is treated as within any cap (never a needless downmix).
+    let over_cap = track.channels != 0 && track.channels > client.max_channels;
+
+    if supported && !over_cap {
+        return AudioPlan::Copy;
+    }
+
+    let codec = if client.supports_audio(AudioCodec::Eac3) {
+        AudioCodec::Eac3
+    } else {
+        AudioCodec::Aac
+    };
+    // AAC is a stereo fallback; E-AC-3 keeps surround, downmixed to the cap.
+    let target_ch = if codec == AudioCodec::Aac {
+        2
+    } else {
+        let src = if track.channels == 0 { 6 } else { track.channels };
+        src.min(client.max_channels.max(2))
+    };
+    AudioPlan::Transcode { codec, channels: target_ch }
 }
 
 /// The playback decision for one file + client.
@@ -171,20 +318,39 @@ impl Decision {
     }
 }
 
+/// The "best available quality" control + bitrate ceiling carried alongside the client
+/// profile into [`decide`] (`docs/.tasks/70` §QualityProfile). Built by the api layer
+/// from the request's `quality` / `max_bitrate` params.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Quality {
+    pub profile: QualityProfile,
+    /// bits/sec; `None` = uncapped. Honored only for `QualityProfile::Capped`.
+    pub max_bitrate: Option<u64>,
+}
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self {
+            profile: QualityProfile::Auto,
+            max_bitrate: None,
+        }
+    }
+}
+
 /// Decide how to serve `profile` (a source file) to `client`, given host `caps`.
 ///
-/// Implements `docs/.tasks/20` §Playback decision table, extended with the container /
-/// audio checks tvOS AVPlayer needs. Pure and deterministic — unit-tested against every
-/// table row.
+/// Implements `docs/.tasks/20` §Playback decision table (video axis) plus the audio axis
+/// from `docs/.tasks/70`. Pure and deterministic — unit-tested against every table row.
 ///
-/// `container` and `audio` come from the `media_files` row (audio codec of the primary
-/// track). Pass `AudioCodec::Aac` and a client-supported container when audio/container
-/// are unknown to avoid forcing a needless remux.
+/// `container` and `audio` come from the `media_files` row + its default `audio_streams`
+/// track. Pass [`AudioTrack::unknown_safe`] and a client-supported container when
+/// audio/container are unknown, to avoid forcing a needless remux.
 pub fn decide(
     profile: &MediaProfile,
-    audio: AudioCodec,
+    audio: AudioTrack,
     container: &str,
     client: &ClientProfile,
+    quality: Quality,
     caps: &HwCaps,
 ) -> Decision {
     // --- Forced software-decode case: H.264 High 10 (10-bit AVC). ------------
@@ -192,7 +358,7 @@ pub fn decide(
     // this always transcodes with a software decoder feeding a HW (or SW) encoder.
     if profile.hw_decode_unsupported {
         return Decision::Transcode {
-            target: transcode_target(caps, /*software_decode=*/ true, /*tone_map=*/ needs_tonemap(profile, client), profile),
+            target: transcode_target(caps, /*software_decode=*/ true, /*tone_map=*/ needs_tonemap(profile, client), profile, quality),
             reason: "h264_high10_sw_decode",
         };
     }
@@ -204,25 +370,41 @@ pub fn decide(
     // --- HDR / Dolby Vision vs the display. ----------------------------------
     let tone_map = needs_tonemap(profile, client);
 
-    if video_ok && !tone_map {
+    // --- QualityProfile::Capped can force a full transcode. ------------------
+    // A bitrate ceiling below the source video bitrate forces a re-encode even when the
+    // codec would direct-play (`docs/.tasks/70`). `Original` explicitly suppresses this.
+    let bitrate_forces = quality.profile == QualityProfile::Capped
+        && matches!((quality.max_bitrate, profile_bitrate(profile)), (Some(cap), Some(src)) if src > cap);
+
+    if video_ok && !tone_map && !bitrate_forces {
         // Video is directly presentable (incl. DV P5/P8 to a DV-capable Apple TV on an
         // HDR/DV display). The only remaining question is container + audio.
-        let audio_ok = client.supports_audio(audio);
+        let audio_ok = audio_plan(audio, client) == AudioPlan::Copy;
         let container_ok = client.supports_container(container);
         if audio_ok && container_ok {
             return Decision::DirectPlay { remux: false };
         }
         // Video can be copied; only the container or audio needs work. A remux (served
-        // over `/api/direct`, or a copy-video HLS) is far cheaper than re-encoding.
+        // over `/api/direct`, or a copy-video HLS) is far cheaper than re-encoding — and
+        // an audio-only fix does not count against the GPU transcode cap (`docs/.tasks/70`).
         return Decision::DirectPlay { remux: true };
     }
 
     // --- Otherwise transcode. Pick the reason for logs/debugging. ------------
-    let reason = transcode_reason(profile, client, tone_map, video_ok);
+    let reason = if bitrate_forces && video_ok && !tone_map {
+        "bitrate_capped"
+    } else {
+        transcode_reason(profile, client, tone_map, video_ok)
+    };
     Decision::Transcode {
-        target: transcode_target(caps, /*software_decode=*/ false, tone_map, profile),
+        target: transcode_target(caps, /*software_decode=*/ false, tone_map, profile, quality),
         reason,
     }
+}
+
+/// The source bitrate for the `QualityProfile::Capped` check (`media_files.bitrate`).
+fn profile_bitrate(profile: &MediaProfile) -> Option<u64> {
+    profile.bitrate
 }
 
 /// Does this source need tone-mapping for the client's display? True when the source
@@ -292,6 +474,7 @@ fn transcode_target(
     mut software_decode: bool,
     tone_map: bool,
     profile: &MediaProfile,
+    quality: Quality,
 ) -> TranscodeTarget {
     let vendor = caps.vendor;
 
@@ -310,31 +493,22 @@ fn transcode_target(
     // Target H.264 High — the universally direct-playable codec for both TV clients.
     let video_codec = VideoCodec::H264;
 
+    // `Capped` threads its ceiling through to `-maxrate`/`-bufsize` in `command.rs`.
+    let max_bitrate = if quality.profile == QualityProfile::Capped {
+        quality.max_bitrate
+    } else {
+        None
+    };
+
     TranscodeTarget {
         vendor,
         software_decode,
         tone_map,
         dv_tone_map,
         video_codec,
-        // Audio target is decided by the caller against the client; default copy.
+        // Audio target is decided by the caller against the client via `audio_plan`.
         audio_transcode_to: None,
-    }
-}
-
-/// Decide the audio target for a transcode/remux: copy through if the client supports
-/// the source codec, else convert to the best compatible target.
-///
-/// For Apple TV, E-AC-3 (Dolby Digital Plus, incl. Atmos JOC) is the richest widely
-/// supported target; AAC is the safe stereo fallback. DTS/TrueHD are converted to
-/// E-AC-3 to preserve surround where the client supports it, else AAC.
-pub fn audio_target(source: AudioCodec, client: &ClientProfile) -> Option<AudioCodec> {
-    if client.supports_audio(source) {
-        return None; // copy through
-    }
-    if client.supports_audio(AudioCodec::Eac3) {
-        Some(AudioCodec::Eac3)
-    } else {
-        Some(AudioCodec::Aac)
+        max_bitrate,
     }
 }
 
@@ -361,13 +535,28 @@ mod tests {
             hdr,
             dv,
             hw_decode_unsupported: false,
+            bitrate: None,
         }
+    }
+
+    /// A source audio track with a codec, channel count, and immersive marker.
+    fn aud(codec: AudioCodec, channels: u8, immersive: ImmersiveAudio) -> AudioTrack {
+        AudioTrack { codec, channels, immersive }
+    }
+
+    /// A supported stereo AAC track — the audio never blocks a direct-play here.
+    fn aac() -> AudioTrack {
+        AudioTrack::unknown_safe()
+    }
+
+    fn q() -> Quality {
+        Quality::default()
     }
 
     #[test]
     fn h264_sdr_direct_plays_to_apple_tv() {
         let p = prof(VideoCodec::H264, 8, HdrType::None, None);
-        let d = decide(&p, AudioCodec::Aac, "mp4", &ClientProfile::apple_tv_4k(), &hw_intel());
+        let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: false });
         assert_eq!(d.mode(), "direct");
     }
@@ -376,14 +565,14 @@ mod tests {
     fn hevc_hdr10_direct_plays_on_hdr_display() {
         // Apple TV 4K on an HDR display presents HDR10 directly — no transcode.
         let p = prof(VideoCodec::Hevc, 10, HdrType::Hdr10, None);
-        let d = decide(&p, AudioCodec::Eac3, "mp4", &ClientProfile::apple_tv_4k(), &hw_intel());
+        let d = decide(&p, aud(AudioCodec::Eac3, 6, ImmersiveAudio::None), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: false });
     }
 
     #[test]
     fn hevc_hdr10_tone_maps_on_sdr_display() {
         let p = prof(VideoCodec::Hevc, 10, HdrType::Hdr10, None);
-        let d = decide(&p, AudioCodec::Aac, "mp4", &ClientProfile::sdr_baseline(), &hw_intel());
+        let d = decide(&p, aac(), "mp4", &ClientProfile::sdr_baseline(), q(), &hw_intel());
         match d {
             Decision::Transcode { target, reason } => {
                 assert!(target.tone_map);
@@ -398,14 +587,14 @@ mod tests {
     fn dv_p5_direct_plays_to_dv_apple_tv() {
         // The chosen policy: DV-capable Apple TV on a DV display plays P5 directly.
         let p = prof(VideoCodec::Hevc, 10, HdrType::DolbyVision, Some(DvProfile::P5));
-        let d = decide(&p, AudioCodec::Eac3, "mp4", &ClientProfile::apple_tv_4k(), &hw_intel());
+        let d = decide(&p, aud(AudioCodec::Eac3, 6, ImmersiveAudio::None), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: false });
     }
 
     #[test]
     fn dv_p5_tone_maps_on_sdr_display_via_opencl() {
         let p = prof(VideoCodec::Hevc, 10, HdrType::DolbyVision, Some(DvProfile::P5));
-        let d = decide(&p, AudioCodec::Aac, "mp4", &ClientProfile::sdr_baseline(), &hw_intel());
+        let d = decide(&p, aac(), "mp4", &ClientProfile::sdr_baseline(), q(), &hw_intel());
         match d {
             Decision::Transcode { target, reason } => {
                 assert!(target.dv_tone_map, "DV must use the OpenCL/CUDA tone-map path");
@@ -428,14 +617,14 @@ mod tests {
             HdrType::DolbyVision,
             Some(DvProfile::P8 { bl_compatible_id: 1 }),
         );
-        let d = decide(&p, AudioCodec::Eac3, "mp4", &client, &hw_intel());
+        let d = decide(&p, aud(AudioCodec::Eac3, 6, ImmersiveAudio::None), "mp4", &client, q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: false });
     }
 
     #[test]
     fn dv_p5_on_sw_host_falls_back_to_software() {
         let p = prof(VideoCodec::Hevc, 10, HdrType::DolbyVision, Some(DvProfile::P5));
-        let d = decide(&p, AudioCodec::Aac, "mp4", &ClientProfile::sdr_baseline(), &HwCaps::software_only());
+        let d = decide(&p, aac(), "mp4", &ClientProfile::sdr_baseline(), q(), &HwCaps::software_only());
         match d {
             Decision::Transcode { target, .. } => {
                 assert!(target.dv_tone_map);
@@ -450,7 +639,7 @@ mod tests {
     fn h264_high10_forces_software_decode() {
         let mut p = prof(VideoCodec::H264, 10, HdrType::None, None);
         p.hw_decode_unsupported = true;
-        let d = decide(&p, AudioCodec::Aac, "mp4", &ClientProfile::apple_tv_4k(), &hw_intel());
+        let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         match d {
             Decision::Transcode { target, reason } => {
                 assert!(target.software_decode);
@@ -465,7 +654,7 @@ mod tests {
         // Apple TV lists AV1 as decodable, but here the display is SDR so we transcode;
         // the host has no AV1 hwaccel → software (dav1d) decode.
         let p = prof(VideoCodec::Av1, 10, HdrType::Hdr10, None);
-        let d = decide(&p, AudioCodec::Aac, "mp4", &ClientProfile::sdr_baseline(), &hw_intel());
+        let d = decide(&p, aac(), "mp4", &ClientProfile::sdr_baseline(), q(), &hw_intel());
         match d {
             Decision::Transcode { target, .. } => {
                 assert!(target.software_decode, "no AV1 hwaccel → dav1d software decode");
@@ -478,25 +667,124 @@ mod tests {
     fn mkv_container_forces_remux_even_when_codec_ok() {
         // HEVC SDR video the Apple TV can decode, but in an MKV it can't open → remux.
         let p = prof(VideoCodec::Hevc, 10, HdrType::None, None);
-        let d = decide(&p, AudioCodec::Eac3, "mkv", &ClientProfile::apple_tv_4k(), &hw_intel());
+        let d = decide(&p, aud(AudioCodec::Eac3, 6, ImmersiveAudio::None), "mkv", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: true });
     }
 
+    // --- audio axis (`docs/.tasks/70` §combined matrix) ---------------------
+
     #[test]
     fn dts_audio_forces_remux_with_audio_transcode() {
+        // Plain DTS core is unsupported on Apple TV → video copies, audio must re-encode.
         let p = prof(VideoCodec::H264, 8, HdrType::None, None);
-        let d = decide(&p, AudioCodec::Dts, "mp4", &ClientProfile::apple_tv_4k(), &hw_intel());
+        let d = decide(&p, aud(AudioCodec::Dts, 6, ImmersiveAudio::None), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: true });
-        // The audio target for DTS → E-AC-3 on Apple TV.
         assert_eq!(
-            audio_target(AudioCodec::Dts, &ClientProfile::apple_tv_4k()),
-            Some(AudioCodec::Eac3)
+            audio_plan(aud(AudioCodec::Dts, 6, ImmersiveAudio::None), &ClientProfile::apple_tv_4k()),
+            AudioPlan::Transcode { codec: AudioCodec::Eac3, channels: 6 }
+        );
+    }
+
+    #[test]
+    fn shield_copies_truehd_apple_tv_transcodes() {
+        // The Shield ≠ Apple TV split on lossless bitstream: Shield passthrough, Apple TV
+        // re-encode to E-AC-3 5.1.
+        let truehd = aud(AudioCodec::TrueHd, 8, ImmersiveAudio::DolbyAtmos);
+        assert_eq!(audio_plan(truehd, &ClientProfile::nvidia_shield()), AudioPlan::Copy);
+        assert_eq!(
+            audio_plan(truehd, &ClientProfile::apple_tv_4k()),
+            AudioPlan::Transcode { codec: AudioCodec::Eac3, channels: 8 }
+        );
+
+        // On the full decision: MKV+TrueHD to a Shield remuxes only the container (audio
+        // copies via passthrough); to Apple TV it also re-encodes audio.
+        let p = prof(VideoCodec::Hevc, 10, HdrType::None, None);
+        let shield = decide(&p, truehd, "mkv", &ClientProfile::nvidia_shield(), q(), &hw_intel());
+        assert_eq!(shield, Decision::DirectPlay { remux: false }, "Shield opens MKV + bitstreams TrueHD");
+    }
+
+    #[test]
+    fn seven_one_downmixes_over_a_five_one_cap() {
+        // Any codec with channels > client cap downmixes to the cap.
+        let mut client = ClientProfile::nvidia_shield();
+        client.max_channels = 6; // a 5.1 AVR
+        let plan = audio_plan(aud(AudioCodec::Eac3, 8, ImmersiveAudio::None), &client);
+        assert_eq!(plan, AudioPlan::Transcode { codec: AudioCodec::Eac3, channels: 6 });
+    }
+
+    #[test]
+    fn eac3_joc_atmos_copies_on_both() {
+        // Lossy Atmos (E-AC-3 JOC) passes through on Apple TV and Shield.
+        let joc = aud(AudioCodec::Eac3, 6, ImmersiveAudio::DolbyAtmos);
+        assert_eq!(audio_plan(joc, &ClientProfile::apple_tv_4k()), AudioPlan::Copy);
+        assert_eq!(audio_plan(joc, &ClientProfile::nvidia_shield()), AudioPlan::Copy);
+        // But the pessimistic generic Android default has no atmos passthrough → re-encode.
+        assert!(matches!(
+            audio_plan(joc, &ClientProfile::generic_android_tv()),
+            AudioPlan::Transcode { .. }
+        ));
+    }
+
+    #[test]
+    fn flac_transcodes_to_aac_on_apple_tv() {
+        // Unsupported codec on Apple TV → re-encode. AAC because Apple TV has E-AC-3, so
+        // actually it targets E-AC-3; use a client without E-AC-3 to hit the AAC branch.
+        let flac = aud(AudioCodec::Flac, 2, ImmersiveAudio::None);
+        assert_eq!(
+            audio_plan(flac, &ClientProfile::apple_tv_4k()),
+            AudioPlan::Transcode { codec: AudioCodec::Eac3, channels: 2 }
+        );
+        assert_eq!(
+            audio_plan(flac, &ClientProfile::sdr_baseline()),
+            AudioPlan::Transcode { codec: AudioCodec::Aac, channels: 2 }
         );
     }
 
     #[test]
     fn audio_copies_through_when_supported() {
-        assert_eq!(audio_target(AudioCodec::Eac3, &ClientProfile::apple_tv_4k()), None);
-        assert_eq!(audio_target(AudioCodec::Aac, &ClientProfile::apple_tv_4k()), None);
+        assert_eq!(audio_plan(aud(AudioCodec::Eac3, 6, ImmersiveAudio::None), &ClientProfile::apple_tv_4k()), AudioPlan::Copy);
+        assert_eq!(audio_plan(aac(), &ClientProfile::apple_tv_4k()), AudioPlan::Copy);
+    }
+
+    #[test]
+    fn quality_original_copies_where_auto_would_cap() {
+        // A high-bitrate H.264 file that would be forced to transcode under Capped stays
+        // direct under Original / Auto.
+        let mut p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        p.bitrate = Some(40_000_000);
+        let capped = Quality { profile: QualityProfile::Capped, max_bitrate: Some(8_000_000) };
+        let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), capped, &hw_intel());
+        match d {
+            Decision::Transcode { reason, target } => {
+                assert_eq!(reason, "bitrate_capped");
+                assert_eq!(target.max_bitrate, Some(8_000_000));
+            }
+            _ => panic!("expected a capped transcode"),
+        }
+        // Original suppresses the bitrate re-encode.
+        let orig = Quality { profile: QualityProfile::Original, max_bitrate: Some(8_000_000) };
+        let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), orig, &hw_intel());
+        assert_eq!(d, Decision::DirectPlay { remux: false });
+    }
+
+    #[test]
+    fn from_capabilities_builds_profile() {
+        let caps = ClientCapabilities {
+            platform: Platform::Shield,
+            video_codecs: vec![VideoCodec::Hevc],
+            bit_depth_10: true,
+            hdr_display: true,
+            dolby_vision: true,
+            audio_codecs: vec![AudioCodec::Eac3, AudioCodec::TrueHd],
+            atmos_passthrough: true,
+            max_channels: 6,
+            containers: vec!["mkv".into()],
+            quality: QualityProfile::Auto,
+            max_bitrate: None,
+        };
+        let p: ClientProfile = caps.into();
+        assert_eq!(p.max_channels, 6);
+        assert!(p.atmos_passthrough);
+        assert!(p.supports_audio(AudioCodec::TrueHd));
     }
 }

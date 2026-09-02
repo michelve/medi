@@ -118,6 +118,33 @@ export interface SeasonWithEpisodes extends Season {
 }
 
 /**
+ * Immersive-audio marker on an audio track (`docs/.tasks/70`). Mirrors the backend
+ * `audio_streams.immersive` string.
+ */
+export type ImmersiveAudio = 'none' | 'dolby_atmos' | 'dts_x';
+
+/**
+ * One audio track of a media file (`audio_streams`, Task 70). Mirrors
+ * `medi_db::models::AudioStream`. `stream_index` is what react-native-video's
+ * `selectedAudioTrack` selects by.
+ */
+export interface AudioStream {
+  id: number;
+  media_file_id: number;
+  stream_index: number;
+  codec: string | null;
+  profile: string | null;
+  channels: number | null;
+  channel_layout: string | null;
+  bitrate: number | null;
+  sample_rate: number | null;
+  language: string | null;
+  title: string | null;
+  immersive: ImmersiveAudio;
+  is_default: boolean;
+}
+
+/**
  * A `media_files` row. Belongs to exactly one movie OR one episode. Mirrors
  * `medi_db::models::MediaFile`. Many fields are `null` until the file is probed.
  */
@@ -142,6 +169,8 @@ export interface MediaFile {
   dv_bl_compatible_id: number | null;
   dv_level: number | null;
   hw_decode_unsupported: boolean;
+  /** Audio tracks of this file (Task 70). Empty until probed. Drives `selectedAudioTrack`. */
+  audio_streams: AudioStream[];
 }
 
 /** A joined `credits` + `people` billing entry. */
@@ -179,7 +208,17 @@ export interface StreamDecision {
   url: string;
 }
 
-/** Client hints the stream decision honors (`?hdr=0&dv=0&sdr=1`). */
+/** The client platform selecting a static per-device capability default (`docs/.tasks/70`). */
+export type StreamPlatform = 'appletv' | 'shield' | 'androidtv';
+
+/** "Best available quality" control sent to `/api/stream` (`docs/.tasks/70`). */
+export type QualityProfile = 'original' | 'auto' | 'capped';
+
+/**
+ * Client hints the stream decision honors. The video hints (`hdr`/`dv`/`sdr`) are
+ * unchanged; Task 70 adds the audio + quality axis: `platform` picks the static device
+ * default, and the rest overlay a detected `AudioCapabilities` payload.
+ */
 export interface StreamHints {
   /** Display cannot render HDR — force SDR tone-map. */
   hdr?: boolean;
@@ -187,6 +226,21 @@ export interface StreamHints {
   dv?: boolean;
   /** Explicitly request an SDR result. */
   sdr?: boolean;
+  /** Selects the static per-platform capability default (`docs/.tasks/70`). */
+  platform?: StreamPlatform;
+  /** `EXTRA_MAX_CHANNEL_COUNT` — max audio channels the sink accepts. */
+  maxChannels?: number;
+  /**
+   * ExoPlayer `EXTRA_ENCODINGS` tokens (e.g. `['eac3', 'ac3', 'aac', 'eac3_joc']`).
+   * `eac3_joc` present ⇒ lossy Atmos passthrough. Overlays the platform default.
+   */
+  audio?: string[];
+  /** Convenience flag: adds `eac3_joc` to the audio set when true. */
+  atmos?: boolean;
+  /** `MaxStreamingBitrate` in bits/sec (uncapped when omitted). */
+  maxBitrate?: number;
+  /** `original` | `auto` | `capped`. */
+  quality?: QualityProfile;
 }
 
 // ---------------------------------------------------------------------------

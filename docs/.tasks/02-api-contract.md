@@ -21,6 +21,10 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
   `70-audio-quality-and-profiles.md`; the `MediaFile` detail carries an `audio_streams` list.
 - Transcoded output is HLS (playlist + segments) produced by the `transcode` crate.
 - Generated assets (`/config/previews`, `/config/trickplay`) are served by dedicated routes.
+- **`/` (and any non-`/api` path) serves the browser SPA** (`client/apps/web`) via a static
+  `fallback_service` with `index.html` history-fallback (`80-web-ui-client.md`). The fallback
+  fires only when no route matched, so the `/api/*` contract below is unchanged; a deep link
+  like `/movie/1` returns the app shell (`200`), not a `404`.
 
 ## Packages / crates
 
