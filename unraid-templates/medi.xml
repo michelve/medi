@@ -104,6 +104,51 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Required="false"
           Mask="false">all</Config>
 
+  <!-- Metadata provider API key. TMDB is free (themoviedb.org → Settings → API).
+       Without a key, titles still scan and play but have no posters/overview/credits. -->
+  <Config Name="TMDB API Key"
+          Target="TMDB_API_KEY"
+          Default=""
+          Mode=""
+          Description="TMDB API key for artwork + metadata (posters, overview, cast). Free from themoviedb.org (Settings → API). Leave blank to run without online metadata. Used when Metadata Provider is 'tmdb' (the default)."
+          Type="Variable"
+          Display="always"
+          Required="false"
+          Mask="true"></Config>
+
+  <!-- OMDb API key (only when Metadata Provider = omdb). -->
+  <Config Name="OMDb API Key"
+          Target="OMDB_API_KEY"
+          Default=""
+          Mode=""
+          Description="OMDb API key, used only when Metadata Provider is set to 'omdb'. Leave blank for the default TMDB provider."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="true"></Config>
+
+  <!-- Which metadata provider to use. -->
+  <Config Name="Metadata Provider"
+          Target="METADATA_PROVIDER"
+          Default="tmdb"
+          Mode=""
+          Description="Metadata source: 'tmdb' (default, needs TMDB API Key) or 'omdb' (needs OMDb API Key)."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">tmdb</Config>
+
+  <!-- Metadata language (BCP-47, e.g. en-US, fr-FR). -->
+  <Config Name="Metadata Language"
+          Target="METADATA_LANGUAGE"
+          Default="en-US"
+          Mode=""
+          Description="Preferred metadata language (BCP-47), e.g. en-US, fr-FR, de-DE."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">en-US</Config>
+
   <!-- Bind address (rarely changed). -->
   <Config Name="BIND_ADDR"
           Target="BIND_ADDR"
