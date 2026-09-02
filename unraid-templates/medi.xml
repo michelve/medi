@@ -23,6 +23,9 @@
   <Project>https://github.com/michelve/medi</Project>
   <!-- "Read Me First" in the container's right-click menu. -->
   <ReadMe>https://github.com/michelve/medi</ReadMe>
+  <!-- Shown in Unraid's update dialog ("Changes"). Points at the release list so a
+       user can see what a pending :latest update contains before applying it. -->
+  <Changes>https://github.com/michelve/medi/releases</Changes>
 
   <Overview>medi is a self-hosted, hardware-accelerated media server for Unraid: a unified movie + TV library with a 10-foot TV client, Netflix-style hover previews, trickplay scrubbing, and on-the-fly HDR/Dolby Vision-aware transcoding via jellyfin-ffmpeg. Intel QSV and AMD VA-API run through /dev/dri; NVIDIA NVENC runs through the host NVIDIA container runtime. Point it at your movies share (mounted Read-Only) and browse from your TV.</Overview>
 
@@ -42,7 +45,9 @@ INTEL / AMD (QSV / VA-API): keep the "/dev/dri" device mapping below. That is al
 
 NVIDIA (NVENC): set Extra Parameters to "--runtime=nvidia" (toggle Advanced View) and keep the "NVIDIA_VISIBLE_DEVICES=all" variable. You may remove the "/dev/dri" device if the host has no Intel/AMD GPU.
 
-Volumes: /config is read-write appdata (SQLite library, previews, trickplay, HLS cache). /media is your library, mounted READ-ONLY so no scanner/asset bug can ever touch your files.</Description>
+Volumes: /config is read-write appdata (SQLite library, previews, trickplay, HLS cache). /media is your library, mounted READ-ONLY so no scanner/asset bug can ever touch your files.
+
+Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Check for Updates" (or the CA Auto Update Applications plugin) to update — a prompt means a new tagged release is out; your /config and /media survive the update. To track the bleeding edge instead, change the Repository to "ghcr.io/michelve/medi:edge"; to freeze on a version, pin a tag like "ghcr.io/michelve/medi:0.2.0".</Description>
 
   <!-- Web UI / API port: container 8096 -> host port. -->
   <Config Name="WebUI Port"
