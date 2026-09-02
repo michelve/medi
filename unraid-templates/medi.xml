@@ -21,6 +21,8 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/michelve/medi/issues</Support>
   <Project>https://github.com/michelve/medi</Project>
+  <!-- "Read Me First" in the container's right-click menu. -->
+  <ReadMe>https://github.com/michelve/medi</ReadMe>
 
   <Overview>medi is a self-hosted, hardware-accelerated media server for Unraid: a unified movie + TV library with a 10-foot TV client, Netflix-style hover previews, trickplay scrubbing, and on-the-fly HDR/Dolby Vision-aware transcoding via jellyfin-ffmpeg. Intel QSV and AMD VA-API run through /dev/dri; NVIDIA NVENC runs through the host NVIDIA container runtime. Point it at your movies share (mounted Read-Only) and browse from your TV.</Overview>
 
