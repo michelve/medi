@@ -43,7 +43,52 @@ docker run --rm -p 8096:8096 \
 ## Note
 
 The image is Linux/glibc and compiles the Rust backend, so it cannot be built on
-this Windows dev box (no Rust toolchain here — see the repo memory). Build it in
-CI or on the Unraid/Linux host. The Dockerfile is authored correct-by-construction
-against the confirmed backend contract (binary name `medi`, env defaults
+this Windows dev box — build it in CI (the canonical path) or on the Unraid/Linux
+host. (The Windows box *can* still `cargo test`/`cargo build` the backend for
+verification; it just can't produce the Debian runtime image.) The Dockerfile is
+authored against the confirmed backend contract (binary name `medi`, env defaults
 `/media` · `/config` · `0.0.0.0:8096`, `/api/health` → `ok`, self-migrating DB).
+
+## CI, releases & Unraid updates
+
+`.github/workflows/docker-publish.yml` is the canonical build. It gates every push
+and PR on the CI job (`cargo test --workspace` + web typecheck/build), then:
+
+| Trigger                     | Image tags published                          | Moves `:latest`? |
+| --------------------------- | --------------------------------------------- | ---------------- |
+| push to `main`              | `edge`, `sha-<short>`                          | **no**           |
+| push a tag `vX.Y.Z`         | `latest`, `X.Y.Z`, `X.Y`, `X`, `sha-<short>`  | **yes**          |
+| pull request                | *(builds only, nothing pushed)*               | no               |
+
+So `main` stays continuously built and tested, but the tag Unraid watches
+(`:latest`) only advances on a real release — an update prompt on Unraid always
+means a version you cut on purpose.
+
+### Cut a release
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0     # → the workflow builds, tests, and publishes :latest + v0.2.0
+```
+
+Use semver. The first `v*` build is also the moment to set the GHCR package
+**Public** (one-time), so Unraid can pull without auth:
+<https://github.com/michelve/medi/pkgs/container/medi>.
+
+### Updating on Unraid
+
+The template pins `ghcr.io/michelve/medi:latest`, so:
+
+- **Manual:** Docker tab → medi → **Check for Updates** (or *Force Update*). Unraid
+  compares the local image digest against `:latest` on GHCR and shows
+  "update ready" once a new release is published; **Apply Update** pulls and
+  recreates the container. `/config` and `/media` are volumes, so data survives.
+- **Automatic:** install **CA Auto Update Applications** (Community Applications →
+  search "Auto Update"). Enable auto-update for `medi` and pick a schedule; it
+  watches the `:latest` digest and updates the container hands-off. Because
+  `:latest` only moves on tagged releases, this won't churn on every dev commit.
+- **Bleeding edge (opt-in):** to track `main` instead, edit the container's
+  *Repository* to `ghcr.io/michelve/medi:edge`. Then every green push to `main`
+  is an available update. Not recommended for a stable box.
+- **Pin a version:** set *Repository* to a specific tag, e.g.
+  `ghcr.io/michelve/medi:0.2.0`, to freeze updates entirely.

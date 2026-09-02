@@ -112,9 +112,19 @@ export interface Episode {
   overview: string | null;
 }
 
+/**
+ * An episode together with its on-disk media files (`EpisodeWithFiles`). The `Episode`
+ * row is flattened in, so its fields sit at the top level alongside `media_files` — the
+ * same shape as `MovieDetail`. The primary file's `id` is the `file_id` passed to
+ * `GET /api/stream/:file_id` to play the episode. Empty until the file is ingested/probed.
+ */
+export interface EpisodeWithFiles extends Episode {
+  media_files: MediaFile[];
+}
+
 /** A season together with its ordered episodes (`SeasonWithEpisodes`). */
 export interface SeasonWithEpisodes extends Season {
-  episodes: Episode[];
+  episodes: EpisodeWithFiles[];
 }
 
 /**
@@ -206,6 +216,28 @@ export interface StreamDecision {
   reason: string;
   /** `/api/direct/:file_id` (direct) or an `index.m3u8` URL (hls). */
   url: string;
+}
+
+/**
+ * `GET /api/trickplay/:file_id/meta` — grid geometry of a title's tiled-JPG scrub-thumbnail
+ * mosaic. Mirrors the backend `TrickplayMeta` (snake_case wire shape). The mosaic image
+ * itself is fetched from `ApiClient.trickplayUrl(file_id, 'jpg')`. A `404` from this route
+ * means "no croppable thumbnails" (BIF-only or none) — callers fall back to a plain bar.
+ */
+export interface TrickplayMetaResponse {
+  file_id: number;
+  /** Always `"tiled_jpg"` when 200 (the only client-croppable kind). */
+  kind: string;
+  /** Milliseconds between sampled frames. */
+  interval_ms: number;
+  /** Width of one thumbnail cell, px. */
+  tile_w: number;
+  /** Height of one thumbnail cell, px. */
+  tile_h: number;
+  /** Columns in the mosaic. */
+  cols: number;
+  /** Rows in the mosaic. */
+  rows: number;
 }
 
 /** The client platform selecting a static per-device capability default (`docs/.tasks/70`). */

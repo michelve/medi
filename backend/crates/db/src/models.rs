@@ -423,12 +423,26 @@ pub struct MovieDetail {
     pub credits: Vec<Credit>,
 }
 
-/// A season together with its ordered episodes.
+/// An episode together with its on-disk media files (each with audio tracks).
+///
+/// The `Episode` row flattens to the top level (so `id`, `episode_number`, `title`,
+/// `overview` stay where clients expect them) and `media_files` sits alongside — the
+/// same shape `MovieDetail` uses. Carrying the files here lets the web/TV clients play
+/// an episode directly (Task 82): the primary file's `id` is the `file_id` handed to
+/// `GET /api/stream/:file_id`. Empty until the episode's file is ingested/probed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpisodeWithFiles {
+    #[serde(flatten)]
+    pub episode: Episode,
+    pub media_files: Vec<MediaFile>,
+}
+
+/// A season together with its ordered episodes (each with its media files).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeasonWithEpisodes {
     #[serde(flatten)]
     pub season: Season,
-    pub episodes: Vec<Episode>,
+    pub episodes: Vec<EpisodeWithFiles>,
 }
 
 /// Full series detail: the series plus its seasons/episodes and billed credits.

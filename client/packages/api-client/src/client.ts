@@ -26,6 +26,7 @@ import type {
   SeriesDetail,
   StreamDecision,
   StreamHints,
+  TrickplayMetaResponse,
 } from './types';
 
 export interface ApiClientOptions {
@@ -133,6 +134,16 @@ export class ApiClient {
       opts,
       /* cacheable */ false,
     );
+  }
+
+  /**
+   * `GET /api/trickplay/:file_id/meta` — tiled-JPG mosaic geometry for scrub thumbnails.
+   * Throws `ApiError` with `isNotFound` when the title has no croppable trickplay sheet
+   * (BIF-only or none) — the caller treats that as "no thumbnails" and shows a plain bar.
+   * Pair the geometry with `trickplayUrl(fileId, 'jpg')` for the mosaic image.
+   */
+  trickplayMeta(fileId: number, opts: RequestOptions = {}): Promise<TrickplayMetaResponse> {
+    return this.getJson<TrickplayMetaResponse>(`/api/trickplay/${fileId}/meta`, opts, false);
   }
 
   // -- Metadata enrichment (Phase A, `docs/.tasks/60`) ---------------------

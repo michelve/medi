@@ -8,9 +8,10 @@ import { createRoot } from 'react-dom/client';
 import { RouterProvider } from 'react-router-dom';
 import { ApiProvider } from './api';
 import { router } from './router';
-import { installThemeVars } from './theme';
+import { installThemeVars, installGlobalStyles } from './theme';
 
 installThemeVars();
+installGlobalStyles();
 
 const container = document.getElementById('root');
 if (!container) throw new Error('missing #root element');

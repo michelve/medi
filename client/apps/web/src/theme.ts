@@ -21,3 +21,21 @@ export function installThemeVars(root: HTMLElement = document.documentElement): 
   root.style.setProperty('--medi-text-muted', theme.colors.textMuted);
   root.style.setProperty('--medi-accent', theme.colors.accent);
 }
+
+/**
+ * Install the handful of global rules the inline-styled components can't express
+ * (`:hover`, `::placeholder`). Idempotent — guarded by an id so React StrictMode's
+ * double-invoke or a hot reload won't stack duplicate `<style>` tags.
+ */
+export function installGlobalStyles(doc: Document = document): void {
+  const id = 'medi-global-styles';
+  if (doc.getElementById(id)) return;
+  const style = doc.createElement('style');
+  style.id = id;
+  style.textContent = `
+    .medi-poster-card { transition: transform 120ms ease; }
+    .medi-poster-card:hover { transform: scale(1.04); }
+    .medi-search-input::placeholder { color: ${theme.colors.textMuted}; }
+  `;
+  doc.head.appendChild(style);
+}

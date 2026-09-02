@@ -23,6 +23,15 @@ export default defineConfig({
       ),
       '@medi/ui/theme': fileURLToPath(new URL('../../packages/ui/src/theme', import.meta.url)),
       '@medi/ui/types': fileURLToPath(new URL('../../packages/ui/src/types', import.meta.url)),
+      // Pure, RN-free player submodules (state reducer + trickplay math). The `@medi/player`
+      // root re-exports react-native components, so import these directly — same rule as
+      // `@medi/ui/theme`.
+      '@medi/player/usePlayerControls': fileURLToPath(
+        new URL('../../packages/player/src/usePlayerControls', import.meta.url),
+      ),
+      '@medi/player/trickplay': fileURLToPath(
+        new URL('../../packages/player/src/trickplay', import.meta.url),
+      ),
     },
   },
   server: {

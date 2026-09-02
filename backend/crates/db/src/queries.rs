@@ -12,8 +12,8 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
-    AudioStream, Credit, Episode, LibraryCard, MediaFile, Movie, MovieDetail, Season,
-    SeasonWithEpisodes, Series, SeriesDetail, TrickplayAsset,
+    AudioStream, Credit, Episode, EpisodeWithFiles, LibraryCard, MediaFile, Movie, MovieDetail,
+    Season, SeasonWithEpisodes, Series, SeriesDetail, TrickplayAsset,
 };
 use crate::{DbError, DbResult};
 
@@ -302,7 +302,18 @@ pub fn get_series_detail(conn: &Connection, id: i64) -> DbResult<SeriesDetail> {
 
     let mut seasons_with_eps = Vec::with_capacity(seasons.len());
     for season in seasons {
-        let episodes = episodes_for_season(conn, season.id)?;
+        // Hydrate each episode with its media files so clients can play it directly
+        // (Task 82): the primary file's id is the `file_id` for `GET /api/stream`.
+        let episodes = episodes_for_season(conn, season.id)?
+            .into_iter()
+            .map(|episode| {
+                let media_files = media_files_for_episode(conn, episode.id)?;
+                Ok(EpisodeWithFiles {
+                    episode,
+                    media_files,
+                })
+            })
+            .collect::<DbResult<Vec<_>>>()?;
         seasons_with_eps.push(SeasonWithEpisodes { season, episodes });
     }
 

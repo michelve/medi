@@ -95,3 +95,14 @@ client/apps/web/src/
 
 - `80-web-ui-client.md` — this task fills the `components/` and `pages/` directories `80`
   scaffolds; the Play buttons it stubs are completed in `82`.
+
+## Follow-ups (out of scope here)
+
+- **Server-side text search.** The `SearchSortBar` box filters only the already-loaded
+  grid items client-side. A whole-catalog `GET /api/search?q=` belongs in a later spec that
+  adds it to `02-api-contract.md` (route + `search()` client method) and points the box at
+  it. Flagged in `SearchSortBar.tsx` / `LibraryPage.tsx`.
+- ~~**Per-episode playable file.**~~ **Done** (2026-09-02): `SeriesDetail` now hydrates each
+  episode's `media_files` via the new `EpisodeWithFiles` aggregate (`medi-db` model + query,
+  mirrored in `@medi/api-client`), so `EpisodeList` resolves a real `file_id`. `82` only
+  needs to inject the `onPlay` handler.

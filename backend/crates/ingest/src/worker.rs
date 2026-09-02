@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(detail.seasons.len(), 1);
         assert_eq!(detail.seasons[0].episodes.len(), 1);
         assert_eq!(
-            detail.seasons[0].episodes[0].title.as_deref(),
+            detail.seasons[0].episodes[0].episode.title.as_deref(),
             Some("Good News About Hell")
         );
     }

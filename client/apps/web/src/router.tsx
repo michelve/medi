@@ -1,12 +1,22 @@
 /**
- * Route table for the web SPA (Task 80 scaffold). Browse (`81`) and playback/admin (`82`)
- * flesh these out; for now `/` renders a minimal home that proves same-origin fetch works,
- * and a catch-all keeps deep links from erroring before their pages exist.
+ * Route table for the web SPA. Task 81 fills in the browse routes; Task 82 adds
+ * playback (`/watch/:fileId`) and admin (`/settings/...`).
+ *
+ * `/`                    — library poster wall (infinite scroll + search/sort)
+ * `/movie/:id`           — movie detail (overview, credits, files)
+ * `/series/:id`          — series detail (seasons → episodes)
+ * `/play/:fileId`        — in-browser player (direct / HLS)
+ * `/settings/libraries`  — library management (create/scan/edit/delete)
+ * `*`                    — catch-all for deep links no page owns yet
  */
 
 import { createBrowserRouter } from 'react-router-dom';
 import { App } from './App';
-import { HomePage } from './pages/HomePage';
+import { LibraryPage } from './pages/LibraryPage';
+import { MovieDetailPage } from './pages/MovieDetailPage';
+import { SeriesDetailPage } from './pages/SeriesDetailPage';
+import { PlayerPage } from './pages/PlayerPage';
+import { LibrariesPage } from './pages/LibrariesPage';
 import { NotFoundPage } from './pages/NotFoundPage';
 
 export const router = createBrowserRouter([
@@ -14,8 +24,11 @@ export const router = createBrowserRouter([
     path: '/',
     element: <App />,
     children: [
-      { index: true, element: <HomePage /> },
-      // 81/82 add: /movie/:id, /series/:id, /watch/:fileId, /settings/libraries …
+      { index: true, element: <LibraryPage /> },
+      { path: 'movie/:id', element: <MovieDetailPage /> },
+      { path: 'series/:id', element: <SeriesDetailPage /> },
+      { path: 'play/:fileId', element: <PlayerPage /> },
+      { path: 'settings/libraries', element: <LibrariesPage /> },
       { path: '*', element: <NotFoundPage /> },
     ],
   },

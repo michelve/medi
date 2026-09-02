@@ -6,7 +6,9 @@
     "paths": {
       "@medi/api-client": ["../../packages/api-client/src"],
       "@medi/ui/theme": ["../../packages/ui/src/theme"],
-      "@medi/ui/types": ["../../packages/ui/src/types"]
+      "@medi/ui/types": ["../../packages/ui/src/types"],
+      "@medi/player/usePlayerControls": ["../../packages/player/src/usePlayerControls"],
+      "@medi/player/trickplay": ["../../packages/player/src/trickplay"]
     }
   },
   "include": ["vite.config.ts", "src/**/*.ts", "src/**/*.tsx"]
