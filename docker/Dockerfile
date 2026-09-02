@@ -67,7 +67,9 @@ https://repo.jellyfin.org/debian bookworm main" > /etc/apt/sources.list.d/jellyf
 # -- The binary + entrypoint -------------------------------------------------
 COPY --from=build /usr/local/bin/medi /usr/local/bin/medi
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# Strip any CR (a Windows checkout can leave CRLF, which makes Linux look for a
+# `bash\r` interpreter and crash-loop the container) then make it executable.
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
 
 # Defaults mirror medi_core::AppConfig (all overridable via env / Unraid template).
 #   MEDIA_DIR  read-only media source   CONFIG_DIR  read-write appdata (SQLite + assets)

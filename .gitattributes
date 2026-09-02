@@ -1,6 +1,11 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 
+# Shell scripts MUST stay LF — a CRLF shebang makes Linux look for `bash\r`
+# and the container crash-loops. Force LF regardless of the checkout platform.
+*.sh text eol=lf
+docker/entrypoint.sh text eol=lf
+
 # Binary assets: never normalize line endings.
 *.png binary
 *.jpg binary
