@@ -23,9 +23,11 @@ use serde::Deserialize;
 use tower::ServiceExt;
 use tower_http::services::{ServeDir, ServeFile};
 
+use medi_core::{AudioCodec, ImmersiveAudio, Platform, QualityProfile};
 use medi_db::queries::{self, LibraryCursor, LibrarySort};
 use medi_transcode::{
-    audio_target, decide, AudioCodec, AudioTarget, ClientProfile, Decision, PLAYLIST_NAME,
+    audio_plan, decide, AudioPlan, AudioTarget, AudioTrack, ClientProfile, Decision, Quality,
+    PLAYLIST_NAME,
 };
 
 use crate::cursor;
@@ -43,6 +45,7 @@ use medi_metadata::{EnrichOutcome, ProviderId};
 pub fn router(state: AppState) -> Router {
     let images = ServeDir::new(state.config.images_dir());
     let previews = ServeDir::new(state.config.previews_dir());
+    let web_dir = state.config.web_dir();
 
     Router::new()
         // Liveness (no state needed, but uniform under /api).
@@ -86,7 +89,22 @@ pub fn router(state: AppState) -> Router {
         .route("/api/trickplay/:file_id/meta", get(trickplay_meta))
         // Artwork.
         .nest_service("/api/images", images)
+        // Web SPA (`docs/.tasks/80`): serve the built browser client at `/` and any
+        // non-`/api` path. `fallback_service` only fires when no route above matched, so
+        // the `/api/*` contract is never shadowed. `not_found_service(index.html)` gives
+        // SPA history-fallback — a deep link like `/movie/1` returns the app shell (200),
+        // and the client router takes over. The assets ship in the image at `web_dir`.
+        .fallback_service(web_spa(&web_dir))
         .with_state(state)
+}
+
+/// The static-file service for the web SPA: serve files from `web_dir`, falling back to
+/// `index.html` for unmatched paths (client-side routing / deep links). `ServeFile`
+/// returns `200`, so a deep link like `/movie/1` yields the shell with a `200`, not a
+/// `404`.
+fn web_spa(web_dir: &std::path::Path) -> ServeDir<ServeFile> {
+    let index = web_dir.join("index.html");
+    ServeDir::new(web_dir).fallback(ServeFile::new(index))
 }
 
 // ---------------------------------------------------------------------------
@@ -370,13 +388,17 @@ fn map_enrich_err(e: medi_metadata::Error) -> ApiError {
 // Playback — Phase 2 (transcode crate).
 // ---------------------------------------------------------------------------
 
-/// Client capability hints for `/api/stream` (query params). Absent → the Apple TV 4K
-/// baseline. The client sends what its display/decoder can present so the server can
-/// direct-play when possible (e.g. Dolby Vision to a DV-capable Apple TV).
+/// Client capability hints for `/api/stream` (query params, `docs/.tasks/70`). The
+/// `platform` selects a static per-device default; explicitly-sent params overlay it, so
+/// a Shield reporting `max_channels=6` overrides the Shield 8-channel default. Absent
+/// entirely → the Apple TV 4K baseline (back-compat with the old `hdr`/`dv`/`sdr` hints).
 #[derive(Debug, Deserialize)]
 pub struct StreamQuery {
-    /// `1`/`true` when the connected display is HDR-capable. Omitted → assume HDR
-    /// (Apple TV 4K default); pass `hdr=0` to force SDR tone-mapping.
+    /// `appletv` | `shield` | `androidtv` — selects the static default profile.
+    #[serde(default)]
+    platform: Option<String>,
+    /// `1`/`true` when the connected display is HDR-capable. Omitted → the platform
+    /// default; pass `hdr=0` to force SDR tone-mapping.
     #[serde(default)]
     hdr: Option<String>,
     /// `1`/`true` when the client+display can present Dolby Vision.
@@ -385,6 +407,19 @@ pub struct StreamQuery {
     /// Force a conservative SDR/H.264 profile (testing / legacy clients).
     #[serde(default)]
     sdr: Option<String>,
+    /// `EXTRA_MAX_CHANNEL_COUNT` — max audio channels the sink accepts.
+    #[serde(default)]
+    max_channels: Option<u8>,
+    /// ExoPlayer `EXTRA_ENCODINGS`, comma-separated (`eac3,ac3,aac,truehd,dtshd,eac3_joc`);
+    /// `eac3_joc` ⇒ lossy Atmos passthrough. Overlays the platform default when present.
+    #[serde(default)]
+    audio: Option<String>,
+    /// `MaxStreamingBitrate` in bits/sec (`0`/absent = uncapped).
+    #[serde(default)]
+    max_bitrate: Option<u64>,
+    /// `original` | `auto` | `capped`.
+    #[serde(default)]
+    quality: Option<String>,
 }
 
 fn truthy(v: Option<&str>) -> Option<bool> {
@@ -395,13 +430,51 @@ fn truthy(v: Option<&str>) -> Option<bool> {
     }
 }
 
-/// Build the effective [`ClientProfile`] from the request hints, starting from the
-/// Apple TV 4K baseline (or the SDR baseline when `sdr=1`).
+/// Parse the `platform` param to a [`Platform`] (unknown/absent → `Unknown`, which the
+/// profile builder resolves to the Apple TV baseline).
+fn parse_platform(raw: Option<&str>) -> Platform {
+    match raw {
+        Some("appletv") => Platform::AppleTv,
+        Some("shield") => Platform::Shield,
+        Some("androidtv") => Platform::AndroidTv,
+        _ => Platform::Unknown,
+    }
+}
+
+/// Parse one `EXTRA_ENCODINGS` token to an [`AudioCodec`]. `eac3_joc` is Atmos, handled
+/// by the caller as `atmos_passthrough`, so here it maps to `eac3`.
+fn parse_audio_codec(tok: &str) -> Option<AudioCodec> {
+    match tok.trim().to_ascii_lowercase().as_str() {
+        "aac" => Some(AudioCodec::Aac),
+        "ac3" => Some(AudioCodec::Ac3),
+        "eac3" | "eac3_joc" => Some(AudioCodec::Eac3),
+        "dts" => Some(AudioCodec::Dts),
+        "dtshd" => Some(AudioCodec::DtsHd),
+        "truehd" => Some(AudioCodec::TrueHd),
+        "flac" => Some(AudioCodec::Flac),
+        "opus" => Some(AudioCodec::Opus),
+        "pcm" => Some(AudioCodec::Pcm),
+        _ => None,
+    }
+}
+
+fn parse_quality(raw: Option<&str>) -> QualityProfile {
+    match raw {
+        Some("original") => QualityProfile::Original,
+        Some("capped") => QualityProfile::Capped,
+        _ => QualityProfile::Auto,
+    }
+}
+
+/// Build the effective [`ClientProfile`] from the request hints: start from the
+/// `platform` static default (or the SDR baseline when `sdr=1`), then overlay any
+/// explicitly-sent params (`docs/.tasks/70`).
 fn client_profile(q: &StreamQuery) -> ClientProfile {
     if truthy(q.sdr.as_deref()) == Some(true) {
         return ClientProfile::sdr_baseline();
     }
-    let mut p = ClientProfile::apple_tv_4k();
+    let mut p = ClientProfile::for_platform(parse_platform(q.platform.as_deref()));
+
     if let Some(hdr) = truthy(q.hdr.as_deref()) {
         p.hdr_display = hdr;
     }
@@ -412,7 +485,73 @@ fn client_profile(q: &StreamQuery) -> ClientProfile {
     if !p.hdr_display {
         p.dolby_vision = false;
     }
+
+    // Overlay a detected max-channel count (e.g. a 5.1 AVR on a Shield).
+    if let Some(mc) = q.max_channels {
+        p.max_channels = mc.max(2);
+    }
+    // Overlay a detected `EXTRA_ENCODINGS` set — the client is authoritative when it
+    // reports one (Android). `eac3_joc` present ⇒ lossy Atmos passthrough.
+    if let Some(raw) = q.audio.as_deref() {
+        let tokens: Vec<&str> = raw.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        if !tokens.is_empty() {
+            p.atmos_passthrough = tokens.iter().any(|t| t.eq_ignore_ascii_case("eac3_joc"));
+            let codecs: Vec<AudioCodec> = tokens.iter().filter_map(|t| parse_audio_codec(t)).collect();
+            if !codecs.is_empty() {
+                p.audio_codecs = codecs;
+            }
+        }
+    }
     p
+}
+
+/// Build the [`Quality`] control from the request (`docs/.tasks/70`).
+fn quality_from(q: &StreamQuery) -> Quality {
+    Quality {
+        profile: parse_quality(q.quality.as_deref()),
+        // A `0` cap means "uncapped".
+        max_bitrate: q.max_bitrate.filter(|&b| b > 0),
+    }
+}
+
+/// Pick the source audio track `decide` reasons over: the `is_default` track, else the
+/// lowest `stream_index`. Maps the db read model into the transcode [`AudioTrack`]
+/// descriptor. Returns the AAC-safe default when the file has no `audio_streams`
+/// children (un-probed / pre-Task-70), so an unknown-audio row never forces a needless
+/// remux (`docs/.tasks/70` §Backward compat).
+fn default_audio_track(streams: &[medi_db::models::AudioStream]) -> AudioTrack {
+    let Some(track) = streams
+        .iter()
+        .find(|s| s.is_default)
+        .or_else(|| streams.iter().min_by_key(|s| s.stream_index))
+    else {
+        return AudioTrack::unknown_safe();
+    };
+
+    let codec = match track.codec.as_deref() {
+        Some("aac") => AudioCodec::Aac,
+        Some("ac3") => AudioCodec::Ac3,
+        Some("eac3") => AudioCodec::Eac3,
+        Some("dts") => AudioCodec::Dts,
+        Some("dtshd") => AudioCodec::DtsHd,
+        Some("truehd") => AudioCodec::TrueHd,
+        Some("flac") => AudioCodec::Flac,
+        Some("opus") => AudioCodec::Opus,
+        Some("pcm") => AudioCodec::Pcm,
+        // An unknown / absent codec is treated as the AAC-safe default: never force a
+        // needless remux on a row we can't classify.
+        _ => return AudioTrack::unknown_safe(),
+    };
+    let immersive = match track.immersive.as_str() {
+        "dolby_atmos" => ImmersiveAudio::DolbyAtmos,
+        "dts_x" => ImmersiveAudio::DtsX,
+        _ => ImmersiveAudio::None,
+    };
+    AudioTrack {
+        codec,
+        channels: track.channels.unwrap_or(0).clamp(0, 255) as u8,
+        immersive,
+    }
 }
 
 /// `GET /api/stream/:file_id` — direct-play vs transcode decision.
@@ -434,13 +573,13 @@ async fn stream_decision(
     };
 
     let client = client_profile(&q);
-    // Audio codec is not yet extracted into `media_files` (Phase 1 probed video only),
-    // so assume a client-supported track: this never forces a *needless* audio remux.
-    // A future schema column feeds the real audio codec here.
-    let audio = AudioCodec::Aac;
+    let quality = quality_from(&q);
+    // The default audio track's real descriptor (`docs/.tasks/70`), or the AAC-safe
+    // default when the file has no probed `audio_streams` — never a needless remux.
+    let audio = default_audio_track(&file.audio_streams);
     let container = file.container.as_deref().unwrap_or("");
 
-    let decision = decide(&profile, audio, container, &client, &state.caps);
+    let decision = decide(&profile, audio, container, &client, quality, &state.caps);
     tracing::info!(
         file_id,
         mode = decision.mode(),
@@ -452,9 +591,11 @@ async fn stream_decision(
         Decision::DirectPlay { .. } => format!("/api/direct/{file_id}"),
         Decision::Transcode { target, .. } => {
             let src = std::path::PathBuf::from(&file.path);
-            let audio_tgt = match audio_target(audio, &client) {
-                Some(c) => AudioTarget::Transcode(c),
-                None => AudioTarget::Copy,
+            let audio_tgt = match audio_plan(audio, &client) {
+                AudioPlan::Copy => AudioTarget::Copy,
+                AudioPlan::Transcode { codec, channels } => {
+                    AudioTarget::Transcode { codec, channels }
+                }
             };
             let session_id = state
                 .transcode

@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": ["react", "react-dom", "vite/client"],
+    "paths": {
+      "@medi/api-client": ["../../packages/api-client/src"],
+      "@medi/ui/theme": ["../../packages/ui/src/theme"],
+      "@medi/ui/types": ["../../packages/ui/src/types"]
+    }
+  },
+  "include": ["vite.config.ts", "src/**/*.ts", "src/**/*.tsx"]
+}

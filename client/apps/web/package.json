@@ -1,0 +1,26 @@
+{
+  "name": "@medi/web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser SPA (Vite + React DOM) served by the medi binary at /. Task 80.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@medi/api-client": "*",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "react-router-dom": "6.30.1"
+  },
+  "devDependencies": {
+    "@types/react": "~19.1.0",
+    "@types/react-dom": "~19.1.0",
+    "@vitejs/plugin-react": "4.3.4",
+    "typescript": "~5.9.2",
+    "vite": "6.0.7"
+  }
+}

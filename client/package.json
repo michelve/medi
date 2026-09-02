@@ -10,6 +10,9 @@
     "tv": "yarn workspace @medi/tv start",
     "tv:ios": "yarn workspace @medi/tv ios",
     "tv:android": "yarn workspace @medi/tv android",
-    "tv:prebuild": "yarn workspace @medi/tv prebuild"
+    "tv:prebuild": "yarn workspace @medi/tv prebuild",
+    "web:dev": "yarn workspace @medi/web dev",
+    "web:build": "yarn workspace @medi/web build",
+    "web:typecheck": "yarn workspace @medi/web typecheck"
   }
 }

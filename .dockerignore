@@ -1,8 +1,11 @@
 # Keep the Docker build context small and fast for Unraid pulls (docs/.tasks/50
-# §Scaling). Only `backend/` (compiled in the build stage) and `docker/` are needed.
+# §Scaling). `backend/` (build stage) + `client/` (web stage, Task 80) + `docker/` are
+# needed; a clean `yarn install` runs in the web stage, so ship source but not the huge
+# node_modules / target trees.
 **/target
 **/node_modules
-client
+# NOTE: `client/` is intentionally NOT ignored — the web stage builds @medi/web from it.
+client/apps/*/dist
 docs
 unraid-templates
 .git

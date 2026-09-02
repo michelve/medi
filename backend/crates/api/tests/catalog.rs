@@ -288,8 +288,11 @@ async fn stream_unknown_file_is_404() {
 
 #[tokio::test]
 async fn stream_dv_to_apple_tv_default_direct_plays() {
-    // File 88 is a Dolby Vision P5 movie. With no client hints the server assumes the
-    // Apple TV 4K baseline (DV-capable, HDR display) → direct play, no transcode.
+    // File 88 is a Dolby Vision P5 movie in an **MKV** container. With no client hints the
+    // server assumes the Apple TV 4K baseline (DV-capable, HDR display), so the *video*
+    // direct-plays — no GPU/HLS transcode — but AVPlayer cannot open MKV, so the response
+    // is a container remux (`mode: direct`, reason `remux_container_or_audio`), served over
+    // `/api/direct`. The point of the test is that DV does NOT force a video transcode.
     let (app, _dir) = seeded_app();
     let resp = app
         .oneshot(
@@ -301,8 +304,8 @@ async fn stream_dv_to_apple_tv_default_direct_plays() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
-    assert_eq!(json["mode"], "direct");
-    assert_eq!(json["reason"], "direct_play");
+    assert_eq!(json["mode"], "direct", "DV video must not be transcoded to HLS");
+    assert_eq!(json["reason"], "remux_container_or_audio", "MKV can't direct-play on AVPlayer");
     assert_eq!(json["url"], "/api/direct/88");
 }
 
@@ -332,6 +335,131 @@ async fn stream_dv_to_sdr_display_transcodes_via_hls() {
     let url = json["url"].as_str().unwrap();
     assert!(url.starts_with("/api/hls/"));
     assert!(url.ends_with("/index.m3u8"), "fMP4 HLS playlist url: {url}");
+}
+
+// ---------------------------------------------------------------------------
+// Audio-aware playback decision (Task 70) — per-device passthrough + downmix.
+// ---------------------------------------------------------------------------
+
+/// An app seeded with H.264/MP4 files carrying specific audio tracks, so the *video*
+/// always direct-plays and only the audio axis drives the decision (`docs/.tasks/70`).
+///   file 200: TrueHD 7.1 Atmos default track (lossless bitstream).
+///   file 201: E-AC-3 5.1 default track (supported everywhere).
+///   file 202: high-bitrate H.264 (40 Mbps) with an AAC track (for the Capped test).
+fn audio_app() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO movies (id, title, sort_title, added_at) \
+                VALUES (30, 'TrueHD Movie', 'truehd movie', 100), \
+                       (31, 'EAC3 Movie', 'eac3 movie', 200), \
+                       (32, 'Big Movie', 'big movie', 300);
+             INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth) \
+                VALUES (200, 30, '/media/truehd.mp4', 'mp4', 'h264', 1920, 1080, 8);
+             INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth) \
+                VALUES (201, 31, '/media/eac3.mp4', 'mp4', 'h264', 1920, 1080, 8);
+             INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth, bitrate) \
+                VALUES (202, 32, '/media/big.mp4', 'mp4', 'h264', 3840, 2160, 8, 40000000);
+             -- Default audio tracks.
+             INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, immersive, is_default) \
+                VALUES (200, 1, 'truehd', 8, 'dolby_atmos', 1);
+             INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, immersive, is_default) \
+                VALUES (201, 1, 'eac3', 6, 'none', 1);
+             INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, immersive, is_default) \
+                VALUES (202, 1, 'aac', 2, 'none', 1);",
+        )
+        .unwrap();
+    }
+
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 4, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    (router(state), dir)
+}
+
+#[tokio::test]
+async fn truehd_direct_plays_to_shield() {
+    // Shield bitstreams TrueHD losslessly and opens MP4 → full direct play, no transcode.
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(Request::get("/api/stream/200?platform=shield").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "direct");
+    assert_eq!(json["reason"], "direct_play", "Shield bitstreams TrueHD");
+    assert_eq!(json["url"], "/api/direct/200");
+}
+
+#[tokio::test]
+async fn truehd_remuxes_audio_for_apple_tv() {
+    // Apple TV can't bitstream TrueHD → video copies, audio must re-encode (a remux). No
+    // FFMPEG needed: an audio-only fix is served over /api/direct, not an HLS session.
+    std::env::set_var("FFMPEG_BIN", "true");
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(Request::get("/api/stream/200?platform=appletv").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "direct");
+    assert_eq!(json["reason"], "remux_container_or_audio", "Apple TV re-encodes TrueHD");
+}
+
+#[tokio::test]
+async fn low_channel_cap_downmixes() {
+    // An E-AC-3 5.1 track to an androidtv default (stereo, no passthrough) exceeds the
+    // 2-channel cap → the audio must be downmixed (a remux), even though the codec is fine.
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(Request::get("/api/stream/201?platform=androidtv").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["reason"], "remux_container_or_audio", "5.1 over a stereo cap downmixes");
+}
+
+#[tokio::test]
+async fn eac3_direct_plays_to_apple_tv() {
+    // Baseline: a supported E-AC-3 5.1 track in MP4 to Apple TV → full direct play.
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(Request::get("/api/stream/201?platform=appletv").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["reason"], "direct_play");
+}
+
+#[tokio::test]
+async fn capped_bitrate_forces_hls_transcode() {
+    // A 40 Mbps file under an 8 Mbps cap forces a full transcode even though the codec
+    // would direct-play (`docs/.tasks/70` §QualityProfile::Capped).
+    std::env::set_var("FFMPEG_BIN", "true");
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(
+            Request::get("/api/stream/202?platform=appletv&quality=capped&max_bitrate=8000000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "hls");
+    assert_eq!(json["reason"], "bitrate_capped");
+    let url = json["url"].as_str().unwrap();
+    assert!(url.starts_with("/api/hls/"));
 }
 
 // ---------------------------------------------------------------------------
@@ -603,4 +731,94 @@ async fn trickplay_sprite_static_route_still_served() {
     // we'd get a JSON 404 from the DB handler; either way it's 404, but the point of
     // this test is that the route table accepts the static path without a panic.)
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// Web SPA fallback (Task 80) — same-origin serving of the browser client at `/`.
+// ---------------------------------------------------------------------------
+
+/// Build an app whose `web_dir` is a temp directory containing a marker `index.html` and
+/// one hashed asset, so the SPA fallback has something real to serve.
+fn app_with_web() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().join("config");
+    std::fs::create_dir_all(&config.config_dir).unwrap();
+    let web = dir.path().join("web");
+    std::fs::create_dir_all(web.join("assets")).unwrap();
+    std::fs::write(web.join("index.html"), "<!doctype html><title>medi</title><div id=root></div>").unwrap();
+    std::fs::write(web.join("assets/app.abc123.js"), "console.log('medi')").unwrap();
+    config.web_dir = web;
+
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(config.config_dir.join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    (router(state), dir)
+}
+
+#[tokio::test]
+async fn web_root_serves_spa_index() {
+    let (app, _dir) = app_with_web();
+    let resp = app
+        .oneshot(Request::get("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("id=root"), "root serves the SPA shell: {html}");
+}
+
+#[tokio::test]
+async fn web_deep_link_returns_shell_with_200() {
+    // A client-router deep link has no matching file → history fallback to index.html with
+    // a 200 (NOT a 404), so the SPA can boot and route on the path.
+    let (app, _dir) = app_with_web();
+    let resp = app
+        .oneshot(Request::get("/movie/1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "deep link is history-fallback, not 404");
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&bytes).contains("id=root"));
+}
+
+#[tokio::test]
+async fn web_serves_hashed_asset() {
+    let (app, _dir) = app_with_web();
+    let resp = app
+        .oneshot(Request::get("/assets/app.abc123.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn api_routes_are_not_shadowed_by_web_fallback() {
+    // The SPA fallback must never capture a defined `/api/*` route: health still returns
+    // "ok" and the catalog still returns JSON, not the HTML shell. (The fallback fires
+    // only when no route above matched.)
+    let (app, _dir) = app_with_web();
+    let health = app
+        .clone()
+        .oneshot(Request::get("/api/health").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+    let bytes = health.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(&bytes[..], b"ok", "api/health wins over the web fallback");
+
+    // The catalog returns JSON (an empty page here), not the HTML shell.
+    let library = app
+        .oneshot(Request::get("/api/library").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(library.status(), StatusCode::OK);
+    let ct = library
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("application/json"), "catalog stays JSON, not the SPA HTML: {ct}");
 }

@@ -17,6 +17,12 @@ pub struct AppConfig {
     pub media_dir: PathBuf,
     /// Read-write appdata cache: library.db, previews, trickplay, logs.
     pub config_dir: PathBuf,
+    /// Directory holding the built web SPA served at `/` (`docs/.tasks/80`).
+    ///
+    /// **Invariant:** web assets ship *in the image* (baked at build time), never under
+    /// [`Self::config_dir`] (read-write appdata) or `media_dir` (read-only library). The
+    /// default is the image path the Docker web stage copies `dist/` into.
+    pub web_dir: PathBuf,
     /// Address the axum server binds to (LAN-first, no auth).
     pub bind_addr: String,
     /// r2d2 pool size; bound to a small multiple of CPU cores.
@@ -48,6 +54,7 @@ impl Default for AppConfig {
         Self {
             media_dir: PathBuf::from("/media"),
             config_dir: PathBuf::from("/config"),
+            web_dir: PathBuf::from("/usr/share/medi/web"),
             bind_addr: "0.0.0.0:8096".to_string(),
             db_pool_size: 8,
             offpeak_start_hour: 2,
@@ -74,6 +81,7 @@ impl AppConfig {
     /// |----------------------|----------------------|------------------|
     /// | `MEDIA_DIR`          | `media_dir`          | `/media`         |
     /// | `CONFIG_DIR`         | `config_dir`         | `/config`        |
+    /// | `WEB_DIR`            | `web_dir`            | `/usr/share/medi/web` |
     /// | `BIND_ADDR`          | `bind_addr`          | `0.0.0.0:8096`   |
     /// | `DB_POOL_SIZE`       | `db_pool_size`       | `8`              |
     /// | `OFFPEAK_START_HOUR` | `offpeak_start_hour` | `2`              |
@@ -93,6 +101,7 @@ impl AppConfig {
         const KEYS: &[&str] = &[
             "media_dir",
             "config_dir",
+            "web_dir",
             "bind_addr",
             "db_pool_size",
             "offpeak_start_hour",
@@ -119,6 +128,12 @@ impl AppConfig {
     /// Path to the SQLite database file (`/config/library.db`).
     pub fn db_path(&self) -> PathBuf {
         self.config_dir.join("library.db")
+    }
+
+    /// Directory holding the built web SPA (`docs/.tasks/80`). Served at `/` by the api
+    /// crate; ships in the image, never under `config_dir`/`media_dir`.
+    pub fn web_dir(&self) -> PathBuf {
+        self.web_dir.clone()
     }
 
     /// Directory holding generated 720p hover previews.
@@ -181,6 +196,7 @@ mod tests {
             let cfg = AppConfig::from_env().expect("defaults extract");
             assert_eq!(cfg.media_dir, PathBuf::from("/media"));
             assert_eq!(cfg.config_dir, PathBuf::from("/config"));
+            assert_eq!(cfg.web_dir, PathBuf::from("/usr/share/medi/web"));
             assert_eq!(cfg.bind_addr, "0.0.0.0:8096");
             assert_eq!(cfg.db_pool_size, 8);
             assert_eq!(cfg.asset_max_concurrency, 1);
@@ -219,6 +235,7 @@ mod tests {
         figment::Jail::expect_with(|jail| {
             jail.set_env("MEDIA_DIR", "/mnt/library");
             jail.set_env("CONFIG_DIR", "/var/medi");
+            jail.set_env("WEB_DIR", "/opt/medi/web");
             jail.set_env("BIND_ADDR", "127.0.0.1:9000");
             jail.set_env("DB_POOL_SIZE", "16");
             jail.set_env("OFFPEAK_START_HOUR", "1");
@@ -228,6 +245,7 @@ mod tests {
             let cfg = AppConfig::from_env().expect("env extract");
             assert_eq!(cfg.media_dir, PathBuf::from("/mnt/library"));
             assert_eq!(cfg.config_dir, PathBuf::from("/var/medi"));
+            assert_eq!(cfg.web_dir, PathBuf::from("/opt/medi/web"));
             assert_eq!(cfg.bind_addr, "127.0.0.1:9000");
             assert_eq!(cfg.db_pool_size, 16);
             assert_eq!(cfg.offpeak_start_hour, 1);

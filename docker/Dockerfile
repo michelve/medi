@@ -28,7 +28,21 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/medi /usr/local/bin/medi
 
 # ---------------------------------------------------------------------------
-# 2) runtime — minimal Debian + GPU user-mode drivers + jellyfin-ffmpeg.
+# 2) web — build the browser SPA (Task 80, docs/.tasks/80-web-ui-client.md).
+# ---------------------------------------------------------------------------
+# A clean `yarn install` runs in-image (the context ships source, not node_modules —
+# see .dockerignore), then the `@medi/web` workspace is built to
+# client/apps/web/dist. The runtime stage copies that dist to /usr/share/medi/web.
+FROM node:22-bookworm AS web
+WORKDIR /web
+COPY client/ ./client/
+RUN corepack enable \
+    && cd client \
+    && yarn install --frozen-lockfile \
+    && yarn workspace @medi/web build
+
+# ---------------------------------------------------------------------------
+# 3) runtime — minimal Debian + GPU user-mode drivers + jellyfin-ffmpeg.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
@@ -64,8 +78,11 @@ https://repo.jellyfin.org/debian bookworm main" > /etc/apt/sources.list.d/jellyf
     && ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
     && rm -rf /var/lib/apt/lists/*
 
-# -- The binary + entrypoint -------------------------------------------------
+# -- The binary + web SPA + entrypoint ---------------------------------------
 COPY --from=build /usr/local/bin/medi /usr/local/bin/medi
+# Web assets ship IN the image (Task 80) — never under /config or /media. The binary
+# serves them at `/` from WEB_DIR (medi_core::AppConfig::web_dir default).
+COPY --from=web /web/client/apps/web/dist/ /usr/share/medi/web/
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 # Strip any CR (a Windows checkout can leave CRLF, which makes Linux look for a
 # `bash\r` interpreter and crash-loop the container) then make it executable.
@@ -75,6 +92,7 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/ent
 #   MEDIA_DIR  read-only media source   CONFIG_DIR  read-write appdata (SQLite + assets)
 ENV MEDIA_DIR=/media \
     CONFIG_DIR=/config \
+    WEB_DIR=/usr/share/medi/web \
     BIND_ADDR=0.0.0.0:8096 \
     RUST_LOG=info \
     # NVIDIA container runtime reads these; harmless on non-NVIDIA hosts.
