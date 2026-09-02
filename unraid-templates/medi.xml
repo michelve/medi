@@ -100,7 +100,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="NVIDIA GPUs to expose (NVIDIA hosts only). Also set Extra Parameters to '--runtime=nvidia'. Ignored on non-NVIDIA hosts."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false">all</Config>
 
@@ -123,7 +123,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="OMDb API key, used only when Metadata Provider is set to 'omdb'. Leave blank for the default TMDB provider."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="true"></Config>
 
@@ -134,7 +134,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="Metadata source: 'tmdb' (default, needs TMDB API Key) or 'omdb' (needs OMDb API Key)."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false">tmdb</Config>
 
@@ -145,7 +145,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="Preferred metadata language (BCP-47), e.g. en-US, fr-FR, de-DE."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false">en-US</Config>
 
@@ -156,7 +156,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="Address:port the server binds inside the container. Keep the port matching the WebUI Port mapping."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false">0.0.0.0:8096</Config>
 
@@ -167,7 +167,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="Optional: max concurrent transcode sessions. Leave blank for the auto default (iGPU ~4, discrete Arc/NVENC higher, software-only 1)."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false"></Config>
 
@@ -178,7 +178,7 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Mode=""
           Description="Log level (error|warn|info|debug|trace)."
           Type="Variable"
-          Display="advanced"
+          Display="always"
           Required="false"
           Mask="false">info</Config>
 </Container>
