@@ -14,11 +14,18 @@
  * the resolved decision via callbacks so the page can attach controls.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { ApiError, type StreamDecision } from '@medi/api-client';
 import { useApi } from '../api';
 import { theme } from '../theme';
 import { Loading } from './Status';
+import { PlayerEventLog } from './PlayerEventLog';
+import {
+  PlayerDiagnostics,
+  mediaErrorName,
+  networkStateName,
+  readyStateName,
+} from '../lib/playerDiagnostics';
 
 /** A WebVTT text subtitle rendered as a `<track>` child (`docs/.tasks/90`). */
 export interface WebTextTrack {
@@ -44,6 +51,21 @@ export interface VideoPlayerProps {
    * are burned in server-side (via the stream decision) and never appear here.
    */
   textTracks?: WebTextTrack[];
+  /**
+   * Show the on-screen diagnostics event log below the player (default true). It logs the
+   * stream decision, every hls.js event/error, and `<video>` state transitions — both to the
+   * page and the browser console — so playback issues are visible without devtools. Set false
+   * and use {@link onDiagnostics} to render the log elsewhere (e.g. outside the controls
+   * overlay) while still capturing every event.
+   */
+  diagnostics?: boolean;
+  /** Open the diagnostics panel expanded by default. */
+  diagnosticsOpen?: boolean;
+  /**
+   * Receives the player's {@link PlayerDiagnostics} channel so a parent can render its own
+   * `PlayerEventLog` (or read the log). Fires once on mount.
+   */
+  onDiagnostics?: (diag: PlayerDiagnostics) => void;
 }
 
 type Phase =
@@ -87,9 +109,24 @@ function mediaErrorMessage(err: MediaError | null): string {
   }
 }
 
-export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: VideoPlayerProps) {
+export function VideoPlayer({
+  fileId,
+  onVideoRef,
+  onDecision,
+  textTracks,
+  diagnostics = true,
+  diagnosticsOpen = false,
+  onDiagnostics,
+}: VideoPlayerProps) {
   const api = useApi();
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  // One diagnostics channel per mount — a fresh log for each file/session.
+  const diag = useMemo(() => new PlayerDiagnostics(), []);
+
+  // Hand the channel to a parent that wants to render the log itself.
+  useEffect(() => {
+    onDiagnostics?.(diag);
+  }, [diag, onDiagnostics]);
   const [phase, setPhase] = useState<Phase>({ kind: 'loading' });
   // Bumped to force a re-resolve on "retry".
   const [attempt, setAttempt] = useState(0);
@@ -109,6 +146,7 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
   useEffect(() => {
     const controller = new AbortController();
     setPhase({ kind: 'loading' });
+    diag.info('decision', 'requesting /api/stream', { fileId, platform: 'web', forceTranscode, attempt });
     api
       // `platform: 'web'` selects the browser capability profile so the server transcodes
       // codecs a browser can't decode (HEVC / AC-3 / DTS) instead of handing back a direct
@@ -117,6 +155,7 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
       .stream(fileId, { platform: 'web', forceTranscode }, { signal: controller.signal })
       .then((decision) => {
         if (controller.signal.aborted) return;
+        diag.info('decision', `resolved: ${decision.mode}`, decision);
         onDecision?.(decision);
         setPhase({ kind: 'ready', decision });
       })
@@ -124,10 +163,11 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
         if (controller.signal.aborted) return;
         const busy = err instanceof ApiError && err.isBusy;
         const message = err instanceof ApiError ? err.message : String(err);
+        diag.error('decision', 'stream request failed', { message, busy, status: err instanceof ApiError ? err.status : undefined });
         setPhase({ kind: 'error', message, busy });
       });
     return () => controller.abort();
-  }, [api, fileId, attempt, forceTranscode, onDecision]);
+  }, [api, fileId, attempt, forceTranscode, onDecision, diag]);
 
   // 2) Attach the resolved source to the <video> (direct src / native HLS / hls.js).
   useEffect(() => {
@@ -136,10 +176,17 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
     if (!video) return;
     const { decision } = phase;
 
+    // Instrument the raw <video> element's own lifecycle for every attach path. These fire
+    // regardless of direct/HLS and are the ground truth for "why is it a black screen".
+    const detachVideoEvents = attachVideoDiagnostics(video, diag);
+
     if (decision.mode === 'direct') {
-      video.src = api.directUrl(fileId);
+      const src = api.directUrl(fileId);
+      diag.info('video', 'attach direct src', { src });
+      video.src = src;
       void startPlayback(video);
       return () => {
+        detachVideoEvents();
         video.removeAttribute('src');
         video.load();
       };
@@ -147,10 +194,13 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
 
     // HLS. Prefer native (Safari); else hls.js.
     const hlsUrl = api.hlsUrl(decision);
-    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
+    if (nativeHls) {
+      diag.info('hls', 'using native HLS (Safari)', { canPlayType: nativeHls, url: hlsUrl });
       video.src = hlsUrl;
       void startPlayback(video);
       return () => {
+        detachVideoEvents();
         video.removeAttribute('src');
         video.load();
       };
@@ -161,9 +211,11 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
     // effect cleanup can still destroy whatever got created.
     let cancelled = false;
     let instance: import('hls.js').default | null = null;
+    diag.info('hls', 'loading hls.js', { url: hlsUrl });
     void import('hls.js').then(({ default: Hls }) => {
       if (cancelled) return;
       if (!Hls.isSupported()) {
+        diag.error('hls', 'Hls.isSupported() = false (no MSE)');
         setPhase({
           kind: 'error',
           message: 'This browser cannot play the transcoded (HLS) stream.',
@@ -171,11 +223,16 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
         });
         return;
       }
+      diag.info('hls', `hls.js ${Hls.version} ready`, { workers: true });
       const hls = new Hls({ enableWorker: true });
       instance = hls;
+      attachHlsDiagnostics(hls, Hls, diag);
       hls.loadSource(hlsUrl);
       hls.attachMedia(video);
-      hls.on(Hls.Events.MEDIA_ATTACHED, () => void startPlayback(video));
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => {
+        diag.info('hls', 'MEDIA_ATTACHED → play()');
+        void startPlayback(video);
+      });
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         // Only fatal errors abort playback; hls.js recovers from the rest itself.
         if (data.fatal) {
@@ -192,9 +249,10 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
     // Destroy the instance on unmount / re-resolve — the task's explicit requirement.
     return () => {
       cancelled = true;
+      detachVideoEvents();
       instance?.destroy();
     };
-  }, [api, fileId, phase]);
+  }, [api, fileId, phase, diag]);
 
   const setRef = (el: HTMLVideoElement | null) => {
     videoRef.current = el;
@@ -202,6 +260,7 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
   };
 
   return (
+    <>
     <div
       style={{
         position: 'relative',
@@ -223,6 +282,11 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
         onError={(e) => {
           const err = e.currentTarget.error;
           if (!err) return;
+          diag.error('video', `element error: ${mediaErrorName(err.code)}`, {
+            code: err.code,
+            message: err.message || undefined,
+            mode: phase.kind === 'ready' ? phase.decision.mode : phase.kind,
+          });
           // A `direct` stream the browser can't open/decode: instead of dead-ending, re-resolve
           // once forcing a server transcode (H.264+AAC HLS) that hls.js can always play. This
           // self-heals when the server's direct guess was wrong for this browser. A second
@@ -236,6 +300,7 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
             phase.decision.mode === 'direct' &&
             !didFallbackRef.current
           ) {
+            diag.warn('player', 'direct stream failed → retrying with force_transcode');
             didFallbackRef.current = true;
             setForceTranscode(true);
             setPhase({ kind: 'loading' });
@@ -297,6 +362,8 @@ export function VideoPlayer({ fileId, onVideoRef, onDecision, textTracks }: Vide
         </div>
       )}
     </div>
+    {diagnostics && <PlayerEventLog diagnostics={diag} defaultOpen={diagnosticsOpen} />}
+    </>
   );
 }
 
@@ -308,3 +375,88 @@ const overlayCenter: React.CSSProperties = {
   justifyContent: 'center',
   background: 'rgba(0,0,0,0.6)',
 };
+
+/**
+ * Subscribe to the raw `<video>` element's own media events and log each to diagnostics.
+ * Returns a detach function. These are the ground-truth signals for whether the browser is
+ * loading, stalling, buffering, or erroring — independent of hls.js.
+ */
+function attachVideoDiagnostics(
+  video: HTMLVideoElement,
+  diag: PlayerDiagnostics,
+): () => void {
+  const state = () => ({
+    readyState: readyStateName(video.readyState),
+    networkState: networkStateName(video.networkState),
+    currentTime: Number(video.currentTime.toFixed(2)),
+    paused: video.paused,
+  });
+  // A curated set: enough to see the load→play→stall lifecycle without flooding on timeupdate.
+  const handlers: Record<string, (ev?: Event) => void> = {
+    loadstart: () => diag.info('video', 'loadstart', state()),
+    loadedmetadata: () =>
+      diag.info('video', 'loadedmetadata', {
+        ...state(),
+        duration: Number.isFinite(video.duration) ? Number(video.duration.toFixed(1)) : video.duration,
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+      }),
+    loadeddata: () => diag.info('video', 'loadeddata', state()),
+    canplay: () => diag.info('video', 'canplay', state()),
+    playing: () => diag.info('video', 'playing', state()),
+    waiting: () => diag.warn('video', 'waiting (buffering)', state()),
+    stalled: () => diag.warn('video', 'stalled (no data)', state()),
+    suspend: () => diag.info('video', 'suspend', state()),
+    pause: () => diag.info('video', 'pause', state()),
+    ended: () => diag.info('video', 'ended', state()),
+  };
+  for (const [name, fn] of Object.entries(handlers)) video.addEventListener(name, fn);
+  return () => {
+    for (const [name, fn] of Object.entries(handlers)) video.removeEventListener(name, fn);
+  };
+}
+
+/**
+ * Wire hls.js lifecycle + error events into diagnostics. `Hls` is the imported module (its
+ * `Events`/`ErrorTypes` enums); `hls` is the instance. Logs manifest parsing, level switches,
+ * fragment loads, and — crucially — every error (fatal AND non-fatal, since a run of
+ * recovered errors is exactly what precedes a stall/black screen).
+ */
+function attachHlsDiagnostics(
+  hls: import('hls.js').default,
+  Hls: typeof import('hls.js').default,
+  diag: PlayerDiagnostics,
+): void {
+  const E = Hls.Events;
+  hls.on(E.MANIFEST_LOADING, () => diag.info('hls', 'MANIFEST_LOADING'));
+  hls.on(E.MANIFEST_PARSED, (_e, d) =>
+    diag.info('hls', 'MANIFEST_PARSED', { levels: d.levels?.length, firstLevel: d.firstLevel }),
+  );
+  hls.on(E.LEVEL_LOADED, (_e, d) =>
+    diag.info('hls', 'LEVEL_LOADED', {
+      live: d.details?.live,
+      totalduration: d.details?.totalduration,
+      fragments: d.details?.fragments?.length,
+    }),
+  );
+  hls.on(E.LEVEL_SWITCHED, (_e, d) => diag.info('hls', 'LEVEL_SWITCHED', { level: d.level }));
+  hls.on(E.FRAG_LOADED, (_e, d) =>
+    diag.info('hls', `FRAG_LOADED #${d.frag?.sn}`, {
+      sn: d.frag?.sn,
+      duration: d.frag?.duration,
+    }),
+  );
+  hls.on(E.ERROR, (_e, d) => {
+    const detail = {
+      type: d.type,
+      details: d.details,
+      fatal: d.fatal,
+      // Network errors carry the HTTP response; expose it — a 404/5xx here is the smoking gun.
+      httpStatus: (d.response as { code?: number } | undefined)?.code,
+      url: (d as { frag?: { url?: string }; url?: string }).frag?.url ?? (d as { url?: string }).url,
+      reason: (d as { reason?: string }).reason,
+    };
+    if (d.fatal) diag.error('hls', `FATAL ${d.type}: ${d.details}`, detail);
+    else diag.warn('hls', `recovered ${d.type}: ${d.details}`, detail);
+  });
+}

@@ -15,6 +15,8 @@ import type { TrickplayMeta } from '@medi/player/trickplay';
 import { ApiError, type SubtitleStream } from '@medi/api-client';
 import { useApi } from '../api';
 import { VideoPlayer, type WebTextTrack } from '../components/VideoPlayer';
+import { PlayerEventLog } from '../components/PlayerEventLog';
+import type { PlayerDiagnostics } from '../lib/playerDiagnostics';
 import { PlayerControls } from '../components/PlayerControls';
 import { NotFound } from '../components/Status';
 import { theme } from '../theme';
@@ -25,6 +27,9 @@ export function PlayerPage() {
   const location = useLocation();
   const api = useApi();
   const id = Number(fileId);
+  // The player's diagnostics channel, lifted here so the event log renders BELOW the video
+  // box (outside the transport-controls overlay) instead of under it.
+  const [diag, setDiag] = useState<PlayerDiagnostics | null>(null);
   // Detail pages pass a friendly title + the file's subtitle tracks through router state;
   // both fall back gracefully on a deep link (no state).
   const navState = location.state as
@@ -162,17 +167,30 @@ export function PlayerPage() {
       >
         ← Back
       </button>
-      <div
-        style={{ position: 'relative', maxWidth: 1100, margin: '0 auto' }}
-        onPointerMove={showOverlay}
-        onClick={() => handleRemote('playPause')}
-      >
-        <VideoPlayer fileId={id} onVideoRef={handleVideoRef} textTracks={textTracks} />
-        {/* Controls overlay: its own buttons/scrub bar must not bubble a click up to the
-            video-area play-toggle, so stop propagation at this boundary. */}
-        <div style={{ position: 'absolute', inset: 0 }} onClick={(e) => e.stopPropagation()}>
-          <PlayerControls controls={controls} title={title} trickplay={trickplay} onSeek={seekTo} />
+      <div style={{ maxWidth: 1100, margin: '0 auto' }}>
+        {/* Video area only: the transport-controls overlay covers just the video, not the
+            diagnostics log the player renders below it. The play-pause click / pointer-move
+            reveal are scoped here so they don't fire when interacting with the log. */}
+        <div
+          style={{ position: 'relative' }}
+          onPointerMove={showOverlay}
+          onClick={() => handleRemote('playPause')}
+        >
+          <VideoPlayer
+            fileId={id}
+            onVideoRef={handleVideoRef}
+            textTracks={textTracks}
+            diagnostics={false}
+            onDiagnostics={setDiag}
+          />
+          {/* Controls overlay: its own buttons/scrub bar must not bubble a click up to the
+              video-area play-toggle, so stop propagation at this boundary. */}
+          <div style={{ position: 'absolute', inset: 0 }} onClick={(e) => e.stopPropagation()}>
+            <PlayerControls controls={controls} title={title} trickplay={trickplay} onSeek={seekTo} />
+          </div>
         </div>
+        {/* Diagnostics log below the video (outside the overlay so it's interactive). */}
+        {diag && <PlayerEventLog diagnostics={diag} />}
       </div>
     </section>
   );
