@@ -260,10 +260,13 @@ impl HwPlan {
                 }
             }
             HwPlan::Nvidia => {
-                // CUDA tone-map for both HDR10 and Dolby Vision.
-                "hwupload_cuda,\
-                 tonemap_cuda=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709,\
-                 scale_cuda=format=nv12"
+                // CUDA tone-map for both HDR10 and Dolby Vision. The source is decoded via
+                // NVDEC with `-hwaccel_output_format cuda`, so frames are ALREADY CUDA frames
+                // entering the graph — do NOT `hwupload_cuda` (uploading an already-uploaded
+                // frame fails the graph with "Error reinitializing filters! ... -38 Function
+                // not implemented"). `tonemap_cuda` outputs nv12 directly (`:format=nv12`) so
+                // no extra `scale_cuda` is needed; nvenc consumes the CUDA nv12 frames.
+                "tonemap_cuda=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:format=nv12"
                     .to_string()
             }
         })
@@ -322,8 +325,19 @@ fn emit_hls_muxer(a: &mut Vec<String>, out_dir: &Path) {
     p(a, "hls");
     p(a, "-hls_time");
     a.push(SEGMENT_SECONDS.to_string());
+    // `event`, NOT `vod`: for an on-the-fly transcode the playlist must be written from the
+    // FIRST segment so the client can start playing while ffmpeg is still encoding. `vod`
+    // only writes `index.m3u8` when the entire encode finishes (minutes for a long 4K→SDR
+    // job), so the manifest 404s the whole time and playback never starts. `event` grows the
+    // same seekable playlist (with `-hls_list_size 0`, every segment stays listed) but
+    // publishes it immediately; the api layer serves whatever segments exist so far.
     p(a, "-hls_playlist_type");
-    p(a, "vod");
+    p(a, "event");
+    // Write the playlist atomically (`temp_file`) so the client never reads a half-written
+    // manifest, and mark segments independently decodable (`independent_segments`) so seeking
+    // into a not-yet-produced part degrades gracefully.
+    p(a, "-hls_flags");
+    p(a, "temp_file+independent_segments");
     // Fragmented-MP4 (CMAF) segments — required by tvOS AVPlayer for HEVC/HDR.
     p(a, "-hls_segment_type");
     p(a, "fmp4");
@@ -331,7 +345,7 @@ fn emit_hls_muxer(a: &mut Vec<String>, out_dir: &Path) {
     p(a, INIT_NAME);
     p(a, "-hls_segment_filename");
     a.push(out_dir.join(SEGMENT_TEMPLATE).to_string_lossy().into_owned());
-    // Keep the whole playlist (VOD) so the client can seek anywhere.
+    // Keep every segment listed so the client can seek across the whole title.
     p(a, "-hls_list_size");
     p(a, "0");
     a.push(out_dir.join(PLAYLIST_NAME).to_string_lossy().into_owned());
@@ -429,6 +443,11 @@ mod tests {
         assert!(s.contains("tonemap_cuda"));
         assert!(s.contains("h264_nvenc"));
         assert!(s.contains("-hwaccel cuda"));
+        // Frames arrive already on the GPU (`-hwaccel_output_format cuda`) — uploading them
+        // again fails the filter graph, so the chain must NOT contain `hwupload_cuda`.
+        assert!(!s.contains("hwupload_cuda"), "must not re-upload GPU frames: {s}");
+        // `tonemap_cuda` outputs nv12 directly (no separate scale_cuda needed).
+        assert!(s.contains("format=nv12"), "tonemap_cuda outputs nv12: {s}");
     }
 
     #[test]
