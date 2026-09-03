@@ -32,8 +32,10 @@ pub const INIT_NAME: &str = "init.mp4";
 pub const SEGMENT_TEMPLATE: &str = "seg%05d.m4s";
 
 /// Target HLS segment length, seconds. ~4s balances tvOS start-up latency against
-/// playlist churn for a long movie.
-const SEGMENT_SECONDS: u32 = 4;
+/// playlist churn for a long movie. Segment `N` covers `[N*SEGMENT_SECONDS, …)`; the server
+/// synthesizes the VOD playlist from this + the media duration so the whole timeline is
+/// seekable before any byte is transcoded.
+pub const SEGMENT_SECONDS: u32 = 4;
 
 /// Build the full jellyfin-ffmpeg argv for `target`, reading `input` and writing the
 /// HLS playlist + fMP4 segments into `out_dir`.
@@ -46,6 +48,7 @@ pub fn build_argv(
     input: &Path,
     out_dir: &Path,
     render_node: Option<&str>,
+    start_segment: u32,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let push = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
@@ -57,6 +60,17 @@ pub fn build_argv(
     // teardown, but this bounds a single stalled read.
     push(&mut a, "-nostdin");
 
+    // --- Seek to the start segment (VOD seek support). -----------------------
+    // For a seek, start decoding at the segment's time so this ffmpeg produces segments from
+    // there onward. `-ss` BEFORE `-i` is the fast, keyframe-accurate input seek. Segment N
+    // starts at N*SEGMENT_SECONDS; `-start_number N` makes the emitted files `segN..`, so they
+    // line up with the synthesized VOD playlist's URLs no matter where we started.
+    let start_time = start_segment * SEGMENT_SECONDS;
+    if start_time > 0 {
+        push(&mut a, "-ss");
+        a.push(start_time.to_string());
+    }
+
     // --- Hardware device init + decode. --------------------------------------
     let node = render_node.unwrap_or("/dev/dri/renderD128");
     let hw = HwPlan::for_target(target);
@@ -65,6 +79,14 @@ pub fn build_argv(
     // --- Input. --------------------------------------------------------------
     push(&mut a, "-i");
     a.push(input.to_string_lossy().into_owned());
+
+    // --- Keyframe-aligned segments (seekability). ----------------------------
+    // Force a keyframe at every segment boundary so each fMP4 segment is independently
+    // decodable and seeks land cleanly on a segment start. `n_forced` counts forced frames
+    // from THIS process's start, and its `t` is relative to the post-`-ss` timeline, so the
+    // expression is the same whether we started at 0 or mid-file.
+    push(&mut a, "-force_key_frames");
+    a.push(format!("expr:gte(t,n_forced*{SEGMENT_SECONDS})"));
 
     // --- Video filter graph + encoder. ---------------------------------------
     // Image-subtitle burn-in (`docs/.tasks/90` §5) needs a `-filter_complex` so the
@@ -129,7 +151,7 @@ pub fn build_argv(
     }
 
     // --- fMP4/CMAF HLS muxer. -------------------------------------------------
-    emit_hls_muxer(&mut a, out_dir);
+    emit_hls_muxer(&mut a, out_dir, start_segment);
 
     a
 }
@@ -318,24 +340,23 @@ fn build_burn_in_filter(base: Option<&str>, sub_idx: i64) -> String {
     }
 }
 
-/// Append the fragmented-MP4 HLS muxer flags + output playlist path.
-fn emit_hls_muxer(a: &mut Vec<String>, out_dir: &Path) {
+/// Append the fragmented-MP4 HLS muxer flags. `start_segment` makes ffmpeg number its
+/// segment files from that index (so a seek-started process writes `segN..` that line up with
+/// the server-synthesized VOD playlist). The playlist ffmpeg writes here is a throwaway —
+/// the api layer serves its OWN complete `#EXT-X-PLAYLIST-TYPE:VOD` playlist (built from the
+/// media duration) so the whole timeline is seekable before any segment is transcoded.
+fn emit_hls_muxer(a: &mut Vec<String>, out_dir: &Path, start_segment: u32) {
     let p = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
     p(a, "-f");
     p(a, "hls");
     p(a, "-hls_time");
     a.push(SEGMENT_SECONDS.to_string());
-    // `event`, NOT `vod`: for an on-the-fly transcode the playlist must be written from the
-    // FIRST segment so the client can start playing while ffmpeg is still encoding. `vod`
-    // only writes `index.m3u8` when the entire encode finishes (minutes for a long 4K→SDR
-    // job), so the manifest 404s the whole time and playback never starts. `event` grows the
-    // same seekable playlist (with `-hls_list_size 0`, every segment stays listed) but
-    // publishes it immediately; the api layer serves whatever segments exist so far.
-    p(a, "-hls_playlist_type");
-    p(a, "event");
-    // Write the playlist atomically (`temp_file`) so the client never reads a half-written
-    // manifest, and mark segments independently decodable (`independent_segments`) so seeking
-    // into a not-yet-produced part degrades gracefully.
+    // Number emitted segments from `start_segment` so they match the VOD playlist's URLs
+    // regardless of where this ffmpeg started (a fresh start=0, a seek start=N).
+    p(a, "-start_number");
+    a.push(start_segment.to_string());
+    // Write segments atomically (`temp_file`) so the client never fetches a half-written one,
+    // and mark them independently decodable so a seek into any segment plays.
     p(a, "-hls_flags");
     p(a, "temp_file+independent_segments");
     // Fragmented-MP4 (CMAF) segments — required by tvOS AVPlayer for HEVC/HDR.
@@ -345,10 +366,54 @@ fn emit_hls_muxer(a: &mut Vec<String>, out_dir: &Path) {
     p(a, INIT_NAME);
     p(a, "-hls_segment_filename");
     a.push(out_dir.join(SEGMENT_TEMPLATE).to_string_lossy().into_owned());
-    // Keep every segment listed so the client can seek across the whole title.
+    // No `-hls_list_size` cap: keep all segments. The written playlist is ignored by the api
+    // layer (it serves a synthesized VOD one), so its name is a throwaway.
     p(a, "-hls_list_size");
     p(a, "0");
-    a.push(out_dir.join(PLAYLIST_NAME).to_string_lossy().into_owned());
+    a.push(out_dir.join("ffmpeg.m3u8").to_string_lossy().into_owned());
+}
+
+/// Synthesize the complete VOD HLS playlist for a title of `duration_ms`, listing every
+/// segment up front so the client sees the full runtime and can seek anywhere immediately.
+///
+/// Segment `N` covers `[N*SEGMENT_SECONDS, …)`; all but the last are exactly `SEGMENT_SECONDS`
+/// long, and the last carries the remainder. The server produces the actual `.m4s` bytes on
+/// demand (starting or seeking a transcode when a listed-but-absent segment is requested), but
+/// the playlist itself is complete and static — that is what makes the whole timeline
+/// seekable without transcoding it all first.
+pub fn build_vod_playlist(duration_ms: u64) -> String {
+    let seg = SEGMENT_SECONDS as f64;
+    let total = duration_ms as f64 / 1000.0;
+    let full = (total / seg).floor() as u32;
+    let remainder = total - (full as f64) * seg;
+
+    let mut m = String::new();
+    m.push_str("#EXTM3U\n");
+    m.push_str("#EXT-X-VERSION:7\n");
+    // TARGETDURATION must be >= the longest segment (ceil of SEGMENT_SECONDS).
+    m.push_str(&format!("#EXT-X-TARGETDURATION:{}\n", SEGMENT_SECONDS));
+    m.push_str("#EXT-X-MEDIA-SEQUENCE:0\n");
+    m.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+    m.push_str("#EXT-X-INDEPENDENT-SEGMENTS\n");
+    m.push_str(&format!("#EXT-X-MAP:URI=\"{INIT_NAME}\"\n"));
+    for n in 0..full {
+        m.push_str(&format!("#EXTINF:{seg:.6},\n"));
+        m.push_str(&format!("seg{n:05}.m4s\n"));
+    }
+    // A final short segment for the remainder (skip a negligible <100ms tail).
+    if remainder > 0.1 {
+        m.push_str(&format!("#EXTINF:{remainder:.6},\n"));
+        m.push_str(&format!("seg{full:05}.m4s\n"));
+    }
+    m.push_str("#EXT-X-ENDLIST\n");
+    m
+}
+
+/// The segment index a filename like `seg00042.m4s` refers to, or `None` if it isn't a
+/// segment name. Used by the api layer to map a requested segment back to its time offset.
+pub fn segment_index(file: &str) -> Option<u32> {
+    let stem = file.strip_prefix("seg")?.strip_suffix(".m4s")?;
+    stem.parse::<u32>().ok()
 }
 
 /// The ffmpeg encoder name for an audio target codec.
@@ -399,6 +464,7 @@ mod tests {
             &PathBuf::from("/media/in.mkv"),
             &PathBuf::from("/config/hls/abc"),
             Some("/dev/dri/renderD128"),
+            0,
         )
     }
 
@@ -413,7 +479,53 @@ mod tests {
         assert!(s.contains("-f hls"));
         assert!(s.contains("-hls_segment_type fmp4"), "Apple TV needs fMP4, got: {s}");
         assert!(s.contains("init.mp4"));
-        assert!(s.ends_with("index.m3u8"));
+        // Keyframe-aligned segments for clean seeking; ffmpeg writes a throwaway playlist
+        // (the api layer serves the synthesized VOD one).
+        assert!(s.contains("-force_key_frames"), "segments must be keyframe-aligned: {s}");
+        assert!(s.contains("-start_number 0"));
+        assert!(s.ends_with("ffmpeg.m3u8"), "ffmpeg writes a throwaway playlist: {s}");
+    }
+
+    #[test]
+    fn seek_start_segment_adds_ss_and_start_number() {
+        // Starting at segment 100 (=400s in) seeks the input and numbers segments from 100.
+        let a = build_argv(
+            &target(Some(Vendor::Intel), false, false, false),
+            AudioTarget::Copy,
+            &PathBuf::from("/media/in.mkv"),
+            &PathBuf::from("/config/hls/abc"),
+            Some("/dev/dri/renderD128"),
+            100,
+        );
+        let s = joined(&a);
+        assert!(s.contains("-ss 400"), "seek to 100*4s: {s}");
+        assert!(s.contains("-start_number 100"), "segments numbered from 100: {s}");
+        // `-ss` must come before `-i` (fast input seek).
+        let ss = a.iter().position(|x| x == "-ss").unwrap();
+        let i = a.iter().position(|x| x == "-i").unwrap();
+        assert!(ss < i, "-ss must precede -i");
+    }
+
+    #[test]
+    fn vod_playlist_is_complete_and_seekable() {
+        // A 30.5s title at 4s segments → 7 full + 1 remainder = 8 segments, VOD, ENDLIST.
+        let m = build_vod_playlist(30_500);
+        assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "must be VOD, not live: {m}");
+        assert!(m.contains("#EXT-X-ENDLIST"), "complete playlist has ENDLIST");
+        assert!(m.contains("#EXT-X-MAP:URI=\"init.mp4\""));
+        assert!(m.contains("seg00000.m4s") && m.contains("seg00007.m4s"), "all segments listed: {m}");
+        assert_eq!(m.matches(".m4s").count(), 8, "7 full + 1 remainder");
+        // The remainder segment carries <4s.
+        assert!(m.contains("#EXTINF:2.500000,"), "remainder EXTINF: {m}");
+    }
+
+    #[test]
+    fn segment_index_parses_only_segment_names() {
+        assert_eq!(segment_index("seg00042.m4s"), Some(42));
+        assert_eq!(segment_index("seg00000.m4s"), Some(0));
+        assert_eq!(segment_index("init.mp4"), None);
+        assert_eq!(segment_index("index.m3u8"), None);
+        assert_eq!(segment_index("../secret"), None);
     }
 
     #[test]

@@ -46,9 +46,12 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
 }
 
-/// One live transcode session.
+/// One transcode session for a title — a seekable VOD stream. The manager serves a complete
+/// synthesized playlist (`command::build_vod_playlist`) so the client sees the full runtime;
+/// the actual `.m4s` segments are produced on demand by an ffmpeg that can be (re)started at
+/// any segment offset when the player seeks (`command::build_argv`'s `start_segment`).
 struct Session {
-    /// The running ffmpeg child (killed on teardown).
+    /// The running ffmpeg child (killed on teardown / on a seek-restart).
     child: Child,
     /// Output directory `/config/hls/<id>`.
     dir: PathBuf,
@@ -63,7 +66,21 @@ struct Session {
     /// Fingerprint of `(input, target, audio)` so an identical request reuses this session
     /// instead of spawning a second ffmpeg for the same output.
     key: String,
+    // --- everything needed to (re)spawn ffmpeg at a seek target ---------------
+    input: PathBuf,
+    target: TranscodeTarget,
+    audio: AudioTarget,
+    /// The segment index the current ffmpeg process started producing from.
+    producing_from: u32,
+    /// Total media duration (drives the synthesized playlist + the last segment index).
+    duration_ms: u64,
 }
+
+/// How far ahead of the current production point a requested segment may be while we simply
+/// wait for the running ffmpeg to reach it, rather than restarting ffmpeg at that point. A
+/// small forward jump (normal playback drift, a short skip) is cheaper to wait out; a larger
+/// jump is a real seek that should restart the transcode at the target.
+const SEEK_LOOKAHEAD_SEGMENTS: u32 = 3;
 
 /// How long an unconsumed session (started, but no file ever fetched) may live before the
 /// reaper drops it. Shorter than [`IDLE_TIMEOUT`] so a burst of failed/duplicate requests
@@ -102,8 +119,9 @@ impl SessionManager {
         }
     }
 
-    /// Start a transcode session for `input` with `target`/`audio`, returning the
-    /// session id (the caller builds `/api/hls/<id>/index.m3u8` from it).
+    /// Start (or reuse) a seekable VOD transcode session for `input` with `target`/`audio`,
+    /// returning the session id (the caller builds `/api/hls/<id>/index.m3u8` from it).
+    /// `duration_ms` is the media length, used to synthesize the full seekable playlist.
     ///
     /// Rejects with [`SessionError::CapacityReached`] once the concurrency cap is hit.
     pub async fn start(
@@ -111,6 +129,7 @@ impl SessionManager {
         input: &Path,
         target: &TranscodeTarget,
         audio: AudioTarget,
+        duration_ms: u64,
     ) -> Result<String, SessionError> {
         let mut sessions = self.inner.sessions.lock().await;
 
@@ -142,21 +161,10 @@ impl SessionManager {
         let dir = self.inner.hls_root.join(&id);
         std::fs::create_dir_all(&dir)?;
 
-        let argv = command::build_argv(
-            target,
-            audio,
-            input,
-            &dir,
-            self.inner.caps.render_node.as_deref(),
-        );
+        // Start the transcode from segment 0. A seek later restarts ffmpeg at the target
+        // segment via `ensure_segment` (no re-decode of the whole file up to the seek point).
+        let child = self.spawn_ffmpeg(input, target, audio, &dir, 0)?;
         tracing::info!(session = %id, input = %input.display(), "starting transcode session");
-        tracing::debug!(session = %id, argv = ?argv, "ffmpeg argv");
-
-        let child = Command::new(ffmpeg_bin())
-            .args(&argv)
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(SessionError::Spawn)?;
 
         let now = Instant::now();
         sessions.insert(
@@ -168,9 +176,100 @@ impl SessionManager {
                 created: now,
                 consumed: false,
                 key,
+                input: input.to_path_buf(),
+                target: target.clone(),
+                audio,
+                producing_from: 0,
+                duration_ms,
             },
         );
         Ok(id)
+    }
+
+    /// Spawn one ffmpeg producing segments from `start_segment` onward into `dir`.
+    fn spawn_ffmpeg(
+        &self,
+        input: &Path,
+        target: &TranscodeTarget,
+        audio: AudioTarget,
+        dir: &Path,
+        start_segment: u32,
+    ) -> Result<Child, SessionError> {
+        let argv = command::build_argv(
+            target,
+            audio,
+            input,
+            dir,
+            self.inner.caps.render_node.as_deref(),
+            start_segment,
+        );
+        tracing::debug!(start_segment, argv = ?argv, "ffmpeg argv");
+        Command::new(ffmpeg_bin())
+            .args(&argv)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(SessionError::Spawn)
+    }
+
+    /// The synthesized VOD playlist for a session (full runtime, all segments, seekable).
+    /// This is what `/api/hls/<id>/index.m3u8` serves — NOT ffmpeg's own playlist.
+    pub async fn vod_playlist(&self, session_id: &str) -> Result<String, SessionError> {
+        let mut sessions = self.inner.sessions.lock().await;
+        let s = sessions.get_mut(session_id).ok_or(SessionError::NotFound)?;
+        s.last_access = Instant::now();
+        s.consumed = true;
+        Ok(command::build_vod_playlist(s.duration_ms))
+    }
+
+    /// Ensure the segment `seg_index` is being produced, restarting ffmpeg at that point on a
+    /// real seek. Returns once the segment file exists on disk, or after a bounded wait (the
+    /// caller then serves whatever's there — a 404 the client retries).
+    ///
+    /// Policy: if the segment already exists, done. If it's within [producing_from,
+    /// producing_from+lookahead], the running ffmpeg will reach it soon → just wait. Otherwise
+    /// it's a seek (backward, or a big jump forward) → kill ffmpeg and restart at `seg_index`.
+    pub async fn ensure_segment(
+        &self,
+        session_id: &str,
+        seg_index: u32,
+    ) -> Result<PathBuf, SessionError> {
+        let path;
+        let need_restart;
+        {
+            let mut sessions = self.inner.sessions.lock().await;
+            let s = sessions.get_mut(session_id).ok_or(SessionError::NotFound)?;
+            s.last_access = Instant::now();
+            s.consumed = true;
+            path = s.dir.join(format!("seg{seg_index:05}.m4s"));
+
+            if path.exists() {
+                return Ok(path);
+            }
+            // Is the current ffmpeg producing toward this segment (still alive, and the segment
+            // is at/after where it started, within a small lookahead)?
+            let alive = !matches!(s.child.try_wait(), Ok(Some(_)));
+            let in_window = seg_index >= s.producing_from
+                && seg_index <= s.producing_from + SEEK_LOOKAHEAD_SEGMENTS;
+            need_restart = !(alive && in_window);
+
+            if need_restart {
+                // Seek: kill the current ffmpeg and restart it at the requested segment.
+                let _ = s.child.start_kill();
+                let child = self.spawn_ffmpeg(
+                    &s.input,
+                    &s.target,
+                    s.audio,
+                    &s.dir,
+                    seg_index,
+                )?;
+                s.child = child;
+                s.producing_from = seg_index;
+                tracing::info!(session = %session_id, seg_index, "seek: restarting transcode at segment");
+            }
+        }
+        // Wait (outside the lock so other requests aren't blocked) for the segment to appear.
+        wait_for_path(&path, Duration::from_secs(15)).await;
+        Ok(path)
     }
 
     /// Resolve `file` within `session_id`'s directory, refreshing its idle timer.
@@ -219,14 +318,17 @@ impl SessionManager {
         let stale: Vec<String> = sessions
             .iter_mut()
             .filter_map(|(id, s)| {
+                // Reap the ffmpeg zombie of an exited process, but do NOT tear the session
+                // down just because ffmpeg finished: a completed encode's segments stay on
+                // disk and are still seekable (a seek restarts ffmpeg). Only idleness (no
+                // access) or an unconsumed start drops a session.
+                let _ = s.child.try_wait();
                 let idle = now.duration_since(s.last_access) >= IDLE_TIMEOUT;
                 // A session started but never consumed (client errored / duplicated the
                 // request) is dropped after a short grace so it can't hold a capacity slot.
                 let abandoned =
                     !s.consumed && now.duration_since(s.created) >= UNCONSUMED_TIMEOUT;
-                // `try_wait` returns Ok(Some(_)) once the process has exited.
-                let exited = matches!(s.child.try_wait(), Ok(Some(_)));
-                (idle || abandoned || exited).then(|| id.clone())
+                (idle || abandoned).then(|| id.clone())
             })
             .collect();
         for id in &stale {
@@ -269,6 +371,18 @@ async fn teardown(s: &mut Session) {
     let _ = s.child.wait().await;
     if let Err(err) = std::fs::remove_dir_all(&s.dir) {
         tracing::warn!(dir = %s.dir.display(), error = %err, "failed to clean session dir");
+    }
+}
+
+/// Wait for `path` to exist, up to `timeout`, polling briefly. Lets a just-started or
+/// just-restarted (seek) transcode write the requested segment before we serve it.
+async fn wait_for_path(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -351,18 +465,66 @@ mod tests {
         let input = dir.path().join("in.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let a = mgr.start(&input, &target(), AudioTarget::Copy).await.unwrap();
-        let b = mgr.start(&input, &target(), AudioTarget::Copy).await.unwrap();
+        let a = mgr.start(&input, &target(), AudioTarget::Copy, 60_000).await.unwrap();
+        let b = mgr.start(&input, &target(), AudioTarget::Copy, 60_000).await.unwrap();
         assert_eq!(a, b, "identical request must reuse the session");
         assert_eq!(mgr.active_count().await, 1, "only one ffmpeg for one output");
 
         // A DIFFERENT audio target is a different output → a new session.
         let c = mgr
-            .start(&input, &target(), AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2 })
+            .start(&input, &target(), AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2 }, 60_000)
             .await
             .unwrap();
         assert_ne!(a, c, "different target must not reuse");
         assert_eq!(mgr.active_count().await, 2);
+
+        std::env::remove_var("FFMPEG_BIN");
+    }
+
+    #[tokio::test]
+    async fn vod_playlist_reflects_duration() {
+        std::env::set_var("FFMPEG_BIN", "cat");
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path(), 4);
+        let input = dir.path().join("in.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        // 12s title @ 4s segments → 3 segments, VOD, ENDLIST.
+        let id = mgr.start(&input, &target(), AudioTarget::Copy, 12_000).await.unwrap();
+        let m = mgr.vod_playlist(&id).await.unwrap();
+        assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
+        assert!(m.contains("#EXT-X-ENDLIST"));
+        assert_eq!(m.matches(".m4s").count(), 3, "12s / 4s = 3 segments: {m}");
+
+        std::env::remove_var("FFMPEG_BIN");
+    }
+
+    #[tokio::test]
+    async fn seek_far_ahead_restarts_ffmpeg_at_segment() {
+        // Requesting a segment well beyond the lookahead is a seek → the session restarts
+        // ffmpeg at that segment (producing_from advances) rather than waiting for the
+        // original process to encode the whole way there.
+        std::env::set_var("FFMPEG_BIN", "cat");
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path(), 4);
+        let input = dir.path().join("in.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        // 600s title (150 segments). Start at 0, then "seek" to segment 100.
+        let id = mgr.start(&input, &target(), AudioTarget::Copy, 600_000).await.unwrap();
+        // ensure_segment waits up to 15s for the file (which the fake ffmpeg never writes);
+        // run it with a timeout and just assert the restart bookkeeping happened.
+        let _ = tokio::time::timeout(
+            Duration::from_millis(300),
+            mgr.ensure_segment(&id, 100),
+        )
+        .await;
+        // The session's producing_from should now be 100 (a real seek-restart).
+        let from = {
+            let sessions = mgr.inner.sessions.lock().await;
+            sessions.get(&id).unwrap().producing_from
+        };
+        assert_eq!(from, 100, "a far-ahead segment request restarts ffmpeg at that segment");
 
         std::env::remove_var("FFMPEG_BIN");
     }
@@ -381,11 +543,11 @@ mod tests {
         let other = dir.path().join("other.mkv");
         std::fs::write(&other, b"y").unwrap();
 
-        let first = mgr.start(&input, &target(), AudioTarget::Copy).await;
+        let first = mgr.start(&input, &target(), AudioTarget::Copy, 60_000).await;
         assert!(first.is_ok(), "first session should start: {first:?}");
 
         // The cap is 1; a start for a DIFFERENT output is rejected until the first is reaped.
-        let second = mgr.start(&other, &target(), AudioTarget::Copy).await;
+        let second = mgr.start(&other, &target(), AudioTarget::Copy, 60_000).await;
         assert!(matches!(second, Err(SessionError::CapacityReached(1))));
 
         // Tearing the first session down frees the slot deterministically (no reliance on
@@ -393,7 +555,7 @@ mod tests {
         assert_eq!(mgr.active_count().await, 1);
         mgr.stop(&first.unwrap()).await.unwrap();
         assert_eq!(mgr.active_count().await, 0);
-        let third = mgr.start(&other, &target(), AudioTarget::Copy).await;
+        let third = mgr.start(&other, &target(), AudioTarget::Copy, 60_000).await;
         assert!(third.is_ok(), "slot freed → a new session starts: {third:?}");
 
         std::env::remove_var("FFMPEG_BIN");

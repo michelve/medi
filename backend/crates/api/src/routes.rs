@@ -921,9 +921,11 @@ async fn stream_decision(
                     AudioTarget::Transcode { codec, channels }
                 }
             };
+            // Duration drives the synthesized VOD playlist (full runtime + seekable timeline).
+            let duration_ms = file.duration_ms.unwrap_or(0).max(0) as u64;
             let session_id = state
                 .transcode
-                .start(&src, target, audio_tgt)
+                .start(&src, target, audio_tgt, duration_ms)
                 .await
                 .map_err(map_session_err)?;
             format!("/api/hls/{session_id}/{PLAYLIST_NAME}")
@@ -959,29 +961,55 @@ async fn direct_play(
     Ok(resp.into_response())
 }
 
-/// `GET /api/hls/:session_id/:file` — HLS playlist / init / segment for a live session.
-/// Refreshes the session's idle timer and serves the on-disk fMP4 artifact.
+/// `GET /api/hls/:session_id/:file` — one artifact of a seekable VOD transcode session.
+///
+/// - **`index.m3u8`** → the server-synthesized VOD playlist (full runtime, every segment,
+///   `#EXT-X-ENDLIST`), so the client shows the real duration and can seek anywhere.
+/// - **`segNNNNN.m4s`** → produced ON DEMAND: `ensure_segment` (re)starts the transcode at
+///   that segment on a seek, then waits for the file. This is what makes a jump to 45 min
+///   work without transcoding the whole film first.
+/// - **`init.mp4`** (and anything else) → served from disk once the transcode has written it.
 async fn hls_asset(
     State(state): State<AppState>,
     Path((session_id, file)): Path<(String, String)>,
     req: Request,
 ) -> ApiResult<Response> {
-    let path = state
-        .transcode
-        .resolve_file(&session_id, &file)
-        .await
-        .map_err(map_session_err)?;
-
-    // The *playlist* is special: on a freshly-started session ffmpeg needs a few seconds to
-    // encode the first segment before it writes `index.m3u8`. If we 404 immediately, a client
-    // that doesn't retry the manifest (native Safari HLS) dead-ends, and even hls.js reports a
-    // scary error first. So for the playlist only, briefly wait for it to appear (bounded) —
-    // segments still 404-and-retry naturally. Refreshes the idle timer via resolve_file above.
-    if file == PLAYLIST_NAME && !path.exists() {
-        wait_for_file(&path, std::time::Duration::from_secs(12)).await;
+    // The playlist is synthesized, not read from disk.
+    if file == PLAYLIST_NAME {
+        let body = state
+            .transcode
+            .vod_playlist(&session_id)
+            .await
+            .map_err(map_session_err)?;
+        return Ok((
+            [(axum::http::header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            body,
+        )
+            .into_response());
     }
 
-    // The file may not exist yet if ffmpeg hasn't written this segment — ServeFile
+    // A segment: ensure it's being produced (seek-restart if needed) and wait for it.
+    let path = if let Some(seg) = medi_transcode::segment_index(&file) {
+        state
+            .transcode
+            .ensure_segment(&session_id, seg)
+            .await
+            .map_err(map_session_err)?
+    } else {
+        // init.mp4 or another artifact: resolve within the session dir and briefly wait for
+        // it (the init header is written alongside the first segment).
+        let path = state
+            .transcode
+            .resolve_file(&session_id, &file)
+            .await
+            .map_err(map_session_err)?;
+        if !path.exists() {
+            wait_for_file(&path, std::time::Duration::from_secs(15)).await;
+        }
+        path
+    };
+
+    // The file may still be absent if the transcode couldn't produce it in time — ServeFile
     // returns a natural 404 the client retries.
     let serve = ServeFile::new(&path);
     let resp = serve
@@ -992,8 +1020,8 @@ async fn hls_asset(
 }
 
 /// Wait for `path` to exist, up to `timeout`, polling briefly. Used to let a just-started
-/// transcode write its first playlist before we serve `/api/hls/<id>/index.m3u8`. Returns as
-/// soon as the file appears; on timeout the caller serves whatever's there (a natural 404).
+/// transcode write its `init.mp4` before we serve it. Returns as soon as the file appears; on
+/// timeout the caller serves whatever's there (a natural 404).
 async fn wait_for_file(path: &std::path::Path, timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {

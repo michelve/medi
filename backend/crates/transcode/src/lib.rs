@@ -29,7 +29,7 @@ pub mod decision;
 pub mod session;
 
 pub use caps::HwCaps;
-pub use command::{AudioTarget, PLAYLIST_NAME};
+pub use command::{build_vod_playlist, segment_index, AudioTarget, PLAYLIST_NAME};
 pub use decision::{
     audio_plan, decide, AudioPlan, AudioTrack, ClientProfile, Decision, Quality, SubtitlePlan,
     TranscodeTarget, Vendor,
