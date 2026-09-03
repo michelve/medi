@@ -88,6 +88,90 @@ pub struct TrickplayMeta {
 }
 
 // ---------------------------------------------------------------------------
+// Per-file tracks (`docs/.tasks/97` Part C) — `GET /api/files/:file_id`
+// ---------------------------------------------------------------------------
+
+/// One audio track in `GET /api/files/:file_id` — the subset of `audio_streams` a player's
+/// audio menu needs to label + select a track (`docs/.tasks/97` Part C). `stream_index` is
+/// the value the client passes back as `?audio_track=` on `/api/stream`.
+#[derive(Debug, Serialize)]
+pub struct FileAudioTrack {
+    pub stream_index: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channels: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub is_default: bool,
+}
+
+impl From<medi_db::models::AudioStream> for FileAudioTrack {
+    fn from(a: medi_db::models::AudioStream) -> Self {
+        Self {
+            stream_index: a.stream_index,
+            codec: a.codec,
+            channels: a.channels,
+            channel_layout: a.channel_layout,
+            language: a.language,
+            title: a.title,
+            is_default: a.is_default,
+        }
+    }
+}
+
+/// One subtitle track in `GET /api/files/:file_id` — enough for a player's caption menu +
+/// the burn-in / WebVTT-sidecar choice (`docs/.tasks/97` Part C, consumed by `99`). `id` is
+/// the `subtitle_streams` row id (used to address an external sidecar as `ext<id>`);
+/// `stream_index` is the embedded ffprobe index (absent for an external track).
+#[derive(Debug, Serialize)]
+pub struct FileSubtitleTrack {
+    pub id: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_index: Option<i64>,
+    pub external: bool,
+    /// `"text"` | `"image"`.
+    pub format: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub is_default: bool,
+    pub is_forced: bool,
+}
+
+impl From<medi_db::models::SubtitleStream> for FileSubtitleTrack {
+    fn from(s: medi_db::models::SubtitleStream) -> Self {
+        Self {
+            id: s.id,
+            stream_index: s.stream_index,
+            external: s.is_external,
+            format: s.format,
+            language: s.language,
+            title: s.title,
+            is_default: s.is_default,
+            is_forced: s.is_forced,
+        }
+    }
+}
+
+/// `GET /api/files/:file_id` — a file's audio + subtitle tracks (`docs/.tasks/97` Part C).
+///
+/// Lets a **deep link** to `/play/:file_id` (with no router state) populate the player's
+/// audio-track and caption menus. Shared with `99` (which extends it with chapters); defined
+/// once here and consumed by both specs.
+#[derive(Debug, Serialize)]
+pub struct FileTracks {
+    pub file_id: i64,
+    pub audio: Vec<FileAudioTrack>,
+    pub subtitles: Vec<FileSubtitleTrack>,
+}
+
+// ---------------------------------------------------------------------------
 // Genres & discovery (`docs/.tasks/91` Phase A)
 // ---------------------------------------------------------------------------
 

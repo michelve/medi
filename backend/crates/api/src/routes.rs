@@ -32,9 +32,9 @@ use medi_transcode::{
 
 use crate::cursor;
 use crate::dto::{
-    BackfillResponse, CategoryRow, GenreListItem, LibraryItem, LibraryPage, LibraryRows,
-    MatchCandidate, MatchRequest, MatchesResponse, PersonPage, RefreshResponse, StreamDecision,
-    TrickplayMeta,
+    BackfillResponse, CategoryRow, FileTracks, GenreListItem, LibraryItem, LibraryPage,
+    LibraryRows, MatchCandidate, MatchRequest, MatchesResponse, PersonPage, RefreshResponse,
+    StreamDecision, TrickplayMeta,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -93,6 +93,9 @@ pub fn router(state: AppState) -> Router {
             "/api/libraries/:id/scan",
             axum::routing::post(crate::libraries::scan_library),
         )
+        // Per-file tracks (`docs/.tasks/97` Part C): audio + subtitle tracks for a deep link
+        // to populate the player's menus. Shared with `99` (adds chapters).
+        .route("/api/files/:file_id", get(file_tracks))
         // Playback — Phase 2 (transcode crate).
         .route("/api/stream/:file_id", get(stream_decision))
         .route("/api/direct/:file_id", get(direct_play))
@@ -704,6 +707,14 @@ pub struct StreamQuery {
     /// with this flag to demand an H.264+AAC HLS stream hls.js can always play.
     #[serde(default)]
     force_transcode: Option<String>,
+    /// Selected audio track (`docs/.tasks/97` Part C): the ffprobe `stream_index` of one of
+    /// the file's `audio_streams`. Absent (or invalid) → the default track
+    /// (`default_audio_track`). A non-default selection changes the source audio the transcode
+    /// maps (`-map 0:a:<n>`) and, because it feeds the session key, spawns its own transcode
+    /// session. A browser `<video>` can't switch an embedded track, so the client pairs this
+    /// with `force_transcode=1` when the base decision was `direct`.
+    #[serde(default)]
+    audio_track: Option<i64>,
 }
 
 fn truthy(v: Option<&str>) -> Option<bool> {
@@ -799,20 +810,30 @@ fn quality_from(q: &StreamQuery) -> Quality {
     }
 }
 
-/// Pick the source audio track `decide` reasons over: the `is_default` track, else the
+/// The default source audio track `decide` reasons over: the `is_default` track, else the
 /// lowest `stream_index`. Maps the db read model into the transcode [`AudioTrack`]
 /// descriptor. Returns the AAC-safe default when the file has no `audio_streams`
 /// children (un-probed / pre-Task-70), so an unknown-audio row never forces a needless
 /// remux (`docs/.tasks/70` §Backward compat).
 fn default_audio_track(streams: &[medi_db::models::AudioStream]) -> AudioTrack {
-    let Some(track) = streams
+    match default_audio_row(streams) {
+        Some(track) => audio_track_of(track),
+        None => AudioTrack::unknown_safe(),
+    }
+}
+
+/// The default `audio_streams` row: the `is_default` track, else the lowest `stream_index`.
+fn default_audio_row(streams: &[medi_db::models::AudioStream]) -> Option<&medi_db::models::AudioStream> {
+    streams
         .iter()
         .find(|s| s.is_default)
         .or_else(|| streams.iter().min_by_key(|s| s.stream_index))
-    else {
-        return AudioTrack::unknown_safe();
-    };
+}
 
+/// Map one `audio_streams` row into the transcode [`AudioTrack`] descriptor `decide` reads.
+/// An unknown / absent codec becomes the AAC-safe default so a row we can't classify never
+/// forces a needless remux (`docs/.tasks/70` §Backward compat).
+fn audio_track_of(track: &medi_db::models::AudioStream) -> AudioTrack {
     let codec = match track.codec.as_deref() {
         Some("aac") => AudioCodec::Aac,
         Some("ac3") => AudioCodec::Ac3,
@@ -823,8 +844,6 @@ fn default_audio_track(streams: &[medi_db::models::AudioStream]) -> AudioTrack {
         Some("flac") => AudioCodec::Flac,
         Some("opus") => AudioCodec::Opus,
         Some("pcm") => AudioCodec::Pcm,
-        // An unknown / absent codec is treated as the AAC-safe default: never force a
-        // needless remux on a row we can't classify.
         _ => return AudioTrack::unknown_safe(),
     };
     let immersive = match track.immersive.as_str() {
@@ -837,6 +856,41 @@ fn default_audio_track(streams: &[medi_db::models::AudioStream]) -> AudioTrack {
         channels: track.channels.unwrap_or(0).clamp(0, 255) as u8,
         immersive,
     }
+}
+
+/// Resolve the source audio track to serve (`docs/.tasks/97` Part C), honoring a client's
+/// `audio_track` selection.
+///
+/// Returns the track's [`AudioTrack`] descriptor plus its **audio-relative** index
+/// (`0:a:<n>` — its position among the file's audio streams ordered by `stream_index`), which
+/// `command.rs` maps into the output. When `selected` names a real track, that track is used;
+/// when it is absent or doesn't match any stream, the default track is used and the relative
+/// index is `None` (ffmpeg picks its own default first audio — the pre-Task-97 behavior).
+fn select_audio_track(
+    streams: &[medi_db::models::AudioStream],
+    selected: Option<i64>,
+) -> (AudioTrack, Option<u32>) {
+    // Only an explicit, valid selection carries a relative-index map; the default path leaves
+    // it `None` so an un-switched stream is byte-for-byte the same session it always was.
+    if let Some(idx) = selected {
+        if let Some(rel) = audio_relative_index(streams, idx) {
+            if let Some(row) = streams.iter().find(|s| s.stream_index == idx) {
+                return (audio_track_of(row), Some(rel));
+            }
+        }
+    }
+    (default_audio_track(streams), None)
+}
+
+/// The audio-relative (`0:a:<n>`) index of an absolute ffprobe `stream_index` — its position
+/// among the file's audio streams, ordered by `stream_index`. `None` if no track matches.
+fn audio_relative_index(streams: &[medi_db::models::AudioStream], stream_index: i64) -> Option<u32> {
+    let mut ordered: Vec<&medi_db::models::AudioStream> = streams.iter().collect();
+    ordered.sort_by_key(|s| s.stream_index);
+    ordered
+        .iter()
+        .position(|s| s.stream_index == stream_index)
+        .map(|p| p as u32)
 }
 
 /// Map a selected absolute ffprobe subtitle `stream_index` to the *subtitle-relative*
@@ -856,6 +910,26 @@ fn image_subtitle_relative_index(
         .position(|s| s.stream_index == Some(selected_stream_index))
         .filter(|&pos| embedded[pos].format == "image")
         .map(|pos| pos as i64)
+}
+
+/// `GET /api/files/:file_id` — a file's audio + subtitle tracks (`docs/.tasks/97` Part C).
+///
+/// Reuses `queries::get_media_file` (which already hydrates `audio_streams` +
+/// `subtitle_streams`) and projects each into the player-facing menu shape. A deep link to
+/// `/play/:file_id` (with no router state) fetches this to populate its audio-track and
+/// caption menus. Not moka-cached: a tiny single-file read, like `/api/stream`.
+async fn file_tracks(
+    State(state): State<AppState>,
+    Path(file_id): Path<i64>,
+) -> ApiResult<Response> {
+    let db = state.db.clone();
+    let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
+    let body = FileTracks {
+        file_id,
+        audio: file.audio_streams.into_iter().map(Into::into).collect(),
+        subtitles: file.subtitle_streams.into_iter().map(Into::into).collect(),
+    };
+    Ok(Json(body).into_response())
 }
 
 /// `GET /api/stream/:file_id` — direct-play vs transcode decision.
@@ -878,9 +952,11 @@ async fn stream_decision(
 
     let client = client_profile(&q);
     let quality = quality_from(&q);
-    // The default audio track's real descriptor (`docs/.tasks/70`), or the AAC-safe
-    // default when the file has no probed `audio_streams` — never a needless remux.
-    let audio = default_audio_track(&file.audio_streams);
+    // The source audio track's real descriptor (`docs/.tasks/70`) plus its audio-relative
+    // index for the `-map` (`docs/.tasks/97` Part C): the client's `audio_track` selection when
+    // valid, else the default track (with no explicit map — the pre-Task-97 behavior). The
+    // AAC-safe default covers a file with no probed `audio_streams` (never a needless remux).
+    let (audio, audio_source) = select_audio_track(&file.audio_streams, q.audio_track);
     let container = file.container.as_deref().unwrap_or("");
 
     let mut decision = decide(&profile, audio, container, &client, quality, &state.caps);
@@ -915,10 +991,14 @@ async fn stream_decision(
         Decision::DirectPlay { .. } => format!("/api/direct/{file_id}"),
         Decision::Transcode { target, .. } => {
             let src = std::path::PathBuf::from(&file.path);
+            // Carry the selected source track's audio-relative index into the target so
+            // `command.rs` maps `0:a:<n>` and the session key differs per track
+            // (`docs/.tasks/97` Part C). The codec/downmix decision is unchanged — only the
+            // *source* track changes.
             let audio_tgt = match audio_plan(audio, &client) {
-                AudioPlan::Copy => AudioTarget::Copy,
+                AudioPlan::Copy => AudioTarget::Copy { source: audio_source },
                 AudioPlan::Transcode { codec, channels } => {
-                    AudioTarget::Transcode { codec, channels }
+                    AudioTarget::Transcode { codec, channels, source: audio_source }
                 }
             };
             // Duration drives the synthesized VOD playlist (full runtime + seekable timeline).

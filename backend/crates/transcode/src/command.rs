@@ -100,12 +100,24 @@ pub fn build_argv(
         a.push(fc);
         push(&mut a, "-map");
         push(&mut a, "[v]");
-        // With an explicit video map, the default audio stream must be mapped too.
+        // With an explicit video map, the audio stream must be mapped too: the selected
+        // source track (`0:a:<n>`) when one was chosen, else the default first audio.
         push(&mut a, "-map");
-        push(&mut a, "0:a:0?");
-    } else if let Some(vf) = hw.filter_graph(target) {
-        push(&mut a, "-vf");
-        a.push(vf);
+        a.push(format!("0:a:{}?", audio.source().unwrap_or(0)));
+    } else {
+        if let Some(vf) = hw.filter_graph(target) {
+            push(&mut a, "-vf");
+            a.push(vf);
+        }
+        // On the normal (non-burn-in) path ffmpeg maps the default first audio stream on its
+        // own. Emit an explicit `-map` only when a specific source track was selected (an
+        // in-player audio switch): `0:v` keeps the video, `0:a:<n>` picks the chosen track.
+        if let Some(src) = audio.source() {
+            push(&mut a, "-map");
+            push(&mut a, "0:v");
+            push(&mut a, "-map");
+            a.push(format!("0:a:{src}?"));
+        }
     }
     push(&mut a, "-c:v");
     push(&mut a, hw.video_encoder(target));
@@ -134,11 +146,11 @@ pub fn build_argv(
 
     // --- Audio. --------------------------------------------------------------
     match audio {
-        AudioTarget::Copy => {
+        AudioTarget::Copy { .. } => {
             push(&mut a, "-c:a");
             push(&mut a, "copy");
         }
-        AudioTarget::Transcode { codec, channels } => {
+        AudioTarget::Transcode { codec, channels, .. } => {
             push(&mut a, "-c:a");
             push(&mut a, audio_encoder(codec));
             push(&mut a, "-b:a");
@@ -156,12 +168,29 @@ pub fn build_argv(
     a
 }
 
-/// Whether the transcode copies or re-encodes audio, and to how many channels (resolved
-/// by the caller from the source track + client profile via `decision::audio_plan`).
+/// How to handle the audio: whether to copy or re-encode (and to how many channels,
+/// resolved by the caller from the source track + client profile via `decision::audio_plan`),
+/// plus **which** source audio track to take (`docs/.tasks/97` Part C).
+///
+/// `source` is the *audio-relative* index (`0:a:<n>` — the track's position among the file's
+/// audio streams, ordered by `stream_index`), or `None` to let ffmpeg pick its default (the
+/// first audio stream). A non-`None` `source` is what an in-player audio-track switch sets so
+/// the chosen track — not the default — is mapped into the output. It is part of the
+/// session-key fingerprint (via `AudioTarget`'s `Debug`), so switching tracks spawns a
+/// distinct transcode session automatically.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioTarget {
-    Copy,
-    Transcode { codec: AudioCodec, channels: u8 },
+    Copy { source: Option<u32> },
+    Transcode { codec: AudioCodec, channels: u8, source: Option<u32> },
+}
+
+impl AudioTarget {
+    /// The audio-relative source index (`0:a:<n>`) this target selects, if any.
+    fn source(&self) -> Option<u32> {
+        match self {
+            AudioTarget::Copy { source } | AudioTarget::Transcode { source, .. } => *source,
+        }
+    }
 }
 
 /// The HW pipeline plan derived from a [`TranscodeTarget`]: which device to init, how
@@ -474,7 +503,7 @@ mod tests {
 
     #[test]
     fn every_output_is_fmp4_hls() {
-        let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy);
+        let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("-f hls"));
         assert!(s.contains("-hls_segment_type fmp4"), "Apple TV needs fMP4, got: {s}");
@@ -491,7 +520,7 @@ mod tests {
         // Starting at segment 100 (=400s in) seeks the input and numbers segments from 100.
         let a = build_argv(
             &target(Some(Vendor::Intel), false, false, false),
-            AudioTarget::Copy,
+            AudioTarget::Copy { source: None },
             &PathBuf::from("/media/in.mkv"),
             &PathBuf::from("/config/hls/abc"),
             Some("/dev/dri/renderD128"),
@@ -530,7 +559,7 @@ mod tests {
 
     #[test]
     fn intel_hdr10_uses_vpp_tonemap() {
-        let a = argv(&target(Some(Vendor::Intel), true, false, false), AudioTarget::Copy);
+        let a = argv(&target(Some(Vendor::Intel), true, false, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("vpp_qsv=tonemap=1"), "HDR10 uses VPP: {s}");
         assert!(s.contains("h264_qsv"));
@@ -539,7 +568,7 @@ mod tests {
 
     #[test]
     fn intel_dv_uses_opencl_not_vpp() {
-        let a = argv(&target(Some(Vendor::Intel), true, true, false), AudioTarget::Copy);
+        let a = argv(&target(Some(Vendor::Intel), true, true, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("tonemap_opencl"), "DV must use OpenCL, not VPP: {s}");
         assert!(!s.contains("vpp_qsv=tonemap"));
@@ -550,7 +579,7 @@ mod tests {
 
     #[test]
     fn nvidia_dv_uses_cuda_tonemap() {
-        let a = argv(&target(Some(Vendor::Nvidia), true, true, false), AudioTarget::Copy);
+        let a = argv(&target(Some(Vendor::Nvidia), true, true, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("tonemap_cuda"));
         assert!(s.contains("h264_nvenc"));
@@ -564,7 +593,7 @@ mod tests {
 
     #[test]
     fn software_fallback_tone_map_uses_zscale() {
-        let a = argv(&target(None, true, true, true), AudioTarget::Copy);
+        let a = argv(&target(None, true, true, true), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("libx264"));
         assert!(s.contains("tonemap=tonemap=hable") || s.contains("zscale"), "sw tonemap: {s}");
@@ -573,14 +602,14 @@ mod tests {
 
     #[test]
     fn sdr_transcode_has_no_filter() {
-        let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy);
+        let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(!s.contains("-vf"), "plain SDR transcode needs no filter: {s}");
     }
 
     #[test]
     fn tone_mapped_output_is_tagged_bt709() {
-        let a = argv(&target(Some(Vendor::Intel), true, false, false), AudioTarget::Copy);
+        let a = argv(&target(Some(Vendor::Intel), true, false, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("-color_trc bt709"));
     }
@@ -589,7 +618,7 @@ mod tests {
     fn audio_transcode_to_eac3_surround() {
         let a = argv(
             &target(Some(Vendor::Intel), false, false, false),
-            AudioTarget::Transcode { codec: AudioCodec::Eac3, channels: 6 },
+            AudioTarget::Transcode { codec: AudioCodec::Eac3, channels: 6, source: None },
         );
         let s = joined(&a);
         assert!(s.contains("-c:a eac3"));
@@ -601,7 +630,7 @@ mod tests {
         // A 7.1 → 5.1 downmix carries the resolved channel count, not a hard-coded 6.
         let a = argv(
             &target(Some(Vendor::Intel), false, false, false),
-            AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2 },
+            AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2, source: None },
         );
         let s = joined(&a);
         assert!(s.contains("-c:a aac"));
@@ -609,10 +638,44 @@ mod tests {
     }
 
     #[test]
+    fn default_audio_maps_nothing_explicit() {
+        // With no source track selected, ffmpeg picks the default first audio itself — no
+        // explicit `-map` is emitted on the plain (non-burn-in) path.
+        let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(!s.contains("-map "), "no explicit audio map without a selected track: {s}");
+    }
+
+    #[test]
+    fn selected_audio_track_maps_that_stream() {
+        // Selecting audio-relative track 2 (an in-player audio switch) maps `0:v` + `0:a:2`.
+        let a = argv(
+            &target(Some(Vendor::Intel), false, false, false),
+            AudioTarget::Copy { source: Some(2) },
+        );
+        let s = joined(&a);
+        assert!(s.contains("-map 0:v"), "video kept: {s}");
+        assert!(s.contains("-map 0:a:2?"), "selected audio track mapped: {s}");
+    }
+
+    #[test]
+    fn selected_audio_track_maps_under_burn_in() {
+        // The burn-in path (explicit `-map [v]`) maps the selected source audio track too,
+        // not the hard-coded first track.
+        let mut t = target(Some(Vendor::Intel), false, false, false);
+        t.subtitle_burn_in = Some(0);
+        let a = argv(&t, AudioTarget::Copy { source: Some(3) });
+        let s = joined(&a);
+        assert!(s.contains("-map [v]"));
+        assert!(s.contains("-map 0:a:3?"), "burn-in path maps the selected audio track: {s}");
+        assert!(!s.contains("-map 0:a:0?"), "no longer hard-codes the first track: {s}");
+    }
+
+    #[test]
     fn capped_emits_maxrate_and_bufsize() {
         let mut t = target(Some(Vendor::Intel), false, false, false);
         t.max_bitrate = Some(8_000_000);
-        let a = argv(&t, AudioTarget::Copy);
+        let a = argv(&t, AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("-maxrate 8000000"), "capped sets -maxrate: {s}");
         assert!(s.contains("-bufsize 16000000"));
@@ -624,7 +687,7 @@ mod tests {
         // tone-map chain, and an explicit `-map [v]`.
         let mut t = target(Some(Vendor::Intel), false, false, false);
         t.subtitle_burn_in = Some(0);
-        let a = argv(&t, AudioTarget::Copy);
+        let a = argv(&t, AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("-filter_complex"), "burn-in uses filter_complex: {s}");
         assert!(s.contains("[0:v][0:s:0]overlay[v]"), "overlay graph: {s}");
@@ -638,7 +701,7 @@ mod tests {
         // the burned subtitle isn't washed out (`docs/.tasks/90` §5).
         let mut t = target(Some(Vendor::Intel), true, false, false);
         t.subtitle_burn_in = Some(1);
-        let a = argv(&t, AudioTarget::Copy);
+        let a = argv(&t, AudioTarget::Copy { source: None });
         let s = joined(&a);
         assert!(s.contains("-filter_complex"));
         // The tone-map filter appears in the base, before the overlay stage.

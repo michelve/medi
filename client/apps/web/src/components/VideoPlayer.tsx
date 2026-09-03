@@ -46,6 +46,27 @@ export interface VideoPlayerProps {
   /** Receives the server's resolved decision (for debugging / mode display). */
   onDecision?: (decision: StreamDecision) => void;
   /**
+   * Fill the parent container (`docs/.tasks/97` Part A): drop the boxed `16/9` aspect frame
+   * and stretch the `<video>` to `100% × 100%` with `object-fit: contain`, for the
+   * full-viewport player. Default `false` keeps the rounded, aspect-boxed frame used elsewhere.
+   */
+  fill?: boolean;
+  /**
+   * Selected source audio track (`docs/.tasks/97` Part C): the ffprobe `stream_index` to
+   * transcode. Changing it re-resolves the stream, tears down the current hls.js instance,
+   * attaches the new track's playlist, and re-seeks to the position captured at the switch —
+   * so the audio changes without losing the user's place. `undefined` = the server default.
+   */
+  audioTrack?: number;
+  /**
+   * Pair `audioTrack` with a forced transcode when the base decision was `direct` — a browser
+   * `<video>` can't switch an embedded audio track, so a non-default selection must go through
+   * the server transcode path (`docs/.tasks/97` Part C, "direct-play caveat").
+   */
+  forceTranscodeForAudio?: boolean;
+  /** Fires with `true` while an audio-track switch is re-resolving + re-attaching. */
+  onSwitchingAudio?: (switching: boolean) => void;
+  /**
    * WebVTT text subtitles to attach as `<track>` children (`docs/.tasks/90`). Text tracks
    * ride alongside a direct-played or transcoded stream with no extra work; image tracks
    * are burned in server-side (via the stream decision) and never appear here.
@@ -113,6 +134,10 @@ export function VideoPlayer({
   fileId,
   onVideoRef,
   onDecision,
+  fill = false,
+  audioTrack,
+  forceTranscodeForAudio = false,
+  onSwitchingAudio,
   textTracks,
   diagnostics = true,
   diagnosticsOpen = false,
@@ -120,6 +145,12 @@ export function VideoPlayer({
 }: VideoPlayerProps) {
   const api = useApi();
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  // The playback position (ms) to restore once a freshly-attached source is ready — set when
+  // an audio-track switch tears the current stream down, so the new track resumes in place.
+  const resumeToRef = useRef<number | null>(null);
+  // Remember the previous audioTrack so a *change* (a real switch) captures the current
+  // position, while the first mount does not.
+  const prevAudioTrackRef = useRef<number | undefined>(audioTrack);
   // One diagnostics channel per mount — a fresh log for each file/session.
   const diag = useMemo(() => new PlayerDiagnostics(), []);
 
@@ -142,17 +173,33 @@ export function VideoPlayer({
     setForceTranscode(false);
   }, [fileId]);
 
-  // 1) Resolve the stream decision (direct vs HLS) from the server.
+  // On an audio-track *change* (not the first mount), capture the current playback position
+  // so the resolve effect below can re-seek there after the new track's source attaches.
+  if (prevAudioTrackRef.current !== audioTrack) {
+    prevAudioTrackRef.current = audioTrack;
+    const t = videoRef.current?.currentTime;
+    if (typeof t === 'number' && Number.isFinite(t) && t > 0) {
+      resumeToRef.current = Math.round(t * 1000);
+    }
+  }
+
+  // 1) Resolve the stream decision (direct vs HLS) from the server. Re-runs on an
+  // `audioTrack` switch too (the new source is a distinct transcode session).
   useEffect(() => {
     const controller = new AbortController();
+    const switching = resumeToRef.current !== null;
     setPhase({ kind: 'loading' });
-    diag.info('decision', 'requesting /api/stream', { fileId, platform: 'web', forceTranscode, attempt });
+    if (switching) onSwitchingAudio?.(true);
+    // A non-default audio selection can't be switched by a browser `<video>` on a direct
+    // stream — force the transcode path so the server maps the chosen track.
+    const force = forceTranscode || (audioTrack != null && forceTranscodeForAudio);
+    diag.info('decision', 'requesting /api/stream', { fileId, platform: 'web', forceTranscode: force, audioTrack, attempt });
     api
       // `platform: 'web'` selects the browser capability profile so the server transcodes
       // codecs a browser can't decode (HEVC / AC-3 / DTS) instead of handing back a direct
       // stream that would black-screen. `forceTranscode` is set by the fallback below after a
       // `direct` stream failed to play — it demands an HLS transcode hls.js can always play.
-      .stream(fileId, { platform: 'web', forceTranscode }, { signal: controller.signal })
+      .stream(fileId, { platform: 'web', forceTranscode: force, audioTrack }, { signal: controller.signal })
       .then((decision) => {
         if (controller.signal.aborted) return;
         diag.info('decision', `resolved: ${decision.mode}`, decision);
@@ -165,9 +212,10 @@ export function VideoPlayer({
         const message = err instanceof ApiError ? err.message : String(err);
         diag.error('decision', 'stream request failed', { message, busy, status: err instanceof ApiError ? err.status : undefined });
         setPhase({ kind: 'error', message, busy });
+        if (switching) onSwitchingAudio?.(false);
       });
     return () => controller.abort();
-  }, [api, fileId, attempt, forceTranscode, onDecision, diag]);
+  }, [api, fileId, attempt, forceTranscode, audioTrack, forceTranscodeForAudio, onDecision, onSwitchingAudio, diag]);
 
   // 2) Attach the resolved source to the <video> (direct src / native HLS / hls.js).
   useEffect(() => {
@@ -180,6 +228,11 @@ export function VideoPlayer({
     // regardless of direct/HLS and are the ground truth for "why is it a black screen".
     const detachVideoEvents = attachVideoDiagnostics(video, diag);
 
+    // Audio-track switch resume (`docs/.tasks/97` Part C): if a switch captured a position,
+    // seek there once the new source is ready. The VOD playlist makes any offset immediately
+    // seekable. One-shot: it fires on the first `loadedmetadata`, then clears.
+    const detachResume = attachResumeSeek(video, resumeToRef, diag, () => onSwitchingAudio?.(false));
+
     if (decision.mode === 'direct') {
       const src = api.directUrl(fileId);
       diag.info('video', 'attach direct src', { src });
@@ -187,6 +240,7 @@ export function VideoPlayer({
       void startPlayback(video);
       return () => {
         detachVideoEvents();
+        detachResume();
         video.removeAttribute('src');
         video.load();
       };
@@ -283,6 +337,7 @@ export function VideoPlayer({
     return () => {
       cancelled = true;
       detachVideoEvents();
+      detachResume();
       instance?.destroy();
       // Native-HLS (Safari) path: clear the src we set so a re-resolve starts clean.
       if (nativeSrcSet) {
@@ -290,7 +345,7 @@ export function VideoPlayer({
         video.load();
       }
     };
-  }, [api, fileId, phase, diag]);
+  }, [api, fileId, phase, diag, onSwitchingAudio]);
 
   const setRef = (el: HTMLVideoElement | null) => {
     videoRef.current = el;
@@ -303,15 +358,24 @@ export function VideoPlayer({
       style={{
         position: 'relative',
         width: '100%',
-        aspectRatio: '16 / 9',
+        // Full-viewport player fills its (fixed) parent; the boxed use keeps the 16/9 frame.
+        ...(fill
+          ? { height: '100%' }
+          : { aspectRatio: '16 / 9', borderRadius: 8 }),
         background: '#000',
-        borderRadius: 8,
         overflow: 'hidden',
       }}
     >
       <video
         ref={setRef}
-        style={{ width: '100%', height: '100%', display: 'block', background: '#000' }}
+        style={{
+          width: '100%',
+          height: '100%',
+          display: 'block',
+          background: '#000',
+          // Letterbox the frame inside the viewport rather than cropping it.
+          objectFit: fill ? 'contain' : undefined,
+        }}
         crossOrigin="anonymous"
         playsInline
         // A decode / unsupported-source error would otherwise be a silent black screen — surface
@@ -451,6 +515,40 @@ function attachVideoDiagnostics(
   for (const [name, fn] of Object.entries(handlers)) video.addEventListener(name, fn);
   return () => {
     for (const [name, fn] of Object.entries(handlers)) video.removeEventListener(name, fn);
+  };
+}
+
+/**
+ * Seek a freshly-attached source back to a captured position once it's ready — the resume
+ * half of an audio-track switch (`docs/.tasks/97` Part C). `resumeToRef` holds the target ms
+ * (or `null` when there's nothing to resume). On the first `loadedmetadata` it seeks, clears
+ * the ref, calls `onDone` (to drop the "switching audio…" state), and detaches itself. Returns
+ * a detach function for the effect cleanup.
+ */
+function attachResumeSeek(
+  video: HTMLVideoElement,
+  resumeToRef: React.MutableRefObject<number | null>,
+  diag: PlayerDiagnostics,
+  onDone: () => void,
+): () => void {
+  const target = resumeToRef.current;
+  if (target === null) return () => {};
+  let done = false;
+  const seek = () => {
+    if (done) return;
+    done = true;
+    resumeToRef.current = null;
+    video.currentTime = target / 1000;
+    diag.info('player', 'audio switch: resumed position', { ms: target });
+    void video.play().catch(() => undefined);
+    onDone();
+    video.removeEventListener('loadedmetadata', seek);
+  };
+  video.addEventListener('loadedmetadata', seek);
+  return () => {
+    video.removeEventListener('loadedmetadata', seek);
+    // If we tore down before the seek landed (a rapid re-switch), keep the target so the next
+    // attach still resumes — do NOT clear it. Drop the switching flag only once it lands.
   };
 }
 

@@ -365,6 +365,51 @@ export interface TrickplayMetaResponse {
   rows: number;
 }
 
+// ---------------------------------------------------------------------------
+// Per-file tracks (`docs/.tasks/97` Part C) — `GET /api/files/:file_id`
+// ---------------------------------------------------------------------------
+
+/**
+ * One audio track in `GET /api/files/:file_id` (`docs/.tasks/97` Part C) — the subset of an
+ * `audio_streams` row the player's audio menu needs. `stream_index` is the value passed back
+ * as `audioTrack` on `stream(...)` to switch to this track.
+ */
+export interface FileAudioTrack {
+  stream_index: number;
+  codec?: string;
+  channels?: number;
+  channel_layout?: string;
+  language?: string;
+  title?: string;
+  is_default: boolean;
+}
+
+/**
+ * One subtitle track in `GET /api/files/:file_id` (`docs/.tasks/97` Part C, consumed by
+ * `99`). `id` is the `subtitle_streams` row id (an external sidecar is addressed as
+ * `ext<id>`); `stream_index` is the embedded ffprobe index (absent for external tracks).
+ */
+export interface FileSubtitleTrack {
+  id: number;
+  stream_index?: number;
+  external: boolean;
+  format: SubtitleFormat;
+  language?: string;
+  title?: string;
+  is_default: boolean;
+  is_forced: boolean;
+}
+
+/**
+ * `GET /api/files/:file_id` — a file's audio + subtitle tracks (`docs/.tasks/97` Part C).
+ * Lets a deep link to `/play/:file_id` (no router state) populate the player's menus.
+ */
+export interface FileTracks {
+  file_id: number;
+  audio: FileAudioTrack[];
+  subtitles: FileSubtitleTrack[];
+}
+
 /** The client platform selecting a static per-device capability default (`docs/.tasks/70`). */
 export type StreamPlatform = 'appletv' | 'shield' | 'androidtv' | 'web';
 
@@ -413,6 +458,14 @@ export interface StreamHints {
    * an H.264+AAC HLS stream hls.js can always play.
    */
   forceTranscode?: boolean;
+  /**
+   * Selected audio track (`docs/.tasks/97` Part C): the ffprobe `stream_index` of one of the
+   * file's `audio_streams`. Switches the source audio the server transcodes and yields a
+   * distinct HLS session per track. A browser `<video>` can't switch an embedded track, so
+   * pair a non-default selection with `forceTranscode: true` when the base decision was
+   * `direct`.
+   */
+  audioTrack?: number;
 }
 
 // ---------------------------------------------------------------------------

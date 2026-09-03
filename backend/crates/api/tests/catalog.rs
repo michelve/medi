@@ -358,20 +358,30 @@ fn audio_app() -> (axum::Router, tempfile::TempDir) {
             "INSERT INTO movies (id, title, sort_title, added_at) \
                 VALUES (30, 'TrueHD Movie', 'truehd movie', 100), \
                        (31, 'EAC3 Movie', 'eac3 movie', 200), \
-                       (32, 'Big Movie', 'big movie', 300);
+                       (32, 'Big Movie', 'big movie', 300), \
+                       (33, 'Multi Audio Movie', 'multi audio movie', 400);
              INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth) \
                 VALUES (200, 30, '/media/truehd.mp4', 'mp4', 'h264', 1920, 1080, 8);
              INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth) \
                 VALUES (201, 31, '/media/eac3.mp4', 'mp4', 'h264', 1920, 1080, 8);
              INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth, bitrate) \
                 VALUES (202, 32, '/media/big.mp4', 'mp4', 'h264', 3840, 2160, 8, 40000000);
+             -- A file with TWO audio tracks (an English 5.1 default + a French stereo), so the
+             -- audio-track switch (`docs/.tasks/97` Part C) has something to select. Both AC-3,
+             -- which a browser can't decode, so the web profile always transcodes → an HLS
+             -- session whose key differs per selected track.
+             INSERT INTO media_files (id, movie_id, path, container, video_codec, width, height, bit_depth, duration_ms) \
+                VALUES (203, 33, '/media/multi.mkv', 'mkv', 'h264', 1920, 1080, 8, 60000);
              -- Default audio tracks.
              INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, immersive, is_default) \
                 VALUES (200, 1, 'truehd', 8, 'dolby_atmos', 1);
              INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, immersive, is_default) \
                 VALUES (201, 1, 'eac3', 6, 'none', 1);
              INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, immersive, is_default) \
-                VALUES (202, 1, 'aac', 2, 'none', 1);",
+                VALUES (202, 1, 'aac', 2, 'none', 1);
+             INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, language, title, immersive, is_default) \
+                VALUES (203, 1, 'ac3', 6, 'eng', 'English', 'none', 1), \
+                       (203, 2, 'ac3', 2, 'fre', 'Français', 'none', 0);",
         )
         .unwrap();
     }
@@ -493,6 +503,73 @@ async fn force_transcode_promotes_web_direct_play_to_hls() {
     assert_eq!(json["mode"], "hls");
     assert_eq!(json["reason"], "forced_transcode");
     assert!(json["url"].as_str().unwrap().starts_with("/api/hls/"));
+}
+
+// ---------------------------------------------------------------------------
+// Audio-track switching (`docs/.tasks/97` Part C) — /api/files + audio_track select
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn files_endpoint_lists_audio_and_subtitle_tracks() {
+    // A deep link populates its menus from GET /api/files/:id (audio + subtitles).
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(Request::get("/api/files/203").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["file_id"], 203);
+    let audio = json["audio"].as_array().unwrap();
+    assert_eq!(audio.len(), 2, "both audio tracks listed");
+    assert_eq!(audio[0]["stream_index"], 1);
+    assert_eq!(audio[0]["language"], "eng");
+    assert_eq!(audio[0]["is_default"], true);
+    assert_eq!(audio[1]["stream_index"], 2);
+    assert_eq!(audio[1]["title"], "Français");
+    // No subtitle streams on this file → an empty (but present) list.
+    assert!(json["subtitles"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn audio_track_selection_yields_a_distinct_hls_session() {
+    // Selecting track 2 vs the default (track 1) must transcode a DIFFERENT source track and
+    // therefore spawn a DISTINCT session (a different session id in the returned HLS url). The
+    // `FFMPEG_BIN=cat` fake keeps each session alive so the two starts don't collapse.
+    std::env::set_var("FFMPEG_BIN", "cat");
+    let (app, _dir) = audio_app();
+
+    // Default track: browser (web) can't decode AC-3 / open MKV → an HLS transcode session.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/stream/203?platform=web").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "hls");
+    let default_url = json["url"].as_str().unwrap().to_string();
+    assert!(default_url.starts_with("/api/hls/"));
+
+    // Explicit selection of the same default track (stream_index=1) — this DOES set a source
+    // map, so it is its own session, distinct from the ffmpeg-default one above.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/stream/203?platform=web&audio_track=1").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let track1_url = body_json(resp).await["url"].as_str().unwrap().to_string();
+
+    // The French track (stream_index=2) → a different mapped source → a different session.
+    let resp = app
+        .oneshot(Request::get("/api/stream/203?platform=web&audio_track=2").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "hls");
+    let track2_url = json["url"].as_str().unwrap().to_string();
+
+    assert_ne!(track1_url, track2_url, "a different audio track must be a distinct session");
+    std::env::remove_var("FFMPEG_BIN");
 }
 
 // ---------------------------------------------------------------------------

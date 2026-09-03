@@ -7,7 +7,9 @@
  * `/person/:id`          — person page: headshot + bio + filmography (Task 91)
  * `/movie/:id`           — movie detail (overview, credits, files)
  * `/series/:id`          — series detail (seasons → episodes)
- * `/play/:fileId`        — in-browser player (direct / HLS)
+ * `/play/:fileId`        — in-browser player (direct / HLS). A SIBLING top-level route, NOT
+ *                          a child of `App`: the player fills the whole viewport with no nav
+ *                          chrome / max-width box (`docs/.tasks/97` Part A).
  * `/settings/libraries`  — library management (create/scan/edit/delete)
  * `*`                    — catch-all for deep links no page owns yet
  */
@@ -34,10 +36,12 @@ export const router = createBrowserRouter([
       { path: 'person/:id', element: <PersonPage /> },
       { path: 'movie/:id', element: <MovieDetailPage /> },
       { path: 'series/:id', element: <SeriesDetailPage /> },
-      { path: 'play/:fileId', element: <PlayerPage /> },
       { path: 'settings/libraries', element: <LibrariesPage /> },
       { path: 'settings/status', element: <StatusPage /> },
       { path: '*', element: <NotFoundPage /> },
     ],
   },
+  // The player is a sibling of `App`, not a child — it owns the whole viewport with no nav
+  // bar / max-width box (`docs/.tasks/97` Part A).
+  { path: '/play/:fileId', element: <PlayerPage /> },
 ]);

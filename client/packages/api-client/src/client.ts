@@ -17,6 +17,7 @@ import type {
   ApiErrorBody,
   BackfillResponse,
   CreateLibraryRequest,
+  FileTracks,
   GenreCount,
   Library,
   LibraryPage,
@@ -181,6 +182,9 @@ export class ApiClient {
     // Force a server transcode even when the file would direct-play — the web player's
     // fallback when a `direct` stream proved unplayable in the browser.
     if (hints.forceTranscode) params.set('force_transcode', '1');
+    // Selected audio track (`docs/.tasks/97` Part C): the source `stream_index` the server
+    // maps (`-map 0:a:<n>`). A distinct value yields a distinct transcode session.
+    if (hints.audioTrack != null) params.set('audio_track', String(hints.audioTrack));
     const qs = params.toString();
     // Not cached: a stream decision may spin up a transcode session.
     return this.getJson<StreamDecision>(
@@ -188,6 +192,15 @@ export class ApiClient {
       opts,
       /* cacheable */ false,
     );
+  }
+
+  /**
+   * `GET /api/files/:file_id` — a file's audio + subtitle tracks (`docs/.tasks/97` Part C).
+   * A deep link to `/play/:file_id` (with no router state) fetches this to populate the
+   * player's audio-track and caption menus. Not ETag-cached — a tiny per-file read.
+   */
+  files(fileId: number, opts: RequestOptions = {}): Promise<FileTracks> {
+    return this.getJson<FileTracks>(`/api/files/${fileId}`, opts, false);
   }
 
   /**

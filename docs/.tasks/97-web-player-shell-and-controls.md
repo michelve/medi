@@ -1,6 +1,11 @@
 # 97 — Web Player Shell & Controls
 
-> **Status: SPEC (not started).** New web-player phase, peer to
+> **Status: BUILT (session 2026-09-03).** Parts A–C shipped. Backend `cargo test --workspace`
+> green (new `command.rs` audio-map tests + `catalog.rs` `/api/files` + distinct-session tests);
+> all 6 client workspaces typecheck + web `vite build` green (hls.js still code-split). The
+> subtitles menu is a placeholder slot here — `99` fills it. No live browser test this session.
+>
+> New web-player phase, peer to
 > `82` (browse+player+admin) and `90` (format coverage). Depends on `02-api-contract.md`
 > (`/api/stream`), `70-audio-quality-and-profiles.md` (the audio axis, `audio_streams`,
 > `default_audio_track`), `20-phase2-hwa-transcode.md` (`command.rs`, the session layer), and

@@ -465,14 +465,14 @@ mod tests {
         let input = dir.path().join("in.mkv");
         std::fs::write(&input, b"x").unwrap();
 
-        let a = mgr.start(&input, &target(), AudioTarget::Copy, 60_000).await.unwrap();
-        let b = mgr.start(&input, &target(), AudioTarget::Copy, 60_000).await.unwrap();
+        let a = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 60_000).await.unwrap();
+        let b = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 60_000).await.unwrap();
         assert_eq!(a, b, "identical request must reuse the session");
         assert_eq!(mgr.active_count().await, 1, "only one ffmpeg for one output");
 
         // A DIFFERENT audio target is a different output → a new session.
         let c = mgr
-            .start(&input, &target(), AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2 }, 60_000)
+            .start(&input, &target(), AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2, source: None }, 60_000)
             .await
             .unwrap();
         assert_ne!(a, c, "different target must not reuse");
@@ -490,7 +490,7 @@ mod tests {
         std::fs::write(&input, b"x").unwrap();
 
         // 12s title @ 4s segments → 3 segments, VOD, ENDLIST.
-        let id = mgr.start(&input, &target(), AudioTarget::Copy, 12_000).await.unwrap();
+        let id = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 12_000).await.unwrap();
         let m = mgr.vod_playlist(&id).await.unwrap();
         assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(m.contains("#EXT-X-ENDLIST"));
@@ -511,7 +511,7 @@ mod tests {
         std::fs::write(&input, b"x").unwrap();
 
         // 600s title (150 segments). Start at 0, then "seek" to segment 100.
-        let id = mgr.start(&input, &target(), AudioTarget::Copy, 600_000).await.unwrap();
+        let id = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 600_000).await.unwrap();
         // ensure_segment waits up to 15s for the file (which the fake ffmpeg never writes);
         // run it with a timeout and just assert the restart bookkeeping happened.
         let _ = tokio::time::timeout(
@@ -543,11 +543,11 @@ mod tests {
         let other = dir.path().join("other.mkv");
         std::fs::write(&other, b"y").unwrap();
 
-        let first = mgr.start(&input, &target(), AudioTarget::Copy, 60_000).await;
+        let first = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 60_000).await;
         assert!(first.is_ok(), "first session should start: {first:?}");
 
         // The cap is 1; a start for a DIFFERENT output is rejected until the first is reaped.
-        let second = mgr.start(&other, &target(), AudioTarget::Copy, 60_000).await;
+        let second = mgr.start(&other, &target(), AudioTarget::Copy { source: None }, 60_000).await;
         assert!(matches!(second, Err(SessionError::CapacityReached(1))));
 
         // Tearing the first session down frees the slot deterministically (no reliance on
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(mgr.active_count().await, 1);
         mgr.stop(&first.unwrap()).await.unwrap();
         assert_eq!(mgr.active_count().await, 0);
-        let third = mgr.start(&other, &target(), AudioTarget::Copy, 60_000).await;
+        let third = mgr.start(&other, &target(), AudioTarget::Copy { source: None }, 60_000).await;
         assert!(third.is_ok(), "slot freed → a new session starts: {third:?}");
 
         std::env::remove_var("FFMPEG_BIN");
