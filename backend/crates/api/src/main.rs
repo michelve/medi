@@ -79,6 +79,9 @@ async fn main() -> anyhow::Result<()> {
     // metadata is disabled or no key is set — ingest then runs filename-only with no
     // error (graceful degradation). When present, an `EnrichContext` is shared by the
     // ingest worker (auto-enrichment) and the API's manual metadata endpoints.
+    // fanart.tv title-logo client (`docs/.tasks/93`), or `None` when FANARTTV_API_KEY is
+    // unset — the logo feature is then inert. Built once and shared on the EnrichContext.
+    let fanart = medi_metadata::build_fanart(&config);
     let enrich_ctx = medi_metadata::build_provider(&config).and_then(|provider| {
         match medi_metadata::HttpFetcher::new() {
             Ok(fetcher) => Some(medi_metadata::EnrichContext {
@@ -86,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
                 provider,
                 fetcher: std::sync::Arc::new(fetcher),
                 images_dir: images_dir.clone(),
+                fanart: fanart.clone(),
             }),
             Err(err) => {
                 tracing::warn!(error = %err, "failed to build image fetcher; enrichment disabled");
@@ -108,7 +112,17 @@ async fn main() -> anyhow::Result<()> {
     // moved into `AppState`.
     let asset_caps = caps.clone();
 
-    let mut state = AppState::new(db.clone(), cache.clone(), config, transcode, caps);
+    // Scan trigger: the API keeps `scan_trigger` (on AppState) to ask the worker to scan on
+    // library create / rescan; the worker's watch loop takes `scan_signal`.
+    let (scan_trigger, scan_signal) = medi_ingest::ScanTrigger::new();
+
+    // Shared enrichment/scan status (`docs/.tasks/96`): the worker records what each scan +
+    // enrichment pass did; `GET /api/status` reads it. One handle, cloned to both sides.
+    let status = medi_ingest::EnrichmentStatus::new();
+
+    let mut state = AppState::new(db.clone(), cache.clone(), config, transcode, caps)
+        .with_scan_trigger(scan_trigger)
+        .with_status(status.clone());
     if let Some(ctx) = &enrich_ctx {
         state = state.with_enrichment(ctx.clone());
     }
@@ -117,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
     // passed as the opaque callback so ingest can flush the catalog after a write
     // without depending on the `api` crate.
     let invalidate: Invalidator = Arc::new(move || cache.invalidate_all());
-    let mut worker_cfg = WorkerConfig::new(media_dir.clone());
+    let mut worker_cfg = WorkerConfig::new(media_dir.clone()).with_status(status.clone());
     if let Some(ctx) = enrich_ctx.clone() {
         // Auto-enrichment (`docs/.tasks/60` Phase A): a scan that writes new titles
         // enriches everything still pending, so dropping a file into a watched folder
@@ -131,15 +145,40 @@ async fn main() -> anyhow::Result<()> {
         let bg_db = db.clone();
         let bg_cfg = worker_cfg.clone();
         let bg_invalidate = invalidate.clone();
+        let bg_status = status.clone();
         tokio::spawn(async move {
             if let Err(err) = medi_ingest::run_scan(&bg_db, &bg_cfg, &bg_invalidate).await {
                 tracing::error!(error = %err, "initial ingest scan failed");
             }
-            if let Err(err) = medi_ingest::watch(bg_db, bg_cfg, bg_invalidate).await {
+            // Boot-time pending sweep (`docs/.tasks/96` Part B, gap #5): the auto-enrich
+            // inside `run_scan` only fires when a scan writes NEW rows. On a restart where
+            // every file is already recorded, the initial scan writes 0 and the pending
+            // backlog would sit untouched until a new file lands. Run one unconditional
+            // enrichment pass here so a restart always drains whatever is still
+            // pending/failed. Idempotent (matched/unmatched rows are skipped) → cheap when
+            // the library is already fully enriched.
+            if let Some(ctx) = &bg_cfg.enrich {
+                tracing::info!("boot-time enrichment sweep of pending titles");
+                if let Err(err) = medi_ingest::run_enrichment(
+                    &bg_db,
+                    ctx,
+                    bg_cfg.enrich_concurrency,
+                    &bg_invalidate,
+                    Some(&bg_status),
+                )
+                .await
+                {
+                    tracing::error!(error = %err, "boot-time enrichment sweep failed");
+                }
+            }
+            if let Err(err) = medi_ingest::watch(bg_db, bg_cfg, bg_invalidate, scan_signal).await {
                 tracing::error!(error = %err, "media watcher stopped");
             }
         });
     } else {
+        // No MEDIA_DIR → no watcher consumes `scan_signal`; dropping it makes any
+        // `trigger()` a harmless no-op (the send half sees a closed channel).
+        drop(scan_signal);
         tracing::warn!(
             media_dir = %media_dir.display(),
             "MEDIA_DIR does not exist; skipping ingestion (catalog will be empty)",
@@ -179,6 +218,56 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         });
+    }
+
+    // Periodic metadata backfill: a low-priority pass over already-matched titles that fills
+    // any newer detail fields / artwork (genres, collections, fanart logos + wallpapers) which
+    // landed after a title was first matched — e.g. an operator adding a fanart key later, or
+    // fanart publishing art for a title that had none. Reuses the single-flight guard on
+    // `AppState`, so it never overlaps a manual `POST /api/metadata/backfill`. Disabled when
+    // `backfill_interval_hours == 0` or no provider is configured.
+    if let Some(ctx) = enrich_ctx.clone() {
+        let hours = state.config.backfill_interval_hours;
+        if hours > 0 {
+            let bf_state = state.clone();
+            let bf_db = db.clone();
+            let bf_invalidate = invalidate.clone();
+            let bf_status = status.clone();
+            let bf_concurrency = worker_cfg.enrich_concurrency;
+            tokio::spawn(async move {
+                let period = std::time::Duration::from_secs(hours as u64 * 3600);
+                // Skip the immediate first tick — the boot-time sweep already drained pending
+                // titles, so the first periodic pass waits one full interval.
+                let mut interval = tokio::time::interval(period);
+                interval.tick().await; // consume the immediate tick
+                loop {
+                    interval.tick().await;
+                    // (1) Drain the pending/failed backlog on a schedule (`docs/.tasks/96`
+                    // Part B, gap #6): without this, a title stuck `pending` (e.g. a transient
+                    // provider outage at scan time) is never retried unless a NEW file lands.
+                    // This runs even when the filesystem is quiet.
+                    tracing::info!(interval_hours = hours, "running periodic pending-title enrichment");
+                    if let Err(err) = medi_ingest::run_enrichment(
+                        &bf_db,
+                        &ctx,
+                        bf_concurrency,
+                        &bf_invalidate,
+                        Some(&bf_status),
+                    )
+                    .await
+                    {
+                        tracing::error!(error = %err, "periodic enrichment pass failed");
+                    }
+                    // (2) Backfill newer detail fields on already-matched titles (fanart art,
+                    // genres, …). Non-force: only touches titles still missing something, so
+                    // it's cheap and self-limiting once a library is fully enriched.
+                    tracing::info!("running periodic metadata backfill");
+                    medi_api::spawn_backfill(&bf_state, ctx.clone(), false);
+                }
+            });
+        } else {
+            tracing::info!("periodic metadata backfill disabled (BACKFILL_INTERVAL_HOURS=0)");
+        }
     }
 
     let app = router(state);

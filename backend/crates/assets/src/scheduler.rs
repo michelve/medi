@@ -73,6 +73,13 @@ impl Scheduler {
 
     /// Is the GPU idle enough for background work — i.e. live transcode sessions at or
     /// below the threshold?
+    ///
+    /// `<=` (not `==`) is deliberate: `LIVE_SESSION_THRESHOLD` is currently `0` but is a
+    /// constant so a future config can *relax* it to a positive count, at which point the
+    /// inequality is the load-bearing comparison. clippy flags the `<= 0` case as absurd
+    /// today (0 is `usize`'s minimum), so allow it here rather than hard-code `== 0` and
+    /// silently break the relax-later intent.
+    #[allow(clippy::absurd_extreme_comparisons)]
     pub async fn gpu_idle(&self) -> bool {
         self.transcode.active_count().await <= LIVE_SESSION_THRESHOLD
     }

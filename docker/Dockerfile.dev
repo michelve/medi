@@ -1,0 +1,94 @@
+# syntax=docker/dockerfile:1
+#
+# medi — DEV image (Task 92, docs/.tasks/92-windows-dev-and-native-gpu.md).
+#
+# This is the Windows developer inner loop, NOT the release image. It shares the exact
+# production runtime (Debian + GPU user-mode drivers + jellyfin-ffmpeg from docker/Dockerfile)
+# so the transcode code path is identical to Unraid, but the backend is built **debug** with
+# the cargo registry+target caches mounted, so a Rust edit rebuilds in seconds instead of a
+# full `--release` compile.
+#
+# The release image (docker/Dockerfile) is the canonical, CI-built, Unraid-published artifact
+# and is unaffected by this file.
+#
+# Build context is the repo root:  docker compose -f docker/compose.dev.yml up --build
+# (equivalently: docker build -f docker/Dockerfile.dev .)
+
+# ---------------------------------------------------------------------------
+# 1) build — compile the DEBUG binary. Cache mounts keep rebuilds fast.
+# ---------------------------------------------------------------------------
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY backend/ ./backend/
+
+# Debug build (no --release) + cached registry/target so an edit recompiles only the changed
+# crate. The binary is copied OUT of the cache-mounted target dir (a cache mount does not
+# persist into the image layer), same pattern as the prod Dockerfile.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/backend/target \
+    cd backend && cargo build --bin medi \
+    && cp target/debug/medi /usr/local/bin/medi
+
+# ---------------------------------------------------------------------------
+# 2) web — build the browser SPA (unchanged from prod; a debug web build adds
+#    nothing for backend work).
+# ---------------------------------------------------------------------------
+FROM node:22-bookworm AS web
+WORKDIR /web
+COPY client/ ./client/
+RUN corepack enable \
+    && cd client \
+    && yarn install --frozen-lockfile \
+    && yarn workspace @medi/web build
+
+# ---------------------------------------------------------------------------
+# 3) runtime — IDENTICAL to docker/Dockerfile's runtime stage (Debian + Intel/AMD
+#    VA-API drivers + jellyfin-ffmpeg). NVIDIA is injected at runtime by the host's
+#    NVIDIA Container Toolkit (--gpus all / compose device reservation) and is NOT
+#    baked in — same as prod.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+
+RUN sed -i 's/ main$/ main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources \
+    || sed -i 's/ main$/ main contrib non-free non-free-firmware/' /etc/apt/sources.list ; \
+    apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      gnupg \
+      intel-media-va-driver-non-free \
+      intel-opencl-icd \
+      mesa-va-drivers \
+      vainfo \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN install -d /etc/apt/keyrings \
+    && curl -fsSL https://repo.jellyfin.org/jellyfin_team.gpg.key \
+         | gpg --dearmor -o /etc/apt/keyrings/jellyfin.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/jellyfin.gpg] \
+https://repo.jellyfin.org/debian bookworm main" > /etc/apt/sources.list.d/jellyfin.list \
+    && apt-get update && apt-get install -y --no-install-recommends jellyfin-ffmpeg7 \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffmpeg  /usr/local/bin/ffmpeg \
+    && ln -sf /usr/lib/jellyfin-ffmpeg/ffprobe /usr/local/bin/ffprobe \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /usr/local/bin/medi /usr/local/bin/medi
+COPY --from=web /web/client/apps/web/dist/ /usr/share/medi/web/
+COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh && chmod +x /usr/local/bin/entrypoint.sh
+
+# Same defaults as prod (docker/Dockerfile / medi_core::AppConfig). RUST_LOG defaults a touch
+# more verbose for the transcode crate here so the dev sees the resolved GPU vendor + argv.
+ENV MEDIA_DIR=/media \
+    CONFIG_DIR=/config \
+    WEB_DIR=/usr/share/medi/web \
+    BIND_ADDR=0.0.0.0:8096 \
+    RUST_LOG=info,medi_transcode=debug \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
+
+VOLUME ["/config", "/media"]
+EXPOSE 8096
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8096/api/health || exit 1
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

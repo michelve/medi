@@ -37,8 +37,13 @@ pub async fn run_enrichment(
     ctx: &EnrichContext,
     concurrency: usize,
     invalidate: &Invalidator,
+    status: Option<&crate::status::EnrichmentStatus>,
 ) -> anyhow::Result<()> {
     let mut any_matched = false;
+    // Tallies for `GET /api/status` (`docs/.tasks/96`): how this pass resolved.
+    let mut matched_total = 0u64;
+    let mut unmatched_total = 0u64;
+    let mut failed_total = 0u64;
     // Process movies then series. Each kind pulls one bounded batch per DB read and
     // loops until the batch is short (backlog drained). A batch that makes no forward
     // progress (every row stayed `pending`/`failed` — e.g. a persistent provider outage)
@@ -71,15 +76,16 @@ pub async fn run_enrichment(
                         TitleKind::Movie => medi_metadata::enrich_movie(&ctx, title.id, false).await,
                         TitleKind::Series => medi_metadata::enrich_series(&ctx, title.id, false).await,
                     };
+                    // Return an outcome tag so the caller can tally matched/unmatched/failed
+                    // for `GET /api/status` (`docs/.tasks/96`): 0=matched, 1=unmatched,
+                    // 2=skipped(terminal, no tally), 3=failed(no progress).
                     match res {
-                        // matched / unmatched are both terminal (the row leaves the pending
-                        // set); only `matched` warrants a cache flush.
-                        Ok(medi_metadata::EnrichOutcome::Matched { .. }) => (true, true),
-                        Ok(medi_metadata::EnrichOutcome::Unmatched) => (false, true),
-                        Ok(medi_metadata::EnrichOutcome::Skipped) => (false, true),
+                        Ok(medi_metadata::EnrichOutcome::Matched { .. }) => 0u8,
+                        Ok(medi_metadata::EnrichOutcome::Unmatched) => 1u8,
+                        Ok(medi_metadata::EnrichOutcome::Skipped) => 2u8,
                         Err(err) => {
                             tracing::warn!(id = title.id, error = %err, "enrichment failed");
-                            (false, false) // stayed pending/failed → no progress
+                            3u8 // stayed pending/failed → no progress
                         }
                     }
                 }));
@@ -87,10 +93,19 @@ pub async fn run_enrichment(
             let mut progressed = 0u32;
             for t in tasks {
                 match t.await {
-                    Ok((matched, terminal)) => {
-                        any_matched |= matched;
-                        if terminal {
-                            progressed += 1;
+                    Ok(tag) => {
+                        match tag {
+                            0 => {
+                                any_matched = true;
+                                matched_total += 1;
+                                progressed += 1;
+                            }
+                            1 => {
+                                unmatched_total += 1;
+                                progressed += 1;
+                            }
+                            2 => progressed += 1, // skipped: terminal, not counted
+                            _ => failed_total += 1, // no progress
                         }
                     }
                     Err(err) => tracing::error!(error = %err, "enrichment task panicked"),
@@ -105,6 +120,9 @@ pub async fn run_enrichment(
 
     if any_matched {
         (**invalidate)();
+    }
+    if let Some(s) = status {
+        s.enrichment_finished(matched_total, unmatched_total, failed_total);
     }
     Ok(())
 }

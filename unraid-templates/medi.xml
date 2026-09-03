@@ -149,6 +149,17 @@ Updates: this image tracks stable releases on the "latest" tag. Use Unraid's "Ch
           Required="false"
           Mask="false">en-US</Config>
 
+  <!-- fanart.tv API key — movie title logos + background wallpapers. Independent of TMDB/OMDb. -->
+  <Config Name="fanart.tv API Key"
+          Target="FANARTTV_API_KEY"
+          Default=""
+          Mode=""
+          Description="fanart.tv personal API key — enables movie title logos and background wallpapers on detail pages. Optional; leave blank to disable. Get one free from fanart.tv (Account → API). Independent of the TMDB/OMDb keys."
+          Type="Variable"
+          Display="always"
+          Required="false"
+          Mask="true"></Config>
+
   <!-- Bind address (rarely changed). -->
   <Config Name="BIND_ADDR"
           Target="BIND_ADDR"

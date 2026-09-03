@@ -109,3 +109,87 @@ fn media_file_xor_owner_enforced() {
     );
     assert!(neither.is_err(), "a file with no owner must be rejected");
 }
+
+/// The collection backfill worklist lists matched movies with no collection, keyset-pages by
+/// `(added_at, id)`, and terminates (the cursor advances past rows that stay NULL rather than
+/// re-listing them, which a "still missing" filter could not do).
+#[test]
+fn collection_worklist_pages_and_terminates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.db");
+    let db = medi_db::open(&path, 2).unwrap();
+    let conn = db.conn().unwrap();
+
+    conn.execute_batch(
+        "INSERT INTO collections (id, name) VALUES (9, 'Franchise');
+         -- Three matched movies with no collection (backfill candidates).
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state) VALUES \
+            (1, 'A', 'a', 100, 'matched'), \
+            (2, 'B', 'b', 200, 'matched'), \
+            (3, 'C', 'c', 300, 'matched');
+         -- A matched movie that already HAS a collection (excluded).
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state, collection_id) \
+            VALUES (4, 'D', 'd', 400, 'matched', 9);
+         -- A pending (unmatched) movie (excluded).
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state) \
+            VALUES (5, 'E', 'e', 500, 'pending');",
+    )
+    .unwrap();
+
+    // First page of 2 → the two oldest NULL-collection matched movies, in (added_at, id) order.
+    let page1 = queries::matched_movies_missing_collection(&conn, None, 2).unwrap();
+    assert_eq!(page1, vec![(1, 100), (2, 200)]);
+
+    // Resume after the last row → the third; movie 4 (has collection) and 5 (pending) excluded.
+    let cursor = Some((page1.last().unwrap().1, page1.last().unwrap().0)); // (added_at, id)
+    let page2 = queries::matched_movies_missing_collection(&conn, cursor, 2).unwrap();
+    assert_eq!(page2, vec![(3, 300)]);
+
+    // Past the end → empty, so the backfill loop stops.
+    let cursor2 = Some((page2.last().unwrap().1, page2.last().unwrap().0));
+    let page3 = queries::matched_movies_missing_collection(&conn, cursor2, 2).unwrap();
+    assert!(page3.is_empty());
+}
+
+/// The fanart backfill worklist (Task 93 logos + Task 95 wallpapers) lists matched movies with
+/// a NULL `logo_path` **or** a NULL `wallpaper_path`, oldest-added first; `force` returns every
+/// matched movie. `get_movie` round-trips both columns.
+#[test]
+fn fanart_worklist_lists_matched_movies_missing_logo_or_wallpaper() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.db");
+    let db = medi_db::open(&path, 2).unwrap();
+    let conn = db.conn().unwrap();
+
+    conn.execute_batch(
+        "-- Missing both (worklist candidate).
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state) VALUES \
+            (1, 'A', 'a', 100, 'matched');
+         -- Has a logo but no wallpaper → still a candidate (needs the wallpaper).
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state, logo_path) \
+            VALUES (2, 'B', 'b', 200, 'matched', 'movies/2/logo.png');
+         -- Has BOTH → excluded unless force.
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state, logo_path, wallpaper_path) \
+            VALUES (3, 'C', 'c', 300, 'matched', 'movies/3/logo.png', 'movies/3/wallpaper.jpg');
+         -- A pending movie (excluded regardless of force).
+         INSERT INTO movies (id, title, sort_title, added_at, metadata_state) \
+            VALUES (4, 'D', 'd', 400, 'pending');",
+    )
+    .unwrap();
+
+    // Non-force: matched movies still missing either art type, oldest-added first (1 and 2).
+    let missing = queries::matched_movies_missing_fanart(&conn, false, 60).unwrap();
+    assert_eq!(missing, vec![1, 2]);
+
+    // Force: every matched movie (incl. the fully-arted one), still excluding the pending one.
+    let forced = queries::matched_movies_missing_fanart(&conn, true, 60).unwrap();
+    assert_eq!(forced, vec![1, 2, 3]);
+
+    // get_movie round-trips both columns (set on movie 3, NULL on movie 1).
+    let m3 = queries::get_movie(&conn, 3).unwrap();
+    assert_eq!(m3.logo_path.as_deref(), Some("movies/3/logo.png"));
+    assert_eq!(m3.wallpaper_path.as_deref(), Some("movies/3/wallpaper.jpg"));
+    let m1 = queries::get_movie(&conn, 1).unwrap();
+    assert!(m1.logo_path.is_none());
+    assert!(m1.wallpaper_path.is_none());
+}

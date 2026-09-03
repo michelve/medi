@@ -1,0 +1,89 @@
+# medi — DEV compose (Task 92, docs/.tasks/92-windows-dev-and-native-gpu.md).
+#
+# The Windows developer inner loop: build once, mount media/appdata, hit REAL NVENC
+# transcode through Docker Desktop's WSL2 backend, and iterate fast (debug build + cargo
+# cache mounts in docker/Dockerfile.dev). This is NOT the release image — the Unraid box
+# still runs the CI-built ghcr.io/michelve/medi:latest from docker/Dockerfile.
+#
+# Prereqs (see task 92 §1): Docker Desktop WSL2 backend + a current Windows NVIDIA driver +
+# the NVIDIA Container Toolkit installed inside the WSL2 distro. Verify FIRST with:
+#   docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi
+#
+# Run:
+#   docker compose -f docker/compose.dev.yml up --build
+#   # edit Rust -> re-run the same command; only the changed crate recompiles (seconds)
+#
+# Media/appdata come from bind mounts. Defaults live under ./devdata (git-ignored); override
+# with a real Windows folder, e.g.:
+#   MEDI_MEDIA=E:/Movies docker compose -f docker/compose.dev.yml up --build
+
+services:
+  medi:
+    build:
+      context: ..                     # repo root — the Dockerfile.dev COPYs backend/, client/, docker/
+      dockerfile: docker/Dockerfile.dev
+    image: medi:dev
+    ports:
+      - "8096:8096"
+    volumes:
+      # Read-only source library. Default: a local Windows folder of sample clips.
+      #
+      # NOTE (network shares): a Windows *mapped drive* (e.g. Y:\ -> \\SERVER\Share) canNOT be
+      # bind-mounted — the drive letter lives in your Windows session, not the WSL2 VM, so the
+      # mount comes up EMPTY. To use an SMB/CIFS media server, don't point MEDI_MEDIA at the
+      # drive letter; instead mount the share with a CIFS volume (see `volumes:` at the bottom)
+      # and swap this bind for `- media:/media:ro`.
+      - type: bind
+        source: ${MEDI_MEDIA:-./devdata/media}
+        target: /media
+        read_only: true
+      # Read-write appdata: library.db, hls/, subs/, previews/, trickplay/. Wipe to reset.
+      - type: bind
+        source: ${MEDI_CONFIG:-./devdata/config}
+        target: /config
+    environment:
+      RUST_LOG: ${RUST_LOG:-info,medi_transcode=debug}
+      # Injected/read by the NVIDIA Container Toolkit — harmless on non-NVIDIA hosts.
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+      # The probe (caps.rs) auto-detects NVIDIA from the toolkit-injected /dev/nvidia0 +
+      # nvidia-smi, so no override is needed. Uncomment to force a specific path:
+      #   MEDI_GPU_VENDOR: nvidia   # pin the NVENC path explicitly
+      #   MEDI_GPU_VENDOR: none     # force software (libx264) — see the AMD/Intel note below
+    # --- NVIDIA GPU passthrough (primary path) --------------------------------
+    # `gpus: all` is the Compose-spec equivalent of `docker run --gpus all` and is what
+    # actually fires the NVIDIA Container Toolkit on Docker Desktop (WSL2). Requires
+    # Compose v2.30+ (this repo's dev loop was verified on v5.x). Requires the toolkit.
+    #
+    # NOTE: the older Swarm-style `deploy.resources.reservations.devices` block does NOT
+    # inject the GPU under Docker Desktop — the container boots but the probe resolves
+    # vendor=None (verified). Use `gpus: all`; keep `deploy` only for a real Swarm host.
+    gpus: all
+    # --- AMD / Intel on Windows (software fallback) ---------------------------
+    # Docker Desktop's WSL2 kernel exposes NO /dev/dri, so Intel QSV/VA-API and AMD
+    # AMF/VA-API CANNOT be passed through on Windows Docker today (task 92 §4). To run
+    # the loop in software mode instead:
+    #   1) delete (or comment out) the `gpus: all` line above, and
+    #   2) set MEDI_GPU_VENDOR: none in `environment:`.
+    # Output is still valid fMP4 HLS via libx264 — correct, just slower. Real Intel/AMD
+    # HW-encode validation happens on the Linux/Unraid host (--device /dev/dri) or in CI.
+    restart: unless-stopped
+
+# --- OPTIONAL: mount an SMB/CIFS media server as the read-only library --------------------
+# When your media lives on a network share (a Windows mapped drive like Y:\ -> \\SERVER\Share
+# will NOT bind-mount — see the note by `volumes:` above), define a CIFS volume that mounts the
+# share INSIDE the container over SMB, then point the service's /media at it:
+#
+#   1) uncomment the `volumes:` block below (set device / creds for your server), and
+#   2) in the service above, replace the `/media` bind with:  - media:/media:ro
+#
+# Guest (no auth) shares just need `guest`; for an authed share drop `guest` and add
+# `username=<u>,password=<p>` (keep secrets out of git — prefer a `.env` / an override file).
+#
+# volumes:
+#   media:
+#     driver: local
+#     driver_opts:
+#       type: cifs
+#       device: "//SERVER/Share/Movies"
+#       o: "ro,guest,vers=3.0,uid=0,gid=0"

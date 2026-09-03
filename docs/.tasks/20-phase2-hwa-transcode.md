@@ -19,6 +19,13 @@ Dolby Vision → SDR tone mapping via OpenCL/CUDA.
   or CUDA (NVIDIA)** with `init_hw_device` chaining (VPP alone distorts DV → purple/green).
 - Output HLS (playlist + segments) consumed by `/api/hls/...` (see `02-api-contract.md`).
 
+> **Dev note (Windows).** The **NVENC** vendor path is exercised locally on a Windows dev box
+> via `92-windows-dev-and-native-gpu.md`'s dev image: `caps.rs` lights up `Vendor::Nvidia`
+> unchanged from the `/dev/nvidia0` / `nvidia-smi` the NVIDIA Container Toolkit injects into a
+> Docker Desktop (WSL2) container. Intel **QSV/VA-API** and AMD **AMF/VA-API** are **not**
+> passthrough-able on Windows Docker (no `/dev/dri` in the WSL2 kernel) → the software path
+> (libx264) is the dev fallback there; real Intel/AMD HW-encode is validated on Linux/Unraid.
+
 ## Packages / crates
 
 - `tokio` (`process`), `jellyfin-ffmpeg` **binary** injected in the Docker runtime (Phase 5)
@@ -53,6 +60,10 @@ crates/transcode/src/
 | Dolby Vision **P5** → SDR display | NVIDIA | NVDEC → **CUDA** tone map → NVENC encode |
 | Dolby Vision **P8.1** (HDR10 compat) → SDR | HW present | Treat BL as HDR10 → tone map path above |
 | AV1 source, no AV1 HW decode | older host | **dav1d** software decode (bundled in jellyfin-ffmpeg) → HW encode |
+| **VC-1 / MPEG-2 / MPEG-4 (DivX/Xvid)** | any | **Transcode → H.264** (no TV client decodes these). HW decode where the host advertises the accel (Intel QSV decodes MPEG-2/VC-1), else software — generalized per-codec via `caps.can_hw_decode()` (`90-format-coverage-and-subtitles.md`). |
+| **VP9** | any | **Transcode → H.264**; HW decode if `can_hw_decode(vp9)` (NVDEC / Intel), else software. |
+| Dolby Vision **P7** (BL(HDR10)+EL) → **HDR** display | any | **Transcode**, drop the EL, keep the **HDR10** base layer (no tone-map). Reserve OpenCL/CUDA IPTPQc2 for P5 — P7's base is standard HDR10 (`90-format-coverage-and-subtitles.md`). |
+| Dolby Vision **P7** → **SDR** display | any | **Transcode**, tone-map the HDR10 base → SDR via **VPP/CUDA** (the normal HDR10 path, **not** the P5 OpenCL path). |
 
 ## Vendor command sketches (assemble in `command.rs`)
 

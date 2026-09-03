@@ -88,6 +88,104 @@ pub struct TrickplayMeta {
 }
 
 // ---------------------------------------------------------------------------
+// Genres & discovery (`docs/.tasks/91` Phase A)
+// ---------------------------------------------------------------------------
+
+/// One entry in `GET /api/genres` — a genre with a nonzero title count. Backs the browse
+/// rows and the genre chips.
+#[derive(Debug, Serialize)]
+pub struct GenreListItem {
+    pub id: i64,
+    pub name: String,
+    /// Number of titles (movies + series) carrying this genre.
+    pub count: i64,
+}
+
+impl From<medi_db::models::GenreCount> for GenreListItem {
+    fn from(g: medi_db::models::GenreCount) -> Self {
+        Self { id: g.id, name: g.name, count: g.count }
+    }
+}
+
+/// One horizontal category row on the landing page (`GET /api/library/rows`).
+///
+/// `key` is a stable machine id (`recently_added`, or `genre:878`); `title` is the display
+/// heading; `items` is a capped set of poster tiles (same `LibraryItem` shape as the grid).
+#[derive(Debug, Serialize)]
+pub struct CategoryRow {
+    pub key: String,
+    pub title: String,
+    pub items: Vec<LibraryItem>,
+    /// The genre id backing a genre row, so the client can link "See all →" to
+    /// `/genre/:id`. `null` for the synthetic "Recently Added" row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub genre_id: Option<i64>,
+}
+
+/// `GET /api/library/rows` — the landing page's curated category rows in one request
+/// (`docs/.tasks/91`): "Recently Added" plus the top-N genres by count, each capped.
+#[derive(Debug, Serialize)]
+pub struct LibraryRows {
+    pub rows: Vec<CategoryRow>,
+}
+
+/// `GET /api/movies/:id` response (Task 91 detail extensions): the DB movie detail (which
+/// carries the movie row, files, credits, trailers, and collection) plus the collection's
+/// **other** in-library movies as poster tiles. The DB `MovieDetail` is flattened in, so the
+/// existing fields keep their positions; `collection_movies` is the only added key.
+#[derive(Debug, Serialize)]
+pub struct MovieDetailResponse {
+    #[serde(flatten)]
+    pub detail: medi_db::models::MovieDetail,
+    /// The other in-library movies of this movie's franchise (this movie excluded), newest
+    /// first — the "Collection" row. Empty when standalone.
+    pub collection_movies: Vec<LibraryItem>,
+}
+
+/// `GET /api/people/:id` — a person page (`docs/.tasks/91` Phase B): the enriched person
+/// plus their in-library filmography (poster tiles, newest first). `photo` is a ready-to-fetch
+/// `/api/images/people/<id>/photo.jpg` URL (or `null` pre-enrichment), mirroring how a card's
+/// `poster` is surfaced.
+#[derive(Debug, Serialize)]
+pub struct PersonPage {
+    pub id: i64,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub photo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub biography: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmdb_id: Option<i64>,
+    /// The person's titles present in this library, newest first.
+    pub filmography: Vec<LibraryItem>,
+}
+
+impl PersonPage {
+    /// Build the page from the person row + their filmography cards, turning the stored
+    /// `photo_path` into a client-facing `/api/images/...` URL.
+    pub fn build(person: medi_db::models::PersonMeta, filmography: Vec<LibraryItem>) -> Self {
+        Self {
+            id: person.id,
+            name: person.name,
+            photo: person.photo_path.map(image_url),
+            biography: person.biography,
+            tmdb_id: person.tmdb_id,
+            filmography,
+        }
+    }
+}
+
+/// `POST /api/metadata/backfill` acknowledgement — the backfill runs in the background, so
+/// this reports only that it was accepted (the counts are logged as it progresses).
+#[derive(Debug, Serialize)]
+pub struct BackfillResponse {
+    /// `"accepted"` — the backfill task was spawned.
+    pub status: &'static str,
+    /// Whether a backfill was already running (a re-hit is idempotent, not queued twice).
+    pub already_running: bool,
+}
+
+// ---------------------------------------------------------------------------
 // Metadata enrichment (`docs/.tasks/60` Phase A) — refresh / matches / match
 // ---------------------------------------------------------------------------
 

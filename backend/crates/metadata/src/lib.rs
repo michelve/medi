@@ -13,6 +13,7 @@
 //! and enrichment runs entirely off the request path.
 
 pub mod enrich;
+pub mod fanart;
 pub mod matcher;
 pub mod omdb;
 pub mod provider;
@@ -20,11 +21,17 @@ pub mod reap;
 pub mod tmdb;
 
 pub use enrich::{
-    candidates_for, enrich_movie, enrich_series, enrich_with_id, EnrichContext, EnrichOutcome,
-    HttpFetcher, ImageFetcher,
+    backfill_genres_people, candidates_for, enrich_movie, enrich_series, enrich_with_id,
+    BackfillReport, EnrichContext, EnrichOutcome, HttpFetcher, ImageFetcher,
+};
+pub use fanart::{
+    parse_movie_logo, parse_movie_wallpaper, FanartArt, FanartClient, MovieArt,
 };
 pub use reap::{remove_title_images, sweep_orphan_images};
-pub use provider::{CreditIn, Details, Match, MediaKind, MetadataProvider, ProviderId};
+pub use provider::{
+    Collection, CreditIn, Details, Genre, Match, MediaKind, MetadataProvider, PersonDetails,
+    ProviderId, TrailerIn,
+};
 
 use std::sync::Arc;
 
@@ -93,6 +100,24 @@ pub fn build_provider(cfg: &medi_core::AppConfig) -> Option<Arc<dyn MetadataProv
         }
         Err(err) => {
             tracing::warn!(error = %err, "failed to build metadata provider; enrichment disabled");
+            None
+        }
+    }
+}
+
+/// Construct the fanart.tv title-logo client (`docs/.tasks/93`), or `None` when
+/// `FANARTTV_API_KEY` is unset/empty — the logo feature is then inert (enrichment behaves
+/// exactly as today, no request, no error). Returned as a trait object so [`EnrichContext`]
+/// holds one `Arc<dyn FanartArt>` regardless of source.
+pub fn build_fanart(cfg: &medi_core::AppConfig) -> Option<Arc<dyn FanartArt>> {
+    let key = cfg.fanart_key()?; // None ⇒ feature off
+    match FanartClient::new(key, &cfg.metadata_language) {
+        Ok(c) => {
+            tracing::info!("fanart.tv art client ready (logos + wallpapers)");
+            Some(Arc::new(c) as Arc<dyn FanartArt>)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to build fanart client; title logos disabled");
             None
         }
     }

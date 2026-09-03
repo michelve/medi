@@ -8,10 +8,10 @@
  * user can use to jump back and refine — harmless, and keeps the header stable.
  */
 
-import { Outlet, Link } from 'react-router-dom';
-import { theme } from './theme';
+import { Outlet } from 'react-router-dom';
+import { theme, detail } from './theme';
 import { BrowseProvider } from './lib/browseState';
-import { SearchSortBar } from './components/SearchSortBar';
+import { NavBar } from './components/NavBar';
 
 export function App() {
   return (
@@ -21,52 +21,21 @@ export function App() {
           minHeight: '100vh',
           background: theme.colors.background,
           color: theme.colors.text,
-          fontFamily:
-            '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif',
+          fontFamily: detail.fontFamily,
         }}
       >
-        <header
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: 24,
-            padding: '16px 24px',
-            borderBottom: `1px solid ${theme.colors.surface}`,
-            position: 'sticky',
-            top: 0,
-            zIndex: 10,
-            background: theme.colors.background,
-          }}
-        >
-          <Link
-            to="/"
-            style={{
-              color: theme.colors.text,
-              textDecoration: 'none',
-              fontWeight: 700,
-              fontSize: 20,
-              flex: '0 0 auto',
-            }}
-          >
-            medi
-          </Link>
-          <div style={{ flex: '1 1 auto' }}>
-            <SearchSortBar />
+        {/* Floating Apple-TV-style glass nav — a fixed, transparent-track overlay pinned to the
+            top of the viewport. Content scrolls beneath it and the detail page's fixed gradient
+            shows through the glass. */}
+        <NavBar />
+        {/* The fixed nav is out of flow, so the inner wrapper adds top padding to clear the
+            floating pill. `minWidth: 0` lets flex/grid children shrink; `overflowX: hidden`
+            keeps the body from scrolling sideways (wide rows scroll in their own container);
+            the inner wrapper centers content and caps it at the max width on wide displays. */}
+        <main style={{ minWidth: 0, overflowX: 'hidden' }}>
+          <div style={{ maxWidth: detail.maxWidth, margin: '0 auto', padding: '108px 24px 24px' }}>
+            <Outlet />
           </div>
-          <Link
-            to="/settings/libraries"
-            style={{
-              color: theme.colors.textMuted,
-              textDecoration: 'none',
-              fontSize: 14,
-              flex: '0 0 auto',
-            }}
-          >
-            Libraries
-          </Link>
-        </header>
-        <main style={{ padding: 24 }}>
-          <Outlet />
         </main>
       </div>
     </BrowseProvider>

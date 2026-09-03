@@ -16,6 +16,12 @@ image installable on Unraid via a Community Applications XML template.
 **Out of scope (intentional):** user authentication, multi-user watch state, cloud
 sync. This is a frictionless LAN-first appliance. Do not add auth without a spec change.
 
+> **Local development on Windows** uses `docker/compose.dev.yml` (real NVENC via Docker
+> Desktop's WSL2 backend + the NVIDIA Container Toolkit; software fallback for AMD/Intel,
+> which can't be passed through Windows Docker) — see `92-windows-dev-and-native-gpu.md`. It
+> runs the same Linux container as Unraid and keeps the `/config` vs `/media` contract below
+> (dev bind-mounts a Windows media folder → `/media:ro` and a local dir → `/config`).
+
 ## Requirements
 
 - Backend must return catalog data with near-zero latency for grids of up to 10,000 items.

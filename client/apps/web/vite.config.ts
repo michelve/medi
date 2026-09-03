@@ -1,5 +1,5 @@
 import { fileURLToPath, URL } from 'node:url';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 
 /**
@@ -9,12 +9,19 @@ import react from '@vitejs/plugin-react';
  *   to the workspace source, mirroring `apps/web/tsconfig.json` — no build step for the
  *   shared packages, and the api-client stays the single source of truth (Task 40).
  * - Dev proxy: forward `/api` to the running backend so the app uses **relative** URLs in
- *   both dev and prod (`new ApiClient({ baseUrl: '' })`). Override the target with
- *   `MEDI_DEV_API` (e.g. a real Unraid box) when the backend isn't on localhost.
+ *   both dev and prod (`new ApiClient({ baseUrl: '' })`). Point the proxy at a non-local
+ *   backend (e.g. the Unraid box) with `MEDI_DEV_API` — set it in the shell, or drop it in
+ *   an untracked `apps/web/.env.local` (`MEDI_DEV_API=http://192.168.5.242:8096`) so a bare
+ *   `yarn web:dev` picks it up without a rebuild.
  */
-const apiTarget = process.env.MEDI_DEV_API ?? 'http://localhost:8096';
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  // loadEnv reads .env / .env.local (the '' prefix loads every var, not just VITE_*).
+  // A real shell env var still wins over the file.
+  const env = loadEnv(mode, fileURLToPath(new URL('.', import.meta.url)), '');
+  const apiTarget = process.env.MEDI_DEV_API ?? env.MEDI_DEV_API ?? 'http://localhost:8096';
+
+  return {
   plugins: [react()],
   resolve: {
     alias: {
@@ -47,4 +54,5 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false,
   },
+  };
 });

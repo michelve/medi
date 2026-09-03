@@ -19,7 +19,7 @@
 export const PLAYER_PHASE = 5 as const;
 
 export { VideoScreen } from './VideoScreen';
-export type { VideoScreenProps, ResolvedStream } from './VideoScreen';
+export type { VideoScreenProps, ResolvedStream, TextTrack } from './VideoScreen';
 
 export { PlayerOverlay } from './PlayerOverlay';
 export type { PlayerOverlayProps } from './PlayerOverlay';

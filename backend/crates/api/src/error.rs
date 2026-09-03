@@ -50,6 +50,17 @@ impl ApiError {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 
+    /// `415` — the resource exists but cannot be served in the requested form (an image
+    /// subtitle cannot be converted to WebVTT; the client must request a burn-in instead —
+    /// `docs/.tasks/90` §5).
+    pub fn unsupported_media_type(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_media_type",
+            message,
+        )
+    }
+
     /// `501` — the route exists in the contract but its backing phase is not wired
     /// yet (stream/HLS are Phase 2; preview/trickplay generation is Phase 3). Kept
     /// distinct from `unavailable` so a client can tell "not built" from "try again".

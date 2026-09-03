@@ -259,6 +259,7 @@ mod tests {
             video_codec: VideoCodec::H264,
             audio_transcode_to: None,
             max_bitrate: None,
+            subtitle_burn_in: None,
         }
     }
 

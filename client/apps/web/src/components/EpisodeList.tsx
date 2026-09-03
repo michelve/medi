@@ -10,6 +10,7 @@
 import type { SeasonWithEpisodes } from '@medi/api-client';
 import { theme } from '../theme';
 import { PlayButton } from './PlayButton';
+import { pickBestFile } from '../lib/bestFile';
 
 export interface EpisodeListProps {
   season: SeasonWithEpisodes;
@@ -23,8 +24,8 @@ export function EpisodeList({ season, onPlay }: EpisodeListProps) {
       <h2 style={{ fontSize: 18, margin: '0 0 12px' }}>Season {season.season_number}</h2>
       <div style={{ display: 'grid', gap: 8 }}>
         {season.episodes.map((ep) => {
-          // The episode's primary file drives playback; undefined until probed.
-          const fileId = ep.media_files[0]?.id;
+          // The episode's best copy drives playback; undefined until probed.
+          const fileId = pickBestFile(ep.media_files)?.id;
           return (
             <div
               key={ep.id}

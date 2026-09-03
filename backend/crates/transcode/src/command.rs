@@ -67,7 +67,21 @@ pub fn build_argv(
     a.push(input.to_string_lossy().into_owned());
 
     // --- Video filter graph + encoder. ---------------------------------------
-    if let Some(vf) = hw.filter_graph(target) {
+    // Image-subtitle burn-in (`docs/.tasks/90` §5) needs a `-filter_complex` so the
+    // subtitle can be a second input to `overlay`, and the overlay MUST run **after** any
+    // HDR→SDR tone-map (else the burned subtitle would be tone-mapped/washed out). A plain
+    // transcode (no burn-in) keeps the simpler `-vf` path.
+    if let Some(sub_idx) = target.subtitle_burn_in {
+        let base = hw.filter_graph(target);
+        let fc = build_burn_in_filter(base.as_deref(), sub_idx);
+        push(&mut a, "-filter_complex");
+        a.push(fc);
+        push(&mut a, "-map");
+        push(&mut a, "[v]");
+        // With an explicit video map, the default audio stream must be mapped too.
+        push(&mut a, "-map");
+        push(&mut a, "0:a:0?");
+    } else if let Some(vf) = hw.filter_graph(target) {
         push(&mut a, "-vf");
         a.push(vf);
     }
@@ -285,6 +299,22 @@ impl HwPlan {
     }
 }
 
+/// Build the `-filter_complex` graph that burns image subtitle `sub_idx` (a *subtitle-
+/// relative* index, i.e. `0:s:<sub_idx>`) into the video, after any base filter chain
+/// (`docs/.tasks/90` §5).
+///
+/// - With a base chain (a tone-map): `[0:v]<base>[base];[base][0:s:N]overlay[v]` — the
+///   overlay runs **after** the tone-map so the subtitle is not tone-mapped/washed out.
+/// - Without one (plain transcode + burn-in): `[0:v][0:s:N]overlay[v]`.
+fn build_burn_in_filter(base: Option<&str>, sub_idx: i64) -> String {
+    match base {
+        Some(chain) => {
+            format!("[0:v]{chain}[base];[base][0:s:{sub_idx}]overlay[v]")
+        }
+        None => format!("[0:v][0:s:{sub_idx}]overlay[v]"),
+    }
+}
+
 /// Append the fragmented-MP4 HLS muxer flags + output playlist path.
 fn emit_hls_muxer(a: &mut Vec<String>, out_dir: &Path) {
     let p = |a: &mut Vec<String>, s: &str| a.push(s.to_string());
@@ -344,6 +374,7 @@ mod tests {
             video_codec: VideoCodec::H264,
             audio_transcode_to: None,
             max_bitrate: None,
+            subtitle_burn_in: None,
         }
     }
 
@@ -454,5 +485,41 @@ mod tests {
         let s = joined(&a);
         assert!(s.contains("-maxrate 8000000"), "capped sets -maxrate: {s}");
         assert!(s.contains("-bufsize 16000000"));
+    }
+
+    #[test]
+    fn burn_in_without_tonemap_overlays_video() {
+        // A plain transcode that burns in an image subtitle: filter_complex overlay, no
+        // tone-map chain, and an explicit `-map [v]`.
+        let mut t = target(Some(Vendor::Intel), false, false, false);
+        t.subtitle_burn_in = Some(0);
+        let a = argv(&t, AudioTarget::Copy);
+        let s = joined(&a);
+        assert!(s.contains("-filter_complex"), "burn-in uses filter_complex: {s}");
+        assert!(s.contains("[0:v][0:s:0]overlay[v]"), "overlay graph: {s}");
+        assert!(s.contains("-map [v]"));
+        assert!(!s.contains("-vf "), "no plain -vf when burning in: {s}");
+    }
+
+    #[test]
+    fn burn_in_after_tonemap_orders_overlay_last() {
+        // HDR10→SDR tone-map + burn-in: the overlay must chain AFTER the VPP tone-map so
+        // the burned subtitle isn't washed out (`docs/.tasks/90` §5).
+        let mut t = target(Some(Vendor::Intel), true, false, false);
+        t.subtitle_burn_in = Some(1);
+        let a = argv(&t, AudioTarget::Copy);
+        let s = joined(&a);
+        assert!(s.contains("-filter_complex"));
+        // The tone-map filter appears in the base, before the overlay stage.
+        let fc = a
+            .iter()
+            .position(|x| x == "-filter_complex")
+            .map(|i| a[i + 1].clone())
+            .unwrap();
+        let tonemap_at = fc.find("vpp_qsv=tonemap").expect("tone-map present");
+        let overlay_at = fc.find("overlay[v]").expect("overlay present");
+        assert!(tonemap_at < overlay_at, "overlay must come after tone-map: {fc}");
+        assert!(fc.contains("[0:v]"));
+        assert!(fc.contains("[base][0:s:1]overlay[v]"));
     }
 }

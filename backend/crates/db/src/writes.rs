@@ -368,6 +368,70 @@ pub fn replace_audio_streams(
 }
 
 // ---------------------------------------------------------------------------
+// subtitle_streams — one row per subtitle track of a media file (Task 90)
+// ---------------------------------------------------------------------------
+
+/// One subtitle track's fields, ready to persist via [`replace_subtitle_streams`]. A file
+/// has 0..N of these (embedded commentary/foreign/forced tracks + external sidecars). A
+/// row is either embedded (`stream_index` set, `external_path` None) or an external
+/// sidecar (`external_path` set, `stream_index` None). `format` is `"text"` | `"image"`
+/// (`medi_core::SubtitleFormat`), which drives the WebVTT-passthrough vs burn-in split.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubtitleStreamWrite {
+    /// ffprobe stream index for an embedded track; `None` for an external sidecar.
+    pub stream_index: Option<i64>,
+    /// ffprobe `codec_name` (subrip, ass, mov_text, hdmv_pgs_subtitle, …).
+    pub codec: Option<String>,
+    /// `"text"` | `"image"`.
+    pub format: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
+    pub is_forced: bool,
+    pub is_external: bool,
+    /// Absolute path of the sidecar under `/media`; `None` for an embedded track.
+    pub external_path: Option<String>,
+}
+
+/// Replace all `subtitle_streams` rows of a media file with a freshly probed set.
+///
+/// Delete-then-insert so a re-probe overwrites cleanly, mirroring the overwrite-in-place
+/// contract of [`upsert_media_file`] / [`replace_audio_streams`]. Call this **inside the
+/// same transaction** as `upsert_media_file`, passing the media file id it returned, so a
+/// file's video / audio / subtitle metadata commit atomically.
+pub fn replace_subtitle_streams(
+    conn: &Connection,
+    media_file_id: i64,
+    streams: &[SubtitleStreamWrite],
+) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM subtitle_streams WHERE media_file_id = ?1",
+        params![media_file_id],
+    )?;
+    for s in streams {
+        conn.execute(
+            "INSERT INTO subtitle_streams ( \
+                 media_file_id, stream_index, codec, format, language, title, \
+                 is_default, is_forced, is_external, external_path \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                media_file_id,
+                s.stream_index,
+                s.codec,
+                s.format,
+                s.language,
+                s.title,
+                s.is_default as i64,
+                s.is_forced as i64,
+                s.is_external as i64,
+                s.external_path,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Generated assets — preview clips + trickplay sprites (Phase 3, `medi-assets`)
 // ---------------------------------------------------------------------------
 
@@ -660,6 +724,197 @@ pub struct CreditWrite {
 }
 
 // ---------------------------------------------------------------------------
+// Genres (`docs/.tasks/91` Phase A) — canonical genre table + per-title M:N joins.
+// ---------------------------------------------------------------------------
+
+impl TitleKind {
+    /// The genre join table for this kind (`movie_genres` / `series_genres`).
+    fn genre_join_table(self) -> &'static str {
+        match self {
+            TitleKind::Movie => "movie_genres",
+            TitleKind::Series => "series_genres",
+        }
+    }
+    /// The title FK column in the genre join table (`movie_id` / `series_id`).
+    fn genre_join_col(self) -> &'static str {
+        match self {
+            TitleKind::Movie => "movie_id",
+            TitleKind::Series => "series_id",
+        }
+    }
+}
+
+/// One genre to persist via [`replace_title_genres`]. Mirrors the provider's `Genre` but
+/// lives in `medi-db` so the write path has no dependency on the metadata crate. `tmdb_id`
+/// is TMDB's stable genre id and becomes the `genres.id` primary key (not autoincrement),
+/// so a re-match upserts the same canonical row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenreWrite {
+    pub tmdb_id: i64,
+    pub name: String,
+}
+
+/// Upsert a canonical genre row keyed by its TMDB id, keeping the display `name` current
+/// (a provider could rename "Sci-Fi" → "Science Fiction"). Returns the genre id (== the
+/// TMDB id). Used by [`replace_title_genres`].
+pub fn upsert_genre(conn: &Connection, genre: &GenreWrite) -> DbResult<i64> {
+    conn.execute(
+        "INSERT INTO genres (id, name) VALUES (?1, ?2) \
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name",
+        params![genre.tmdb_id, genre.name],
+    )?;
+    Ok(genre.tmdb_id)
+}
+
+// ---------------------------------------------------------------------------
+// Collections (franchises) + trailers (Task 91 detail extensions) — movie-only.
+// ---------------------------------------------------------------------------
+
+/// One collection to upsert via [`upsert_collection`]. `tmdb_id` becomes the `collections.id`
+/// primary key (not autoincrement), so a re-match upserts the same canonical row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionWrite {
+    pub tmdb_id: i64,
+    pub name: String,
+    /// Downloaded collection poster, relative to `images_dir()`, or `None`.
+    pub poster_path: Option<String>,
+}
+
+/// Upsert a canonical collection keyed by its TMDB id, keeping the name + poster current.
+/// Returns the collection id (== the TMDB id). `poster_path` uses `COALESCE` so a re-match
+/// that hasn't (re)downloaded the art never blanks an existing path.
+pub fn upsert_collection(conn: &Connection, c: &CollectionWrite) -> DbResult<i64> {
+    conn.execute(
+        "INSERT INTO collections (id, name, poster_path) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(id) DO UPDATE SET \
+             name = excluded.name, \
+             poster_path = COALESCE(excluded.poster_path, collections.poster_path)",
+        params![c.tmdb_id, c.name, c.poster_path],
+    )?;
+    Ok(c.tmdb_id)
+}
+
+/// Point a movie at its collection (or clear it with `None`). Called inside the enrichment
+/// transaction after [`upsert_collection`]; a re-match that finds no collection clears the
+/// stale link.
+pub fn set_movie_collection(conn: &Connection, movie_id: i64, collection_id: Option<i64>) -> DbResult<()> {
+    conn.execute(
+        "UPDATE movies SET collection_id = ?2 WHERE id = ?1",
+        params![movie_id, collection_id],
+    )?;
+    Ok(())
+}
+
+/// Set (or clear) a movie's fanart.tv title-logo path (Task 93). Called inside the
+/// enrichment transaction alongside [`set_title_metadata`] so a match commits atomically.
+/// Written unconditionally (not `COALESCE`d): a re-match with no logo passes `None` and
+/// clears a stale link, exactly like [`set_movie_collection`].
+pub fn set_movie_logo(conn: &Connection, movie_id: i64, logo_path: Option<&str>) -> DbResult<()> {
+    conn.execute(
+        "UPDATE movies SET logo_path = ?2 WHERE id = ?1",
+        params![movie_id, logo_path],
+    )?;
+    Ok(())
+}
+
+/// Set (or clear) a movie's fanart.tv background wallpaper path (Task 95). Written
+/// unconditionally in the enrichment transaction like [`set_movie_logo`] — a re-match with no
+/// wallpaper passes `None` and clears a stale link.
+pub fn set_movie_wallpaper(conn: &Connection, movie_id: i64, wallpaper_path: Option<&str>) -> DbResult<()> {
+    conn.execute(
+        "UPDATE movies SET wallpaper_path = ?2 WHERE id = ?1",
+        params![movie_id, wallpaper_path],
+    )?;
+    Ok(())
+}
+
+/// One trailer to persist via [`replace_movie_trailers`]. `ord` preserves provider order so
+/// the best trailer (first) surfaces first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailerWrite {
+    pub youtube_key: String,
+    pub name: Option<String>,
+    pub kind: Option<String>,
+    pub ord: i64,
+}
+
+/// Replace a movie's trailers with a fresh set (Task 91 detail extensions). Delete-then-insert
+/// like [`replace_credits`], so a re-match never leaves a stale trailer. Call inside the
+/// enrichment transaction.
+pub fn replace_movie_trailers(conn: &Connection, movie_id: i64, trailers: &[TrailerWrite]) -> DbResult<()> {
+    conn.execute("DELETE FROM trailers WHERE movie_id = ?1", params![movie_id])?;
+    for t in trailers {
+        conn.execute(
+            "INSERT INTO trailers (movie_id, youtube_key, name, kind, ord) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT(movie_id, youtube_key) DO NOTHING",
+            params![movie_id, t.youtube_key, t.name, t.kind, t.ord],
+        )?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Person enrichment (`docs/.tasks/91` Phase B) — TMDB linkage + headshot/bio.
+// ---------------------------------------------------------------------------
+
+/// Attach TMDB linkage + a downloaded headshot + a bio onto an existing `people` row
+/// (`docs/.tasks/91` Phase B). Keyed by our internal `people.id` (the credit write already
+/// found-or-created the person by name), so a person with no TMDB match still has a stable
+/// art path. `COALESCE(?, existing)` per column so a partial update (e.g. a person fetch
+/// that returned a bio but no photo) never blanks a field it did not carry.
+///
+/// `photo_path` is relative to `images_dir()` (`people/<people.id>/photo.jpg`). Call from
+/// the enrichment write path after the headshot is on disk.
+pub fn upsert_person_meta(
+    conn: &Connection,
+    person_id: i64,
+    tmdb_id: Option<i64>,
+    photo_path: Option<&str>,
+    biography: Option<&str>,
+) -> DbResult<()> {
+    conn.execute(
+        "UPDATE people SET \
+             tmdb_id    = COALESCE(?2, tmdb_id), \
+             photo_path = COALESCE(?3, photo_path), \
+             biography  = COALESCE(?4, biography) \
+         WHERE id = ?1",
+        params![person_id, tmdb_id, photo_path, biography],
+    )?;
+    Ok(())
+}
+
+/// Replace a title's genre associations with a fresh set (`docs/.tasks/91` Phase A).
+///
+/// Delete-then-insert like [`replace_credits`], so a re-match never leaves a stale genre.
+/// Each genre is upserted into the canonical `genres` table first (the genre rows are
+/// shared and never deleted — only the title's joins are), then the join rows are rewritten.
+/// Call **inside the same transaction** as [`set_title_metadata`] / [`replace_credits`] so
+/// a match writes its metadata, credits, and genres atomically.
+pub fn replace_title_genres(
+    conn: &Connection,
+    kind: TitleKind,
+    id: i64,
+    genres: &[GenreWrite],
+) -> DbResult<()> {
+    let join = kind.genre_join_table();
+    let col = kind.genre_join_col();
+    conn.execute(
+        &format!("DELETE FROM {join} WHERE {col} = ?1"),
+        params![id],
+    )?;
+    let insert = format!(
+        "INSERT INTO {join} ({col}, genre_id) VALUES (?1, ?2) \
+         ON CONFLICT({col}, genre_id) DO NOTHING"
+    );
+    for g in genres {
+        let genre_id = upsert_genre(conn, g)?;
+        conn.execute(&insert, params![id, genre_id])?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Libraries (`docs/.tasks/60` Phase B) — Plex-style named libraries + folders.
 // ---------------------------------------------------------------------------
 
@@ -771,6 +1026,33 @@ pub fn seed_default_libraries(
         params![series_lib],
     )?;
     Ok(Some((movie_lib, series_lib)))
+}
+
+// ---------------------------------------------------------------------------
+// Probe failures (`docs/.tasks/96` Part C) — record/clear ffprobe skips
+// ---------------------------------------------------------------------------
+
+/// Record (or refresh) an ffprobe failure for `path`. Upserts on the path primary key so a
+/// repeatedly-failing file keeps one row with the latest error + attempt time.
+pub fn upsert_probe_failure(
+    conn: &Connection,
+    path: &str,
+    error: &str,
+    now: i64,
+) -> DbResult<()> {
+    conn.execute(
+        "INSERT INTO probe_failures (path, error, last_attempt_at) VALUES (?1, ?2, ?3) \
+         ON CONFLICT(path) DO UPDATE SET error = excluded.error, last_attempt_at = excluded.last_attempt_at",
+        params![path, error, now],
+    )?;
+    Ok(())
+}
+
+/// Clear the recorded ffprobe failure for `path` after a subsequent successful probe. A no-op
+/// when there was none.
+pub fn clear_probe_failure(conn: &Connection, path: &str) -> DbResult<()> {
+    conn.execute("DELETE FROM probe_failures WHERE path = ?1", params![path])?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1001,6 +1283,82 @@ mod tests {
     }
 
     #[test]
+    fn subtitle_streams_replace_and_read_back() {
+        // A file with an embedded text track, an embedded image track, and an external
+        // forced sidecar yields three rows; a re-probe replaces the whole set (Task 90).
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "T", "t", None, 0).unwrap();
+        let data = MediaFileWrite {
+            container: Some("mkv".into()),
+            width: Some(3840),
+            height: Some(2160),
+            ..Default::default()
+        };
+        let file_id = upsert_media_file(&conn, "/media/t.mkv", FileOwner::Movie(movie), &data).unwrap();
+
+        let subs = vec![
+            SubtitleStreamWrite {
+                stream_index: Some(2),
+                codec: Some("subrip".into()),
+                format: "text".into(),
+                language: Some("eng".into()),
+                is_default: true,
+                ..Default::default()
+            },
+            SubtitleStreamWrite {
+                stream_index: Some(3),
+                codec: Some("hdmv_pgs_subtitle".into()),
+                format: "image".into(),
+                language: Some("eng".into()),
+                ..Default::default()
+            },
+            SubtitleStreamWrite {
+                codec: Some("subrip".into()),
+                format: "text".into(),
+                language: Some("eng".into()),
+                is_forced: true,
+                is_external: true,
+                external_path: Some("/media/Movie (2020).en.forced.srt".into()),
+                ..Default::default()
+            },
+        ];
+        replace_subtitle_streams(&conn, file_id, &subs).unwrap();
+
+        let read = crate::queries::get_subtitle_streams(&conn, file_id).unwrap();
+        assert_eq!(read.len(), 3);
+        // Embedded tracks sort first by stream_index; the external (NULL index) sorts last.
+        assert_eq!(read[0].stream_index, Some(2));
+        assert_eq!(read[0].format, "text");
+        assert!(read[0].is_default);
+        assert_eq!(read[1].format, "image");
+        assert!(read[2].is_external);
+        assert!(read[2].is_forced);
+        assert_eq!(read[2].language.as_deref(), Some("eng"));
+        assert_eq!(read[2].stream_index, None);
+
+        // A re-probe with a single track replaces the whole set.
+        replace_subtitle_streams(
+            &conn,
+            file_id,
+            &[SubtitleStreamWrite {
+                stream_index: Some(2),
+                codec: Some("ass".into()),
+                format: "text".into(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        let read2 = crate::queries::get_subtitle_streams(&conn, file_id).unwrap();
+        assert_eq!(read2.len(), 1, "re-probe replaces the whole set");
+        assert_eq!(read2[0].codec.as_deref(), Some("ass"));
+
+        // And they surface on the MediaFile read model.
+        let mf = crate::queries::get_media_file(&conn, file_id).unwrap();
+        assert_eq!(mf.subtitle_streams.len(), 1);
+    }
+
+    #[test]
     fn metadata_write_marks_matched_and_dedupes_people() {
         let (db, _dir) = db();
         let conn = db.conn().unwrap();
@@ -1083,6 +1441,115 @@ mod tests {
     }
 
     #[test]
+    fn replace_title_genres_upserts_and_replaces() {
+        // A title's genres are written, a genre is shared across titles (one canonical row),
+        // and a re-match replaces the title's genre set wholesale (`docs/.tasks/91`).
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let m1 = find_or_create_movie(&conn, "Arrival", "arrival", Some(2016), 0).unwrap();
+        let m2 = find_or_create_movie(&conn, "Dune", "dune", Some(2021), 0).unwrap();
+
+        replace_title_genres(
+            &conn,
+            TitleKind::Movie,
+            m1,
+            &[
+                GenreWrite { tmdb_id: 878, name: "Science Fiction".into() },
+                GenreWrite { tmdb_id: 18, name: "Drama".into() },
+            ],
+        )
+        .unwrap();
+        // Dune shares Sci-Fi (same canonical genre row, not a duplicate).
+        replace_title_genres(
+            &conn,
+            TitleKind::Movie,
+            m2,
+            &[GenreWrite { tmdb_id: 878, name: "Science Fiction".into() }],
+        )
+        .unwrap();
+
+        // One canonical `genres` row for Sci-Fi despite two titles referencing it.
+        let genre_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM genres WHERE id = 878", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(genre_count, 1);
+        // Sci-Fi has both movies; Drama has one.
+        let listed = crate::queries::list_genres(&conn).unwrap();
+        let scifi = listed.iter().find(|g| g.id == 878).unwrap();
+        assert_eq!(scifi.count, 2);
+        assert!(listed.iter().any(|g| g.id == 18 && g.count == 1));
+
+        // A re-match of m1 with a different set replaces its joins (Drama is dropped from m1).
+        replace_title_genres(
+            &conn,
+            TitleKind::Movie,
+            m1,
+            &[GenreWrite { tmdb_id: 28, name: "Action".into() }],
+        )
+        .unwrap();
+        // Drama now references no title → excluded from list_genres.
+        let listed2 = crate::queries::list_genres(&conn).unwrap();
+        assert!(!listed2.iter().any(|g| g.id == 18), "orphaned Drama is excluded");
+        // Sci-Fi now has only Dune.
+        assert_eq!(listed2.iter().find(|g| g.id == 878).unwrap().count, 1);
+    }
+
+    #[test]
+    fn upsert_person_meta_coalesces_fields() {
+        // Person enrichment attaches tmdb_id + photo + bio onto an existing people row, and a
+        // partial later update never blanks a field it doesn't carry (`docs/.tasks/91` B).
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let pid = find_or_create_person(&conn, "Amy Adams").unwrap();
+
+        upsert_person_meta(&conn, pid, Some(9273), Some("people/1/photo.jpg"), Some("An actress.")).unwrap();
+        let p = crate::queries::get_person(&conn, pid).unwrap();
+        assert_eq!(p.tmdb_id, Some(9273));
+        assert_eq!(p.photo_path.as_deref(), Some("people/1/photo.jpg"));
+        assert_eq!(p.biography.as_deref(), Some("An actress."));
+
+        // A later bio-only update keeps the existing tmdb_id + photo (COALESCE).
+        upsert_person_meta(&conn, pid, None, None, Some("Updated bio.")).unwrap();
+        let p2 = crate::queries::get_person(&conn, pid).unwrap();
+        assert_eq!(p2.tmdb_id, Some(9273), "tmdb_id preserved");
+        assert_eq!(p2.photo_path.as_deref(), Some("people/1/photo.jpg"), "photo preserved");
+        assert_eq!(p2.biography.as_deref(), Some("Updated bio."));
+    }
+
+    #[test]
+    fn matched_titles_missing_genres_worklist() {
+        // The backfill worklist returns only `matched` titles lacking genre rows (or all
+        // matched titles under force) — `docs/.tasks/91` §Backfill.
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let with_genres = find_or_create_movie(&conn, "Has Genres", "has genres", None, 1).unwrap();
+        let without = find_or_create_movie(&conn, "No Genres", "no genres", None, 2).unwrap();
+        let pending = find_or_create_movie(&conn, "Pending", "pending", None, 3).unwrap();
+        // Two are matched; one stays pending.
+        set_metadata_state(&conn, TitleKind::Movie, with_genres, MetadataState::Matched).unwrap();
+        set_metadata_state(&conn, TitleKind::Movie, without, MetadataState::Matched).unwrap();
+        // `pending` keeps its default 'pending' state.
+        let _ = pending;
+        replace_title_genres(
+            &conn,
+            TitleKind::Movie,
+            with_genres,
+            &[GenreWrite { tmdb_id: 878, name: "Science Fiction".into() }],
+        )
+        .unwrap();
+
+        // Default: only the matched title *without* genres.
+        let work =
+            crate::queries::matched_titles_missing_genres(&conn, TitleKind::Movie, false, 100).unwrap();
+        assert_eq!(work, vec![without], "only matched-and-missing is on the worklist");
+
+        // Force: every matched title (both), pending excluded, oldest-added first.
+        let forced =
+            crate::queries::matched_titles_missing_genres(&conn, TitleKind::Movie, true, 100).unwrap();
+        assert_eq!(forced, vec![with_genres, without]);
+    }
+
+    #[test]
     fn metadata_state_transitions_to_unmatched() {
         let (db, _dir) = db();
         let conn = db.conn().unwrap();
@@ -1161,5 +1628,61 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM movies WHERE id = ?1", params![m], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    // --- Enrichment observability (`docs/.tasks/96`) --------------------------
+
+    #[test]
+    fn probe_failure_upsert_then_clear() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let p = "/media/bad.mp4";
+
+        // Record a failure, then refresh it (upsert keeps one row with the latest error).
+        upsert_probe_failure(&conn, p, "exit status 1", 100).unwrap();
+        upsert_probe_failure(&conn, p, "moov atom not found", 200).unwrap();
+        let rows = crate::queries::list_probe_failures(&conn, None, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, p);
+        assert_eq!(rows[0].error, "moov atom not found");
+        assert_eq!(rows[0].last_attempt_at, 200);
+
+        // A successful re-probe clears it.
+        clear_probe_failure(&conn, p).unwrap();
+        assert!(crate::queries::list_probe_failures(&conn, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn metadata_state_counts_and_unmatched_list() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+
+        // Seed a mix of states. find_or_create defaults to 'pending'.
+        let matched = find_or_create_movie(&conn, "Matched", "matched", Some(2020), 10).unwrap();
+        let unmatched = find_or_create_movie(&conn, "Junk Name", "junk name", None, 20).unwrap();
+        let failed = find_or_create_movie(&conn, "Failed", "failed", None, 30).unwrap();
+        let _pending = find_or_create_movie(&conn, "Pending", "pending", None, 40).unwrap();
+        set_metadata_state(&conn, TitleKind::Movie, matched, MetadataState::Matched).unwrap();
+        set_metadata_state(&conn, TitleKind::Movie, unmatched, MetadataState::Unmatched).unwrap();
+        set_metadata_state(&conn, TitleKind::Movie, failed, MetadataState::Failed).unwrap();
+
+        let counts = crate::queries::metadata_state_counts(&conn, TitleKind::Movie).unwrap();
+        assert_eq!(counts.total, 4);
+        assert_eq!(counts.matched, 1);
+        assert_eq!(counts.unmatched, 1);
+        assert_eq!(counts.failed, 1);
+        assert_eq!(counts.pending, 1);
+
+        // The unmatched list returns only unmatched + failed, oldest-added (by id) first.
+        let list = crate::queries::list_unmatched(&conn, TitleKind::Movie, None, 10).unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].id, unmatched);
+        assert_eq!(list[0].state, "unmatched");
+        assert_eq!(list[1].id, failed);
+        assert_eq!(list[1].state, "failed");
+        // Keyset: after the first row returns only the second.
+        let page2 = crate::queries::list_unmatched(&conn, TitleKind::Movie, Some(unmatched), 10).unwrap();
+        assert_eq!(page2.len(), 1);
+        assert_eq!(page2[0].id, failed);
     }
 }

@@ -148,13 +148,27 @@ export interface UsePlayerControlsOptions {
   onPause?: () => void;
   /** Start playing immediately (autoplay). Defaults to `true`. */
   autoplay?: boolean;
+  /**
+   * Web only: let the element's own `play`/`pause` events (via [`setPlaying`]) drive the
+   * play state instead of the hook commanding it on mount. When `true`, the reducer starts
+   * `isPlaying: false` and the "reflect intent" effect is primed so the first real
+   * transition fires `onPlay`/`onPause` — this keeps the DOM `<video>` and the UI in lockstep
+   * (the browser autostarts via `video.play()`, then its `onplay` event flips the state). The
+   * RN/TV client leaves this unset: it binds `paused={!isPlaying}` declaratively and relies on
+   * `autoplay` seeding `isPlaying: true`.
+   */
+  reflectFromEvents?: boolean;
 }
 
 export function usePlayerControls(options: UsePlayerControlsOptions): PlayerControls {
-  const { onSeek, onPlay, onPause, autoplay = true } = options;
+  const { onSeek, onPlay, onPause, autoplay = true, reflectFromEvents = false } = options;
+
+  // When the element drives the state (web), start paused so the first real `play` event
+  // flips `isPlaying` and keeps the UI in lockstep; otherwise (TV) seed from `autoplay`.
+  const initialPlaying = reflectFromEvents ? false : autoplay;
 
   const [state, dispatch] = useReducer(reducer, {
-    isPlaying: autoplay,
+    isPlaying: initialPlaying,
     overlayVisible: true, // visible on mount, then auto-hides
     scrubTargetMs: null,
     positionMs: 0,

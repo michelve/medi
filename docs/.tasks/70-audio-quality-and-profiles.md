@@ -109,6 +109,10 @@ pub enum AudioCodec {
     Aac, Ac3, Eac3,
     Dts, DtsHd,
     TrueHd, Flac, Opus, Pcm, Other,
+    // Added by `90-format-coverage-and-subtitles.md`: Mp3 (decodable default on all
+    // clients) plus Vorbis/Wma/Alac (transcode by default). The audio decision is
+    // otherwise unchanged; ALAC is lossless but always decoded, never bitstreamed.
+    // Mp3, Vorbis, Wma, Alac,
 }
 
 impl AudioCodec {

@@ -29,7 +29,8 @@ use std::process::Stdio;
 use serde::Deserialize;
 use tokio::process::Command;
 
-use medi_db::writes::{AudioStreamWrite, MediaFileWrite};
+use medi_core::SubtitleFormat;
+use medi_db::writes::{AudioStreamWrite, MediaFileWrite, SubtitleStreamWrite};
 
 /// The ffprobe binary. `jellyfin-ffmpeg` ships it as `ffprobe` on `PATH` inside the
 /// container image (`docs/.tasks/50-phase5`); overridable via `FFPROBE_BIN` for tests
@@ -54,13 +55,18 @@ pub enum ProbeError {
     NoVideoStream(String),
 }
 
+/// The parsed result of one ffprobe pass: the `media_files` row plus its child audio and
+/// subtitle track lists. The worker persists all three in one file transaction via
+/// `upsert_media_file` + `replace_audio_streams` + `replace_subtitle_streams`.
+pub type Probed = (MediaFileWrite, Vec<AudioStreamWrite>, Vec<SubtitleStreamWrite>);
+
 /// Run `ffprobe` on `path` and parse its output into the persistable `media_files` row
-/// plus every audio track (`docs/.tasks/70`). The worker writes both in one transaction
-/// via `upsert_media_file` + `replace_audio_streams`.
+/// plus every audio and subtitle track (`docs/.tasks/70` / `90`). One invocation already
+/// emits every stream; only the parser widens — no extra ffprobe pass.
 ///
 /// Runs fully asynchronously on `tokio::process` so it never blocks the runtime; the
 /// worker bounds how many run at once with a semaphore.
-pub async fn probe(path: &Path) -> Result<(MediaFileWrite, Vec<AudioStreamWrite>), ProbeError> {
+pub async fn probe(path: &Path) -> Result<Probed, ProbeError> {
     let output = Command::new(ffprobe_bin())
         .args([
             "-v",
@@ -91,12 +97,12 @@ pub async fn probe(path: &Path) -> Result<(MediaFileWrite, Vec<AudioStreamWrite>
     map_output(&parsed).ok_or_else(|| ProbeError::NoVideoStream(path.display().to_string()))
 }
 
-/// Convert the parsed ffprobe JSON into the persistable write struct plus its audio
-/// tracks. Returns `None` if the file has no video stream (nothing meaningful to catalog).
+/// Convert the parsed ffprobe JSON into the persistable write struct plus its audio and
+/// subtitle tracks. Returns `None` if the file has no video stream (nothing to catalog).
 ///
 /// Split out from [`probe`] and made `pub(crate)` so it can be unit-tested against
 /// fixture JSON without a real `ffprobe` on the machine.
-pub(crate) fn map_output(out: &FfprobeOutput) -> Option<(MediaFileWrite, Vec<AudioStreamWrite>)> {
+pub(crate) fn map_output(out: &FfprobeOutput) -> Option<Probed> {
     let video = out
         .streams
         .iter()
@@ -171,6 +177,29 @@ pub(crate) fn map_output(out: &FfprobeOutput) -> Option<(MediaFileWrite, Vec<Aud
         })
         .collect();
 
+    // Collect every subtitle track (`docs/.tasks/90`). Same single ffprobe pass — the
+    // parser just widens. `stream_index` is the absolute ffprobe index (what the
+    // `/api/subtitles/:file_id/:index.vtt` route and the burn-in `-map 0:s:` select by).
+    let subtitle_streams: Vec<SubtitleStreamWrite> = out
+        .streams
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.codec_type.as_deref() == Some("subtitle"))
+        .map(|(idx, s)| SubtitleStreamWrite {
+            stream_index: Some(idx as i64),
+            codec: s.codec_name.clone(),
+            format: SubtitleFormat::from_ffprobe(s.codec_name.as_deref().unwrap_or(""))
+                .as_str()
+                .to_string(),
+            language: s.tags.as_ref().and_then(|t| t.language.clone()),
+            title: s.tags.as_ref().and_then(|t| t.title.clone()),
+            is_default: s.disposition.as_ref().map(|d| d.default == 1).unwrap_or(false),
+            is_forced: s.disposition.as_ref().map(|d| d.forced == 1).unwrap_or(false),
+            is_external: false,
+            external_path: None,
+        })
+        .collect();
+
     let media = MediaFileWrite {
         container,
         size_bytes,
@@ -190,7 +219,7 @@ pub(crate) fn map_output(out: &FfprobeOutput) -> Option<(MediaFileWrite, Vec<Aud
         hw_decode_unsupported,
     };
 
-    Some((media, audio_streams))
+    Some((media, audio_streams, subtitle_streams))
 }
 
 /// Normalize the ffprobe `codec_name` (+ `profile`, which disambiguates DTS) to the
@@ -209,6 +238,11 @@ fn normalize_audio_codec(codec: Option<&str>, profile: Option<&str>) -> Option<S
         "truehd" => "truehd",
         "flac" => "flac",
         "opus" => "opus",
+        // NEW (`docs/.tasks/90`) — mainstream codecs that previously mapped to `other`.
+        "mp3" | "mp2" => "mp3",
+        "vorbis" => "vorbis",
+        "wmav2" | "wmapro" | "wmavoice" | "wmav1" => "wma",
+        "alac" => "alac",
         "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le" | "pcm_bluray" | "pcm_dvd" => "pcm",
         "dts" => {
             if prof.contains("DTS-HD MA") || prof.contains("DTS-HD High") {
@@ -436,11 +470,13 @@ pub(crate) struct Tags {
 }
 
 /// Stream disposition flags. `default == 1` marks the default audio track the transcode
-/// decision feeds into `decide()`.
+/// decision feeds into `decide()`; `forced == 1` marks a forced subtitle track (Task 90).
 #[derive(Debug, Deserialize)]
 pub(crate) struct Disposition {
     #[serde(default)]
     pub default: i64,
+    #[serde(default)]
+    pub forced: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -480,6 +516,11 @@ mod tests {
     fn parse_audio(json: &str) -> Vec<AudioStreamWrite> {
         let out: FfprobeOutput = serde_json::from_str(json).unwrap();
         map_output(&out).expect("has a video stream").1
+    }
+
+    fn parse_subs(json: &str) -> Vec<SubtitleStreamWrite> {
+        let out: FfprobeOutput = serde_json::from_str(json).unwrap();
+        map_output(&out).expect("has a video stream").2
     }
 
     #[test]
@@ -727,5 +768,96 @@ mod tests {
             }"#,
         );
         assert!(streams.is_empty());
+    }
+
+    // --- widened video/audio codec set + subtitles (Task 90) -----------------
+
+    #[test]
+    fn widened_video_codecs_persist_raw_name_and_type() {
+        use medi_core::VideoCodec;
+        // The raw ffprobe name is stored verbatim; the typed codec is derived on read via
+        // `VideoCodec::from_ffprobe` (the shared source of truth with `db`).
+        for (name, expect) in [
+            ("vc1", VideoCodec::Vc1),
+            ("mpeg2video", VideoCodec::Mpeg2),
+            ("mpeg4", VideoCodec::Mpeg4),
+            ("msmpeg4v3", VideoCodec::Mpeg4),
+            ("vp9", VideoCodec::Vp9),
+        ] {
+            let w = parse(&format!(
+                r#"{{ "streams": [{{ "codec_type": "video", "codec_name": "{name}",
+                       "width": 1920, "height": 1080 }}], "format": {{}} }}"#
+            ));
+            assert_eq!(w.video_codec.as_deref(), Some(name));
+            assert_eq!(VideoCodec::from_ffprobe(w.video_codec.as_deref().unwrap()), expect);
+        }
+    }
+
+    #[test]
+    fn mp3_and_other_new_audio_codecs_normalized() {
+        let streams = parse_audio(
+            r#"{
+              "streams": [
+                { "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080 },
+                { "codec_type": "audio", "codec_name": "mp3", "channels": 2 },
+                { "codec_type": "audio", "codec_name": "vorbis", "channels": 2 },
+                { "codec_type": "audio", "codec_name": "wmapro", "channels": 6 },
+                { "codec_type": "audio", "codec_name": "alac", "channels": 2 }
+              ],
+              "format": {}
+            }"#,
+        );
+        assert_eq!(streams[0].codec.as_deref(), Some("mp3"));
+        assert_eq!(streams[1].codec.as_deref(), Some("vorbis"));
+        assert_eq!(streams[2].codec.as_deref(), Some("wma"));
+        assert_eq!(streams[3].codec.as_deref(), Some("alac"));
+    }
+
+    #[test]
+    fn subtitle_streams_classified_text_and_image() {
+        // A file with an embedded SRT (default), an ASS commentary, and a PGS image track.
+        let subs = parse_subs(
+            r#"{
+              "streams": [
+                { "codec_type": "video", "codec_name": "hevc", "width": 3840, "height": 2160 },
+                { "codec_type": "audio", "codec_name": "eac3", "channels": 6 },
+                { "codec_type": "subtitle", "codec_name": "subrip",
+                  "tags": { "language": "eng", "title": "English" },
+                  "disposition": { "default": 1, "forced": 0 } },
+                { "codec_type": "subtitle", "codec_name": "ass",
+                  "tags": { "language": "eng", "title": "Signs & Songs" },
+                  "disposition": { "default": 0, "forced": 1 } },
+                { "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle",
+                  "tags": { "language": "fre" } }
+              ],
+              "format": {}
+            }"#,
+        );
+        assert_eq!(subs.len(), 3);
+        // Track 0: SRT at absolute stream_index 2, text, default.
+        assert_eq!(subs[0].stream_index, Some(2));
+        assert_eq!(subs[0].codec.as_deref(), Some("subrip"));
+        assert_eq!(subs[0].format, "text");
+        assert!(subs[0].is_default);
+        assert!(!subs[0].is_forced);
+        assert_eq!(subs[0].language.as_deref(), Some("eng"));
+        // Track 1: ASS, text, forced disposition read.
+        assert_eq!(subs[1].format, "text");
+        assert!(subs[1].is_forced);
+        // Track 2: PGS → image.
+        assert_eq!(subs[2].stream_index, Some(4));
+        assert_eq!(subs[2].format, "image");
+        assert!(!subs[2].is_external);
+    }
+
+    #[test]
+    fn no_subtitle_streams_is_empty() {
+        let subs = parse_subs(
+            r#"{
+              "streams": [{ "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080 }],
+              "format": {}
+            }"#,
+        );
+        assert!(subs.is_empty());
     }
 }

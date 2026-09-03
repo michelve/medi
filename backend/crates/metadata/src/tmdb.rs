@@ -17,13 +17,19 @@ use serde_json::Value;
 use tokio::sync::{OnceCell, Semaphore};
 
 use crate::matcher;
-use crate::provider::{CreditIn, Details, Match, MediaKind, MetadataProvider, ProviderId};
+use crate::provider::{
+    Collection, CreditIn, Details, Genre, Match, MediaKind, MetadataProvider, PersonDetails,
+    ProviderId, TrailerIn,
+};
 use crate::{Error, Result};
 
 const API_BASE: &str = "https://api.themoviedb.org/3";
 /// A safe fallback image base if `/configuration` cannot be reached. TMDB's canonical
 /// CDN host; `w780` is a reasonable poster/backdrop width for a 10-foot UI.
 const FALLBACK_IMAGE_BASE: &str = "https://image.tmdb.org/t/p/w780";
+/// A safe fallback profile-image base for headshots (`docs/.tasks/91` Phase B). `h632` is
+/// TMDB's tallest fixed profile width — a good size for a person-page portrait.
+const FALLBACK_PROFILE_BASE: &str = "https://image.tmdb.org/t/p/h632";
 /// Max concurrent TMDB requests. TMDB's documented limit is generous (~50/s) but we stay
 /// well under it during a burst scan; the enrichment worker also bounds its own fan-out.
 const MAX_CONCURRENCY: usize = 8;
@@ -37,6 +43,10 @@ pub struct TmdbProvider {
     /// The image base URL from `/configuration`, fetched once and reused (a courtesy
     /// cache to avoid a round-trip per title — `docs/.tasks/60` §Provider-response cache).
     image_base: OnceCell<String>,
+    /// The profile-image base URL for headshots (`docs/.tasks/91` Phase B) — a second
+    /// cached width from the same `/configuration` response, resolved lazily like
+    /// [`Self::image_base`].
+    profile_base: OnceCell<String>,
 }
 
 impl TmdbProvider {
@@ -53,6 +63,7 @@ impl TmdbProvider {
             http,
             sem: Arc::new(Semaphore::new(MAX_CONCURRENCY)),
             image_base: OnceCell::new(),
+            profile_base: OnceCell::new(),
         })
     }
 
@@ -87,6 +98,26 @@ impl TmdbProvider {
                     Err(err) => {
                         tracing::warn!(error = %err, "tmdb /configuration failed; using fallback image base");
                         FALLBACK_IMAGE_BASE.to_string()
+                    }
+                }
+            })
+            .await
+            .clone()
+    }
+
+    /// The `/configuration` profile-image base URL for headshots, fetched once and cached
+    /// for the process (`docs/.tasks/91` Phase B). Reads the same `/configuration` response
+    /// as [`Self::image_base`] but a different size list (`profile_sizes`).
+    async fn profile_base(&self) -> String {
+        self.profile_base
+            .get_or_init(|| async {
+                match self.get("/configuration", &[]).await {
+                    Ok(v) => {
+                        parse_profile_base(&v).unwrap_or_else(|| FALLBACK_PROFILE_BASE.to_string())
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "tmdb /configuration failed; using fallback profile base");
+                        FALLBACK_PROFILE_BASE.to_string()
                     }
                 }
             })
@@ -130,10 +161,17 @@ impl MetadataProvider for TmdbProvider {
             MediaKind::Series => format!("/tv/{tmdb_id}"),
         };
         let json = self
-            .get(&path, &[("append_to_response", "credits,external_ids")])
+            .get(&path, &[("append_to_response", "credits,external_ids,videos")])
             .await?;
         let image_base = self.image_base().await;
         Ok(parse_details(&json, tmdb_id, &image_base))
+    }
+
+    async fn person_details(&self, person_tmdb_id: i64) -> Result<Option<PersonDetails>> {
+        // `GET /person/{id}` — bounded by the same semaphore as every other call.
+        let json = self.get(&format!("/person/{person_tmdb_id}"), &[]).await?;
+        let profile_base = self.profile_base().await;
+        Ok(Some(parse_person(&json, person_tmdb_id, &profile_base)))
     }
 }
 
@@ -158,6 +196,55 @@ pub fn parse_image_base(v: &Value) -> Option<String> {
         })
         .unwrap_or("w780");
     Some(format!("{}/{width}", base.trim_end_matches('/')))
+}
+
+/// Extract the profile-image base for headshots from a `/configuration` response
+/// (`images.secure_base_url` + a `profile_sizes` width) — `docs/.tasks/91` Phase B. Prefers
+/// `h632` (TMDB's tallest fixed profile width), else the second-largest available, else
+/// `original`. Returns `None` if the shape is unexpected.
+pub fn parse_profile_base(v: &Value) -> Option<String> {
+    let images = v.get("images")?;
+    let base = images.get("secure_base_url")?.as_str()?;
+    let width = images
+        .get("profile_sizes")
+        .and_then(|s| s.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str())
+                .find(|w| *w == "h632")
+                .or_else(|| arr.iter().filter_map(|x| x.as_str()).nth(arr.len().saturating_sub(2)))
+        })
+        .unwrap_or("h632");
+    Some(format!("{}/{width}", base.trim_end_matches('/')))
+}
+
+/// Parse a `/person/{id}` response into [`PersonDetails`], resolving the `profile_path`
+/// against `profile_base` (`docs/.tasks/91` Phase B). An empty `biography`/`profile_path`
+/// becomes `None`. `tmdb_id` is passed in (the id we requested) so the shape stays a pure
+/// function of the JSON + the base.
+pub fn parse_person(v: &Value, tmdb_id: i64, profile_base: &str) -> PersonDetails {
+    let name = v
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let biography = v
+        .get("biography")
+        .and_then(|b| b.as_str())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let photo_url = v
+        .get("profile_path")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|p| format!("{profile_base}{p}"));
+    PersonDetails {
+        tmdb_id,
+        name,
+        biography,
+        photo_url,
+    }
 }
 
 /// Parse a `/search/{movie,tv}` response into scored [`Match`]es, ordered best-first.
@@ -226,6 +313,9 @@ pub fn parse_details(v: &Value, tmdb_id: i64, image_base: &str) -> Details {
         .map(|s| s.to_string());
 
     let cast = parse_cast(v);
+    let genres = parse_genres(v);
+    let collection = parse_collection(v, image_base);
+    let trailers = parse_trailers(v);
 
     Details {
         overview,
@@ -234,7 +324,106 @@ pub fn parse_details(v: &Value, tmdb_id: i64, image_base: &str) -> Details {
         backdrop_url,
         imdb_id,
         tmdb_id: Some(tmdb_id),
+        genres,
+        collection,
+        trailers,
     }
+}
+
+/// Parse `belongs_to_collection: { id, name, poster_path }` from a `/movie/{id}` details
+/// response into a [`Collection`], resolving the poster against `image_base`. `None` when the
+/// field is absent/null (a standalone movie, or a TV title).
+pub fn parse_collection(v: &Value, image_base: &str) -> Option<Collection> {
+    let c = v.get("belongs_to_collection")?;
+    if c.is_null() {
+        return None;
+    }
+    let tmdb_id = c.get("id")?.as_i64()?;
+    let name = c.get("name")?.as_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let poster_url = c
+        .get("poster_path")
+        .and_then(|p| p.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|p| format!("{image_base}{p}"));
+    Some(Collection {
+        tmdb_id,
+        name: name.to_string(),
+        poster_url,
+    })
+}
+
+/// Parse an appended `videos.results[]` block into YouTube [`TrailerIn`]s, best-first.
+/// Keeps only `site == "YouTube"` entries with a non-empty `key` (the only site the client
+/// embeds), preferring official Trailers, then Teasers, then everything else, and official
+/// entries within each. Empty when the title has no YouTube videos.
+pub fn parse_trailers(v: &Value) -> Vec<TrailerIn> {
+    let Some(results) = v
+        .get("videos")
+        .and_then(|vids| vids.get("results"))
+        .and_then(|r| r.as_array())
+    else {
+        return Vec::new();
+    };
+
+    // Collect YouTube videos with a rank so the best trailer surfaces first.
+    let mut ranked: Vec<(i64, TrailerIn)> = results
+        .iter()
+        .filter(|entry| entry.get("site").and_then(|s| s.as_str()) == Some("YouTube"))
+        .filter_map(|entry| {
+            let key = entry.get("key").and_then(|k| k.as_str())?.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let kind = entry
+                .get("type")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+            let official = entry.get("official").and_then(|o| o.as_bool()).unwrap_or(false);
+            // Lower rank sorts first: Trailer(0) < Teaser(2) < other(4); official beats not.
+            let type_rank = match kind.as_deref() {
+                Some("Trailer") => 0,
+                Some("Teaser") => 2,
+                _ => 4,
+            };
+            let rank = type_rank + if official { 0 } else { 1 };
+            Some((
+                rank,
+                TrailerIn {
+                    youtube_key: key.to_string(),
+                    name: entry.get("name").and_then(|n| n.as_str()).map(|s| s.to_string()),
+                    kind,
+                },
+            ))
+        })
+        .collect();
+    ranked.sort_by_key(|(rank, _)| *rank);
+    ranked.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Extract the top-level `genres: [{id, name}]` array from a `/movie/{id}` or `/tv/{id}`
+/// details response into [`Genre`]s. Zero extra HTTP — it reads the array already present
+/// in the details payload the pipeline fetches. Entries missing an id or a non-empty name
+/// are skipped.
+pub fn parse_genres(v: &Value) -> Vec<Genre> {
+    let Some(arr) = v.get("genres").and_then(|g| g.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|g| {
+            let tmdb_id = g.get("id")?.as_i64()?;
+            let name = g.get("name")?.as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(Genre {
+                tmdb_id,
+                name: name.to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Extract billed cast (+ the director as a crew credit) from an appended `credits`
@@ -257,11 +446,13 @@ fn parse_cast(v: &Value) -> Vec<CreditIn> {
                 .and_then(|c| c.as_str())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
+            let person_tmdb_id = member.get("id").and_then(|i| i.as_i64());
             out.push(CreditIn {
                 name: name.to_string(),
                 role: "actor".to_string(),
                 character,
                 ord,
+                person_tmdb_id,
             });
         }
     }
@@ -278,11 +469,13 @@ fn parse_cast(v: &Value) -> Vec<CreditIn> {
             let Some(name) = member.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
+            let person_tmdb_id = member.get("id").and_then(|i| i.as_i64());
             out.push(CreditIn {
                 name: name.to_string(),
                 role: "director".to_string(),
                 character: None,
                 ord: next_ord,
+                person_tmdb_id,
             });
             next_ord += 1;
         }
@@ -313,6 +506,88 @@ mod tests {
             parse_image_base(&cfg).as_deref(),
             Some("https://image.tmdb.org/t/p/w780")
         );
+    }
+
+    #[test]
+    fn parses_configuration_profile_base() {
+        let cfg = json!({
+            "images": {
+                "secure_base_url": "https://image.tmdb.org/t/p/",
+                "profile_sizes": ["w45", "w185", "h632", "original"]
+            }
+        });
+        assert_eq!(
+            parse_profile_base(&cfg).as_deref(),
+            Some("https://image.tmdb.org/t/p/h632")
+        );
+    }
+
+    #[test]
+    fn parse_person_extracts_bio_and_photo() {
+        let resp = json!({
+            "id": 9273,
+            "name": "Amy Adams",
+            "biography": "  Amy Lou Adams is an American actress.  ",
+            "profile_path": "/amy.jpg",
+            "birthday": "1974-08-20"
+        });
+        let p = parse_person(&resp, 9273, "https://img/h632");
+        assert_eq!(p.tmdb_id, 9273);
+        assert_eq!(p.name, "Amy Adams");
+        // Biography is trimmed.
+        assert_eq!(p.biography.as_deref(), Some("Amy Lou Adams is an American actress."));
+        assert_eq!(p.photo_url.as_deref(), Some("https://img/h632/amy.jpg"));
+    }
+
+    #[test]
+    fn parse_collection_resolves_poster() {
+        let resp = json!({
+            "belongs_to_collection": {
+                "id": 295,
+                "name": "Pirates of the Caribbean Collection",
+                "poster_path": "/poster.jpg"
+            }
+        });
+        let c = parse_collection(&resp, "https://img/w780").unwrap();
+        assert_eq!(c.tmdb_id, 295);
+        assert_eq!(c.name, "Pirates of the Caribbean Collection");
+        assert_eq!(c.poster_url.as_deref(), Some("https://img/w780/poster.jpg"));
+
+        // A standalone movie (null / absent) → None.
+        assert!(parse_collection(&json!({ "belongs_to_collection": null }), "x").is_none());
+        assert!(parse_collection(&json!({}), "x").is_none());
+    }
+
+    #[test]
+    fn parse_trailers_keeps_youtube_and_ranks_official_trailers_first() {
+        let resp = json!({
+            "videos": { "results": [
+                { "site": "YouTube", "key": "clip1", "type": "Clip", "official": true, "name": "A clip" },
+                { "site": "Vimeo",   "key": "vimeo1", "type": "Trailer", "official": true, "name": "ignored" },
+                { "site": "YouTube", "key": "teaser1", "type": "Teaser", "official": true, "name": "Teaser" },
+                { "site": "YouTube", "key": "trailer1", "type": "Trailer", "official": true, "name": "Official Trailer" },
+                { "site": "YouTube", "key": "", "type": "Trailer", "official": true }
+            ]}
+        });
+        let t = parse_trailers(&resp);
+        // Vimeo dropped, empty-key dropped → 3 YouTube videos.
+        assert_eq!(t.len(), 3);
+        // Official Trailer ranks first, then Teaser, then the Clip.
+        assert_eq!(t[0].youtube_key, "trailer1");
+        assert_eq!(t[0].kind.as_deref(), Some("Trailer"));
+        assert_eq!(t[1].youtube_key, "teaser1");
+        assert_eq!(t[2].youtube_key, "clip1");
+        // No videos block → empty.
+        assert!(parse_trailers(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn parse_person_empty_fields_become_none() {
+        let resp = json!({ "id": 1, "name": "No Photo", "biography": "", "profile_path": null });
+        let p = parse_person(&resp, 1, "https://img/h632");
+        assert_eq!(p.name, "No Photo");
+        assert!(p.biography.is_none());
+        assert!(p.photo_url.is_none());
     }
 
     #[test]
@@ -361,13 +636,17 @@ mod tests {
             "poster_path": "/poster.jpg",
             "backdrop_path": "/backdrop.jpg",
             "imdb_id": "tt2543164",
+            "genres": [
+                { "id": 878, "name": "Science Fiction" },
+                { "id": 18, "name": "Drama" }
+            ],
             "credits": {
                 "cast": [
-                    { "name": "Amy Adams", "character": "Louise Banks", "order": 0 },
-                    { "name": "Jeremy Renner", "character": "Ian Donnelly", "order": 1 }
+                    { "id": 9273, "name": "Amy Adams", "character": "Louise Banks", "order": 0 },
+                    { "id": 17647, "name": "Jeremy Renner", "character": "Ian Donnelly", "order": 1 }
                 ],
                 "crew": [
-                    { "name": "Denis Villeneuve", "job": "Director" },
+                    { "id": 137427, "name": "Denis Villeneuve", "job": "Director" },
                     { "name": "Someone Else", "job": "Producer" }
                 ]
             }
@@ -383,9 +662,36 @@ mod tests {
         assert_eq!(d.cast[0].role, "actor");
         assert_eq!(d.cast[0].character.as_deref(), Some("Louise Banks"));
         assert_eq!(d.cast[0].ord, 0);
+        // Cast person ids are captured for person enrichment (`docs/.tasks/91` Phase B).
+        assert_eq!(d.cast[0].person_tmdb_id, Some(9273));
         let director = d.cast.iter().find(|c| c.role == "director").unwrap();
         assert_eq!(director.name, "Denis Villeneuve");
         assert!(director.ord >= 2, "director billed after the cast");
+        assert_eq!(director.person_tmdb_id, Some(137427));
+
+        // Genres come free from the same details response (`docs/.tasks/91` Phase A).
+        assert_eq!(d.genres.len(), 2);
+        assert_eq!(d.genres[0].tmdb_id, 878);
+        assert_eq!(d.genres[0].name, "Science Fiction");
+        assert_eq!(d.genres[1].tmdb_id, 18);
+    }
+
+    #[test]
+    fn genres_absent_or_malformed_yield_empty() {
+        // No `genres` key → empty (a title with none, or an old response shape).
+        assert!(parse_genres(&json!({})).is_empty());
+        // Entries missing an id or a non-empty name are skipped.
+        let resp = json!({
+            "genres": [
+                { "id": 28, "name": "Action" },
+                { "name": "No Id" },
+                { "id": 99, "name": "" }
+            ]
+        });
+        let g = parse_genres(&resp);
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].tmdb_id, 28);
+        assert_eq!(g[0].name, "Action");
     }
 
     #[test]

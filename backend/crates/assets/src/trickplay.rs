@@ -248,7 +248,7 @@ async fn generate_tiled(
     let n = frames.len() as u32;
 
     let cols = TILE_COLS.min(n.max(1));
-    let rows = (n + cols - 1) / cols; // ceil
+    let rows = n.div_ceil(cols);
 
     // Second pass: read the numbered frames back in and tile them. Using the frame
     // glob keeps this independent of the source seek cost.

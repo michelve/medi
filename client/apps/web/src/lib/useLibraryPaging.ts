@@ -1,20 +1,35 @@
 /**
- * `useLibraryPaging` (Task 81) — keyset infinite-scroll state over `GET /api/library`.
+ * `useLibraryPaging` (Task 81) — keyset infinite-scroll state over a `LibraryPage` endpoint.
  *
  * Owns the accumulated items, the opaque `next_cursor`, and load lifecycle. Exposes
  * `loadMore()` (idempotent while a fetch is in flight) for the grid sentinel to call.
- * Changing `sort` resets to page one (cursor cleared, items dropped) — the from-page-one
- * re-fetch the spec requires. All fetches are abortable and cancelled on unmount / re-run.
+ * Changing `sort` (or the `source` — a different endpoint / genre) resets to page one
+ * (cursor cleared, items dropped) — the from-page-one re-fetch the spec requires. All
+ * fetches are abortable and cancelled on unmount / re-run.
+ *
+ * `source` (Task 91) selects the paged endpoint: the default `{ kind: 'library' }` pages
+ * `GET /api/library`; `{ kind: 'genre', id }` pages `GET /api/genres/:id`, whose response
+ * has the identical `LibraryPage` shape — so a `GenrePage` reuses this hook verbatim.
  *
  * Kept as a hook (not inline in the page) so the paging contract is isolated and the page
  * is pure rendering — the modularity the task asks for.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ApiError, type LibraryItem, type LibrarySort } from '@medi/api-client';
+import {
+  ApiError,
+  type LibraryItem,
+  type LibraryPage,
+  type LibrarySort,
+} from '@medi/api-client';
 import { useApi } from '../api';
 
 const PAGE_SIZE = 60;
+
+/** Which paged `LibraryPage` endpoint the hook draws from (`docs/.tasks/91`). */
+export type LibraryPagingSource =
+  | { kind: 'library' }
+  | { kind: 'genre'; id: number };
 
 export interface LibraryPagingState {
   items: LibraryItem[];
@@ -29,8 +44,14 @@ export interface LibraryPagingState {
   loadMore: () => void;
 }
 
-export function useLibraryPaging(sort: LibrarySort): LibraryPagingState {
+export function useLibraryPaging(
+  sort: LibrarySort,
+  source: LibraryPagingSource = { kind: 'library' },
+): LibraryPagingState {
   const api = useApi();
+  // A stable identity for the source so the fetch callback (and its restart effect) only
+  // re-run when the endpoint actually changes, not on every render's fresh object literal.
+  const sourceKey = source.kind === 'genre' ? `genre:${source.id}` : 'library';
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
@@ -59,10 +80,12 @@ export function useLibraryPaging(sort: LibrarySort): LibraryPagingState {
       if (isInitial) setInitialLoading(true);
       else setLoadingMore(true);
       try {
-        const page = await api.library(
-          { cursor: nextCursor, limit: PAGE_SIZE, sort },
-          { signal: controller?.signal },
-        );
+        const query = { cursor: nextCursor, limit: PAGE_SIZE, sort };
+        const reqOpts = { signal: controller?.signal };
+        const page: LibraryPage =
+          source.kind === 'genre'
+            ? await api.genreTitles(source.id, query, reqOpts)
+            : await api.library(query, reqOpts);
         // Superseded by a newer generation while awaiting — drop the result.
         if (controller?.signal.aborted) return;
         setItems((prev) => (isInitial ? page.items : [...prev, ...page.items]));
@@ -83,7 +106,11 @@ export function useLibraryPaging(sort: LibrarySort): LibraryPagingState {
         else setLoadingMore(false);
       }
     },
-    [api, sort],
+    // `sourceKey` (not the `source` object) so a fresh literal each render doesn't churn
+    // the callback; the resolved `source` is read inside via closure and only changes with
+    // the key. `sort` and the key together define a page-one generation.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [api, sort, sourceKey],
   );
 
   // (Re)start from page one whenever the sort key changes.

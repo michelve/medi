@@ -45,6 +45,12 @@ injection, and publish an Unraid Community Applications XML template for one-cli
 - Expose the API port; declare a `HEALTHCHECK` hitting `/api/health`.
 - Volumes: `/config` (RW appdata), `/media` (RO array) — per `00-architecture.md`.
 
+> **Release vs dev image.** This **release** image (`docker/Dockerfile`, `cargo build
+> --release`, built in CI) is the only artifact the Unraid template publishes/pins. A separate
+> **dev** image (`docker/Dockerfile.dev` — same runtime, but a *debug* backend build with
+> cargo cache mounts) drives the Windows fast-iteration loop and is never published — see
+> `92-windows-dev-and-native-gpu.md`.
+
 ### Dockerfile skeleton
 ```dockerfile
 # ---- build ----

@@ -47,6 +47,15 @@ pub struct AppConfig {
     pub metadata_enabled: bool,
     /// Language tag passed to the provider (e.g. `"en-US"`) for overviews/titles.
     pub metadata_language: String,
+    /// fanart.tv personal API key (`docs/.tasks/93`). Unset ⇒ title-logo fetching is
+    /// disabled (graceful degradation); every other enrichment behaves exactly as today.
+    /// A separate key from TMDB/OMDb.
+    pub fanarttv_api_key: Option<String>,
+    /// How often (hours) to run a low-priority background backfill over already-matched
+    /// titles, filling any newer detail fields / artwork (genres, collections, fanart logos +
+    /// wallpapers) that landed since a title was matched. `0` disables the periodic pass (the
+    /// manual `POST /api/metadata/backfill` still works). Default `24` (once a day).
+    pub backfill_interval_hours: u32,
 }
 
 impl Default for AppConfig {
@@ -65,6 +74,8 @@ impl Default for AppConfig {
             metadata_provider: "tmdb".to_string(),
             metadata_enabled: true,
             metadata_language: "en-US".to_string(),
+            fanarttv_api_key: None,
+            backfill_interval_hours: 24,
         }
     }
 }
@@ -92,6 +103,8 @@ impl AppConfig {
     /// | `METADATA_PROVIDER`  | `metadata_provider`  | `tmdb`           |
     /// | `METADATA_ENABLED`   | `metadata_enabled`   | `true`           |
     /// | `METADATA_LANGUAGE`  | `metadata_language`  | `en-US`          |
+    /// | `FANARTTV_API_KEY`   | `fanarttv_api_key`   | *(unset)*        |
+    /// | `BACKFILL_INTERVAL_HOURS` | `backfill_interval_hours` | `24`      |
     ///
     /// A `MEDI_`-prefixed form of each key is also accepted (e.g. `MEDI_BIND_ADDR`)
     /// so the vars can be namespaced when the container shares an environment.
@@ -112,6 +125,8 @@ impl AppConfig {
             "metadata_provider",
             "metadata_enabled",
             "metadata_language",
+            "fanarttv_api_key",
+            "backfill_interval_hours",
         ];
 
         Figment::new()
@@ -144,6 +159,13 @@ impl AppConfig {
     /// Directory holding generated trickplay sprites.
     pub fn trickplay_dir(&self) -> PathBuf {
         self.config_dir.join("trickplay")
+    }
+
+    /// Directory holding converted/cached WebVTT subtitles (`docs/.tasks/90` §5).
+    /// Text subtitles are extracted/converted here and served from the cache; sidecars
+    /// under `/media` are read-only and never written.
+    pub fn subs_dir(&self) -> PathBuf {
+        self.config_dir.join("subs")
     }
 
     /// Whether `hour` (0–23, local) falls inside the configured off-peak window during
@@ -184,6 +206,17 @@ impl AppConfig {
         }
         .filter(|k| !k.is_empty())
     }
+
+    /// The fanart.tv key, if configured and non-empty (`docs/.tasks/93`). `None` ⇒ title-logo
+    /// fetching is inert (no request, no error) — the whole feature is disabled.
+    pub fn fanart_key(&self) -> Option<&str> {
+        self.fanarttv_api_key.as_deref().filter(|k| !k.is_empty())
+    }
+
+    /// Whether fanart.tv title-logo fetching is enabled (a non-empty key is set).
+    pub fn fanart_enabled(&self) -> bool {
+        self.fanart_key().is_some()
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +239,11 @@ mod tests {
             assert_eq!(cfg.metadata_language, "en-US");
             assert!(cfg.tmdb_api_key.is_none());
             assert!(cfg.active_metadata_key().is_none(), "no key ⇒ enrichment off");
+            // fanart.tv is off by default (Task 93).
+            assert!(cfg.fanarttv_api_key.is_none());
+            assert!(!cfg.fanart_enabled(), "no fanart key ⇒ logo fetching off");
+            // Periodic backfill defaults to daily.
+            assert_eq!(cfg.backfill_interval_hours, 24);
             Ok(())
         });
     }
@@ -218,6 +256,7 @@ mod tests {
             jail.set_env("METADATA_PROVIDER", "omdb");
             jail.set_env("METADATA_ENABLED", "false");
             jail.set_env("METADATA_LANGUAGE", "fr-FR");
+            jail.set_env("FANARTTV_API_KEY", "fanart-secret");
 
             let cfg = AppConfig::from_env().expect("env extract");
             assert_eq!(cfg.tmdb_api_key.as_deref(), Some("tmdb-secret"));
@@ -226,6 +265,9 @@ mod tests {
             assert_eq!(cfg.metadata_language, "fr-FR");
             // active key follows the selected provider.
             assert_eq!(cfg.active_metadata_key(), Some("omdb-secret"));
+            // fanart.tv key loads from its own env var (Task 93).
+            assert_eq!(cfg.fanarttv_api_key.as_deref(), Some("fanart-secret"));
+            assert!(cfg.fanart_enabled());
             Ok(())
         });
     }

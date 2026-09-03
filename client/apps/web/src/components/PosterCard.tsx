@@ -17,9 +17,15 @@ export interface PosterCardProps {
   item: LibraryItem;
   /** Absolute poster URL from `client.imageUrl(item.poster)`, or undefined. */
   posterUrl?: string;
+  /**
+   * Show the title/year caption under the poster. The browse grid keeps it (default); the
+   * detail page's collection/recommendation rows hide it to match the Figma comp, which
+   * shows bare poster art.
+   */
+  showCaption?: boolean;
 }
 
-export function PosterCard({ item, posterUrl }: PosterCardProps) {
+export function PosterCard({ item, posterUrl, showCaption = true }: PosterCardProps) {
   const to = `/${item.kind}/${item.id}`;
 
   return (
@@ -65,24 +71,26 @@ export function PosterCard({ item, posterUrl }: PosterCardProps) {
             </div>
           )}
         </div>
-        <div style={{ marginTop: 8 }}>
-          <div
-            style={{
-              fontSize: 14,
-              fontWeight: 600,
-              color: theme.colors.text,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }}
-            title={item.title}
-          >
-            {item.title}
+        {showCaption && (
+          <div style={{ marginTop: 8 }}>
+            <div
+              style={{
+                fontSize: 14,
+                fontWeight: 600,
+                color: theme.colors.text,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              title={item.title}
+            >
+              {item.title}
+            </div>
+            {item.year != null && (
+              <div style={{ fontSize: 13, color: theme.colors.textMuted }}>{item.year}</div>
+            )}
           </div>
-          {item.year != null && (
-            <div style={{ fontSize: 13, color: theme.colors.textMuted }}>{item.year}</div>
-          )}
-        </div>
+        )}
       </div>
     </Link>
   );

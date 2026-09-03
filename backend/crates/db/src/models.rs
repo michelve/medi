@@ -23,11 +23,19 @@ pub struct Movie {
     pub added_at: i64,
     pub poster_path: Option<String>,
     pub backdrop_path: Option<String>,
+    /// The movie's transparent-PNG title logo from fanart.tv (Task 93), relative to
+    /// `images_dir()`. The client maps it to a `/api/images/...` URL exactly like
+    /// `poster_path`. `None` when the movie has no logo / fanart is unconfigured.
+    pub logo_path: Option<String>,
+    /// The movie's fanart.tv background wallpaper (Task 95), relative to `images_dir()`.
+    /// Shown on the detail hero in place of the TMDB backdrop when present. `None` when the
+    /// movie has no wallpaper / fanart is unconfigured.
+    pub wallpaper_path: Option<String>,
 }
 
 impl Movie {
     /// Column order: id, title, sort_title, year, overview, added_at,
-    /// poster_path, backdrop_path.
+    /// poster_path, backdrop_path, logo_path, wallpaper_path.
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
@@ -38,6 +46,8 @@ impl Movie {
             added_at: row.get(5)?,
             poster_path: row.get(6)?,
             backdrop_path: row.get(7)?,
+            logo_path: row.get(8)?,
+            wallpaper_path: row.get(9)?,
         })
     }
 }
@@ -145,6 +155,11 @@ pub struct MediaFile {
     /// [`MediaFile::from_row`] leaves it empty and the query layer fills it in.
     #[serde(default)]
     pub audio_streams: Vec<AudioStream>,
+    /// Subtitle tracks of this file (Task 90) — embedded tracks + external sidecars. A
+    /// child table for the same 1:N reason as `audio_streams`. Empty when unprobed or read
+    /// without the subtitle join; the query layer fills it in.
+    #[serde(default)]
+    pub subtitle_streams: Vec<SubtitleStream>,
 }
 
 impl MediaFile {
@@ -174,6 +189,7 @@ impl MediaFile {
             // stored as 0/1
             hw_decode_unsupported: row.get::<_, i64>(19)? != 0,
             audio_streams: Vec::new(),
+            subtitle_streams: Vec::new(),
         })
     }
 
@@ -185,12 +201,9 @@ impl MediaFile {
         let width = self.width? as u32;
         let height = self.height? as u32;
 
-        let codec = match self.video_codec.as_deref() {
-            Some("h264") => VideoCodec::H264,
-            Some("hevc") => VideoCodec::Hevc,
-            Some("av1") => VideoCodec::Av1,
-            _ => VideoCodec::Other,
-        };
+        // Single source of truth for the ffprobe-name → typed-codec mapping (Task 90);
+        // shared with `ingest` so the two never drift.
+        let codec = VideoCodec::from_ffprobe(self.video_codec.as_deref().unwrap_or(""));
 
         let hdr = match self.hdr_type.as_deref() {
             Some("hdr10") => HdrType::Hdr10,
@@ -268,11 +281,160 @@ impl AudioStream {
     }
 }
 
+/// A row of `subtitle_streams` — one subtitle track of a media file (Task 90).
+///
+/// Either an embedded track (`stream_index` set, `external_path` None) or an external
+/// sidecar (`external_path` set, `stream_index` None). `format` is `"text"` | `"image"`;
+/// the client uses it to decide between a WebVTT sidecar and a burn-in request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubtitleStream {
+    pub id: i64,
+    pub media_file_id: i64,
+    pub stream_index: Option<i64>,
+    pub codec: Option<String>,
+    /// `"text"` | `"image"`.
+    pub format: String,
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub is_default: bool,
+    pub is_forced: bool,
+    pub is_external: bool,
+    pub external_path: Option<String>,
+}
+
+impl SubtitleStream {
+    /// Column order: id, media_file_id, stream_index, codec, format, language, title,
+    /// is_default, is_forced, is_external, external_path.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            media_file_id: row.get(1)?,
+            stream_index: row.get(2)?,
+            codec: row.get(3)?,
+            format: row.get(4)?,
+            language: row.get(5)?,
+            title: row.get(6)?,
+            is_default: row.get::<_, i64>(7)? != 0,
+            is_forced: row.get::<_, i64>(8)? != 0,
+            is_external: row.get::<_, i64>(9)? != 0,
+            external_path: row.get(10)?,
+        })
+    }
+}
+
 /// A row of `people`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Person {
     pub id: i64,
     pub name: String,
+}
+
+/// The enriched `people` row backing a person page (`docs/.tasks/91` Phase B): the base
+/// identity plus the TMDB linkage / headshot / bio columns added in V6. `photo_path` is
+/// relative to `images_dir()`; the API maps it to a `/api/images/...` URL. Nullable columns
+/// are absent for a person not yet enriched (pre-backfill).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersonMeta {
+    pub id: i64,
+    pub name: String,
+    pub tmdb_id: Option<i64>,
+    pub photo_path: Option<String>,
+    pub biography: Option<String>,
+}
+
+impl PersonMeta {
+    /// Column order: id, name, tmdb_id, photo_path, biography.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            tmdb_id: row.get(2)?,
+            photo_path: row.get(3)?,
+            biography: row.get(4)?,
+        })
+    }
+}
+
+/// A `trailers` row — a YouTube trailer/teaser of a movie (Task 91 detail extensions).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Trailer {
+    pub id: i64,
+    pub youtube_key: String,
+    pub name: Option<String>,
+    /// TMDB `type`: `"Trailer"` | `"Teaser"` | `"Clip"` | …
+    pub kind: Option<String>,
+}
+
+impl Trailer {
+    /// Column order: id, youtube_key, name, kind.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            youtube_key: row.get(1)?,
+            name: row.get(2)?,
+            kind: row.get(3)?,
+        })
+    }
+}
+
+/// A `collections` row — a TMDB franchise a movie belongs to (Task 91 detail extensions).
+/// `poster_path` is relative to `images_dir()`; the API maps it to a `/api/images/...` URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Collection {
+    pub id: i64,
+    pub name: String,
+    pub poster_path: Option<String>,
+}
+
+impl Collection {
+    /// Column order: id, name, poster_path.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            poster_path: row.get(2)?,
+        })
+    }
+}
+
+/// A genre with the number of titles carrying it — the shape `GET /api/genres` returns
+/// (`docs/.tasks/91` Phase A). `count` is movies + series; only genres with `count >= 1`
+/// are listed, ordered by count desc then name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenreCount {
+    pub id: i64,
+    pub name: String,
+    pub count: i64,
+}
+
+impl GenreCount {
+    /// Column order: id, name, count.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            count: row.get(2)?,
+        })
+    }
+}
+
+/// A genre carried by a title (id + name), for the detail-page metadata line
+/// (`docs/.tasks/91`). Unlike [`GenreCount`] this has no count — it's the genres
+/// a single movie/series belongs to, in provider order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Genre {
+    pub id: i64,
+    pub name: String,
+}
+
+impl Genre {
+    /// Column order: id, name.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+        })
+    }
 }
 
 /// A row of `libraries` (`docs/.tasks/60` Phase B).
@@ -305,7 +467,9 @@ pub struct LibraryWithFolders {
     pub folders: Vec<String>,
 }
 
-/// A joined `credits` + `people` row (billing entry for a title).
+/// A joined `credits` + `people` row (billing entry for a title). `photo_path` is the
+/// person's downloaded headshot (Task 91 Phase B), relative to `images_dir()`, so a detail
+/// page can render a circular avatar; `None` for a person not yet enriched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Credit {
     pub id: i64,
@@ -314,11 +478,12 @@ pub struct Credit {
     pub role: Option<String>,
     pub character: Option<String>,
     pub ord: Option<i64>,
+    pub photo_path: Option<String>,
 }
 
 impl Credit {
     /// Column order: credits.id, credits.person_id, people.name,
-    /// credits.role, credits.character, credits.ord.
+    /// credits.role, credits.character, credits.ord, people.photo_path.
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
@@ -327,6 +492,7 @@ impl Credit {
             role: row.get(3)?,
             character: row.get(4)?,
             ord: row.get(5)?,
+            photo_path: row.get(6)?,
         })
     }
 }
@@ -413,14 +579,25 @@ impl ScanState {
 // reusable detail aggregates the queries return.)
 // ---------------------------------------------------------------------------
 
-/// Full movie detail: the movie plus its files and billed credits.
-/// Backs `GET /api/movies/:id` (see `02-api-contract.md`).
+/// Full movie detail: the movie plus its files and billed credits, and (Task 91 detail
+/// extensions) its trailers + franchise collection. The **other** in-library movies of the
+/// collection are assembled and shaped by the API layer (as poster tiles), not here. Backs
+/// `GET /api/movies/:id` (see `02-api-contract.md`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MovieDetail {
     #[serde(flatten)]
     pub movie: Movie,
     pub media_files: Vec<MediaFile>,
     pub credits: Vec<Credit>,
+    /// YouTube trailers, best-first. Empty when the movie has none.
+    #[serde(default)]
+    pub trailers: Vec<Trailer>,
+    /// The franchise this movie belongs to, or `null`.
+    #[serde(default)]
+    pub collection: Option<Collection>,
+    /// Genres carried by this movie, in provider order. Empty when unmatched.
+    #[serde(default)]
+    pub genres: Vec<Genre>,
 }
 
 /// An episode together with its on-disk media files (each with audio tracks).

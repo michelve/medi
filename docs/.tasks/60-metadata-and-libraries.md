@@ -128,9 +128,10 @@ boot with **no** libraries defined, auto-seed one `movie` and one `series` libra
 at `MEDIA_DIR`, so existing single-mount deployments keep working with no config change.
 
 > **Version coordination.** This task reserves migration versions **V2** and **V3**;
-> `70-audio-quality-and-profiles.md` uses **V4**. refinery versions must stay gapless and
-> monotonic, so whichever of `60`/`70` ships later renumbers to keep the sequence
-> contiguous — the ordering constraint is refinery's; the numbers are not load-bearing.
+> `70-audio-quality-and-profiles.md` uses **V4**; `90-format-coverage-and-subtitles.md`
+> uses **V5**. refinery versions must stay gapless and monotonic, so whichever of
+> `60`/`70`/`90` ships later renumbers to keep the sequence contiguous — the ordering
+> constraint is refinery's; the numbers are not load-bearing.
 
 ## Config additions
 

@@ -24,7 +24,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{mpsc, Semaphore};
 
-use medi_db::writes::{self, AudioStreamWrite, FileOwner, FileStat, MediaFileWrite};
+use medi_db::writes::{
+    self, AudioStreamWrite, FileOwner, FileStat, MediaFileWrite, SubtitleStreamWrite,
+};
 use medi_db::Db;
 
 use crate::ffprobe;
@@ -34,6 +36,39 @@ use crate::scanner::{self, Classification, DiscoveredFile};
 /// layer can drop its cached responses. `api` passes a closure over
 /// `ResponseCache::invalidate_all`.
 pub type Invalidator = Arc<dyn Fn() + Send + Sync>;
+
+/// A handle the API uses to ask the ingest worker to run a scan **now**, out of band from
+/// the filesystem watcher (`docs/.tasks/60` Phase B — the `POST /api/libraries/:id/scan`
+/// and library-create triggers). The fs-watcher only fires on disk *changes*; a library
+/// pointed at a folder whose files already exist would otherwise wait for the next restart
+/// or fs event. Sending on this channel wakes the same debounced scan loop.
+///
+/// Cloneable and cheap; a send never blocks (unbounded) and a full/closed channel is a
+/// no-op (the worker isn't running), so callers can `trigger()` fire-and-forget.
+#[derive(Clone)]
+pub struct ScanTrigger {
+    tx: mpsc::UnboundedSender<()>,
+}
+
+impl ScanTrigger {
+    /// Build a trigger + its receiver. The API keeps the [`ScanTrigger`]; the worker's
+    /// [`watch`] loop takes the receiver.
+    pub fn new() -> (Self, ScanSignal) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx }, ScanSignal { rx })
+    }
+
+    /// Ask the worker to scan as soon as the debounce settles. Never blocks; a closed
+    /// receiver (worker not running) is silently ignored.
+    pub fn trigger(&self) {
+        let _ = self.tx.send(());
+    }
+}
+
+/// The receiving half of a [`ScanTrigger`], handed to [`watch`]. Opaque to the API.
+pub struct ScanSignal {
+    rx: mpsc::UnboundedReceiver<()>,
+}
 
 /// Configuration for the ingestion worker.
 #[derive(Clone)]
@@ -48,6 +83,9 @@ pub struct WorkerConfig {
     pub enrich: Option<medi_metadata::EnrichContext>,
     /// Max concurrent enrichment provider round-trips, mirroring `probe_concurrency`.
     pub enrich_concurrency: usize,
+    /// Shared status handle the API's `GET /api/status` reads (`docs/.tasks/96`). `None`
+    /// when observability isn't wired (standalone / tests) — recording is then a no-op.
+    pub status: Option<crate::status::EnrichmentStatus>,
 }
 
 impl WorkerConfig {
@@ -58,12 +96,20 @@ impl WorkerConfig {
             probe_concurrency: 4,
             enrich: None,
             enrich_concurrency: 4,
+            status: None,
         }
     }
 
     /// Attach a metadata enrichment context so `run_scan` enriches newly-ingested titles.
     pub fn with_enrichment(mut self, ctx: medi_metadata::EnrichContext) -> Self {
         self.enrich = Some(ctx);
+        self
+    }
+
+    /// Attach the shared status handle so scans/enrichment record their tallies for
+    /// `GET /api/status` (`docs/.tasks/96`).
+    pub fn with_status(mut self, status: crate::status::EnrichmentStatus) -> Self {
+        self.status = Some(status);
         self
     }
 }
@@ -74,6 +120,13 @@ impl WorkerConfig {
 /// Idempotent: unchanged, already-probed files are skipped via `scan_state`
 /// (mtime + size), so a re-scan of an unchanged library re-probes nothing.
 pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> anyhow::Result<()> {
+    // Observability (`docs/.tasks/96`): stamp scan start so `GET /api/status` shows a run in
+    // flight, and count ffprobe failures across the fan-out to report at the end.
+    if let Some(s) = &cfg.status {
+        s.scan_started();
+    }
+    let probe_failures = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
     // Phase B: scan per library folder so files are scoped to a library and the library
     // `kind` overrides filename guessing. When no libraries are defined (a bare
     // pre-Phase-B DB), fall back to a single filename-guessed scan of `media_dir`.
@@ -118,6 +171,11 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
     tracing::info!(count = changed, "files new or changed since last scan");
 
     if changed == 0 {
+        // Nothing to probe/write, but still a completed scan — record it so `GET /api/status`
+        // shows a fresh "last scan" instead of looking stalled (`docs/.tasks/96`).
+        if let Some(s) = &cfg.status {
+            s.scan_finished(0, 0);
+        }
         return Ok(());
     }
 
@@ -126,12 +184,28 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
     let (tx, mut rx) = mpsc::channel::<Probed>(cfg.probe_concurrency.max(1) * 2);
 
     // Writer task: the single WAL writer. Owns its own DB handle.
+    //
+    // It invalidates the response cache every `INVALIDATE_EVERY` rows, not just once
+    // when the whole pass finishes. A first scan of a large library takes minutes-to-
+    // hours (each ffprobe reads the file, slower still over an SMB mount); without
+    // periodic invalidation the empty catalog page rendered at scan start stays cached
+    // for the entire scan, so the UI grid looks empty even as thousands of rows land.
+    // Busting the cache on a batch boundary makes the grid fill in progressively.
     let writer_db = db.clone();
+    let writer_invalidate = invalidate.clone();
     let writer = tokio::spawn(async move {
+        /// Rows between cache busts during a scan. Small enough that the grid fills in
+        /// visibly, large enough that invalidation isn't per-row churn.
+        const INVALIDATE_EVERY: usize = 25;
         let mut written = 0usize;
         while let Some(probed) = rx.recv().await {
             match write_one(&writer_db, probed).await {
-                Ok(()) => written += 1,
+                Ok(()) => {
+                    written += 1;
+                    if written % INVALIDATE_EVERY == 0 {
+                        (*writer_invalidate)();
+                    }
+                }
                 Err(err) => tracing::error!(error = %err, "failed to persist probed file"),
             }
         }
@@ -143,11 +217,16 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
     for file in to_probe {
         let permit_sem = semaphore.clone();
         let tx = tx.clone();
+        let probe_failures = probe_failures.clone();
+        let probe_db = db.clone();
         probe_tasks.push(tokio::spawn(async move {
             // Acquire before spawning ffprobe so at most `concurrency` run at once.
             let _permit = permit_sem.acquire_owned().await.expect("semaphore open");
             match ffprobe::probe(&file.path).await {
-                Ok((data, audio)) => {
+                Ok((data, audio, mut subtitles)) => {
+                    // External sidecars (`docs/.tasks/90`) are discovered by filename next
+                    // to the video and merged with the embedded subtitle tracks.
+                    subtitles.extend(scanner::discover_sidecars(&file.path));
                     tracing::info!(
                         path = %file.path.display(),
                         codec = data.video_codec.as_deref().unwrap_or("?"),
@@ -155,13 +234,24 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
                         dv_profile = data.dv_profile.unwrap_or(-1),
                         hw_decode_unsupported = data.hw_decode_unsupported,
                         audio_tracks = audio.len(),
+                        subtitle_tracks = subtitles.len(),
                         "probed file",
                     );
+                    // A successful probe clears any prior recorded failure for this path
+                    // (`docs/.tasks/96` Part C) so a re-encoded/replaced file drops off the
+                    // status list. Best-effort — a clear failure is not fatal to the scan.
+                    let path = file.path.to_string_lossy().into_owned();
+                    let _ = clear_probe_failure(&probe_db, path).await;
                     // A closed receiver just means we're shutting down.
-                    let _ = tx.send(Probed { file, data, audio }).await;
+                    let _ = tx.send(Probed { file, data, audio, subtitles }).await;
                 }
                 Err(err) => {
                     tracing::warn!(path = %file.path.display(), error = %err, "ffprobe failed; skipping");
+                    probe_failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Persist the failure so `GET /api/status/probe-failures` can list it and
+                    // the operator can find the bad file (`docs/.tasks/96` Part C).
+                    let path = file.path.to_string_lossy().into_owned();
+                    let _ = record_probe_failure(&probe_db, path, err.to_string()).await;
                 }
             }
         }));
@@ -177,7 +267,11 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
     }
 
     let written = writer.await?;
-    tracing::info!(written, "ingest scan complete");
+    let failures = probe_failures.load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(written, probe_failures = failures, "ingest scan complete");
+    if let Some(s) = &cfg.status {
+        s.scan_finished(written as u64, failures);
+    }
 
     if written > 0 {
         // `invalidate: &Arc<dyn Fn()>` — deref through the Arc to call the closure.
@@ -189,13 +283,48 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
         // manual step — `watch` → incremental `run_scan` → here. Enrichment invalidates
         // the cache again itself once art/overview land.
         if let Some(ctx) = &cfg.enrich {
-            if let Err(err) =
-                crate::enrich::run_enrichment(db, ctx, cfg.enrich_concurrency, invalidate).await
+            if let Err(err) = crate::enrich::run_enrichment(
+                db,
+                ctx,
+                cfg.enrich_concurrency,
+                invalidate,
+                cfg.status.as_ref(),
+            )
+            .await
             {
                 tracing::error!(error = %err, "metadata enrichment pass failed");
             }
         }
     }
+    Ok(())
+}
+
+/// Record (or refresh) a persisted ffprobe failure for `path` (`docs/.tasks/96` Part C).
+/// Best-effort: a DB error here is logged and swallowed so a probe failure never also fails
+/// the scan. Runs on the blocking pool.
+async fn record_probe_failure(db: &Db, path: String, error: String) -> anyhow::Result<()> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || -> medi_db::DbResult<()> {
+        let conn = db.conn()?;
+        writes::upsert_probe_failure(&conn, &path, &error, now_secs())
+    })
+    .await?
+    .map_err(|e| {
+        tracing::warn!(error = %e, "failed to record probe failure");
+        anyhow::anyhow!(e)
+    })?;
+    Ok(())
+}
+
+/// Clear a persisted ffprobe failure for `path` after a subsequent successful probe
+/// (`docs/.tasks/96` Part C). Best-effort; a no-op if there was no recorded failure.
+async fn clear_probe_failure(db: &Db, path: String) -> anyhow::Result<()> {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || -> medi_db::DbResult<()> {
+        let conn = db.conn()?;
+        writes::clear_probe_failure(&conn, &path)
+    })
+    .await??;
     Ok(())
 }
 
@@ -205,6 +334,7 @@ struct Probed {
     file: DiscoveredFile,
     data: MediaFileWrite,
     audio: Vec<AudioStreamWrite>,
+    subtitles: Vec<SubtitleStreamWrite>,
 }
 
 /// Diff discovered files against `scan_state`: keep only those never seen, changed
@@ -263,9 +393,10 @@ async fn write_one(db: &Db, probed: Probed) -> anyhow::Result<()> {
 
         let owner = resolve_owner(&tx, &probed.file.class, probed.file.library_id, now)?;
         let media_file_id = writes::upsert_media_file(&tx, &path, owner, &probed.data)?;
-        // Audio tracks are a child table (Task 70); overwrite them in the same
-        // transaction so a re-probe replaces the whole set atomically.
+        // Audio + subtitle tracks are child tables (Tasks 70 / 90); overwrite them in the
+        // same transaction so a re-probe replaces each whole set atomically.
         writes::replace_audio_streams(&tx, media_file_id, &probed.audio)?;
+        writes::replace_subtitle_streams(&tx, media_file_id, &probed.subtitles)?;
         writes::mark_probed(&tx, &path, now)?;
 
         tx.commit()?;
@@ -325,14 +456,24 @@ fn now_secs() -> i64 {
 // Watch mode (sub-task 5): notify → debounced incremental re-scan.
 // ---------------------------------------------------------------------------
 
-/// Watch `media_dir` for filesystem changes and run an incremental re-scan whenever
-/// activity settles. Runs until the process exits.
+/// Watch `media_dir` for filesystem changes **and** manual scan triggers, running an
+/// incremental re-scan whenever activity settles. Runs until the process exits.
 ///
 /// `notify` fires many events for one logical change (a copy emits a burst), so events
 /// are debounced: after the last event we wait `DEBOUNCE` quiet time before scanning,
 /// coalescing a burst into a single pass. Because [`run_scan`] is idempotent, an
 /// over-eager trigger only costs a `scan_state` diff, not re-probing.
-pub async fn watch(db: Db, cfg: WorkerConfig, invalidate: Invalidator) -> anyhow::Result<()> {
+///
+/// `scan_signal` (from [`ScanTrigger::new`]) is a second event source: the API fires it on
+/// library create / `POST /api/libraries/:id/scan`, so a library pointed at already-present
+/// files is scanned immediately instead of waiting for the next fs change. Both sources feed
+/// the same debounced loop, so a trigger during a copy burst just coalesces in.
+pub async fn watch(
+    db: Db,
+    cfg: WorkerConfig,
+    invalidate: Invalidator,
+    mut scan_signal: ScanSignal,
+) -> anyhow::Result<()> {
     use notify::{RecursiveMode, Watcher};
 
     /// Quiet period after the last fs event before an incremental scan fires.
@@ -341,10 +482,11 @@ pub async fn watch(db: Db, cfg: WorkerConfig, invalidate: Invalidator) -> anyhow
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<()>();
 
     // The notify callback runs on notify's own thread; forward a tick to our task.
+    let notify_tx = evt_tx.clone();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         match res {
             Ok(event) if is_relevant(&event) => {
-                let _ = evt_tx.send(());
+                let _ = notify_tx.send(());
             }
             Ok(_) => {}
             Err(err) => tracing::warn!(error = %err, "watch error"),
@@ -353,14 +495,30 @@ pub async fn watch(db: Db, cfg: WorkerConfig, invalidate: Invalidator) -> anyhow
 
     watcher.watch(&cfg.media_dir, RecursiveMode::Recursive)?;
     tracing::info!(root = %cfg.media_dir.display(), "watching /media for changes");
+    // The watcher is live — surface it in `GET /api/status` (`docs/.tasks/96`).
+    if let Some(s) = &cfg.status {
+        s.watcher_started();
+    }
 
     // Keep the watcher alive for the lifetime of this task.
     let _watcher = watcher;
 
+    // Forward manual scan triggers (API) into the same event channel as fs events, so the
+    // one debounced loop below handles both. This task ends when either the trigger senders
+    // are all dropped or `evt_tx` is closed (worker teardown).
+    tokio::spawn(async move {
+        while scan_signal.rx.recv().await.is_some() {
+            tracing::info!("manual scan trigger received");
+            if evt_tx.send(()).is_err() {
+                break; // watch loop gone
+            }
+        }
+    });
+
     loop {
         // Block until the first event of a burst.
         if evt_rx.recv().await.is_none() {
-            break; // sender dropped → shutting down
+            break; // all senders dropped → shutting down
         }
         // Drain the burst: keep resetting the debounce timer while events keep coming.
         loop {
@@ -370,7 +528,7 @@ pub async fn watch(db: Db, cfg: WorkerConfig, invalidate: Invalidator) -> anyhow
                 Err(_) => break,                 // quiet for DEBOUNCE → scan now
             }
         }
-        tracing::info!("filesystem changed; running incremental scan");
+        tracing::info!("running incremental scan (fs change or manual trigger)");
         if let Err(err) = run_scan(&db, &cfg, &invalidate).await {
             tracing::error!(error = %err, "incremental scan failed");
         }
@@ -466,6 +624,7 @@ mod tests {
                 is_default: true,
                 ..Default::default()
             }],
+            subtitles: Vec::new(),
         }
     }
 
@@ -560,6 +719,7 @@ mod tests {
                 ..Default::default()
             },
             audio: Vec::new(),
+            subtitles: Vec::new(),
         };
         write_one(&db, probed).await.unwrap();
 
@@ -635,5 +795,19 @@ mod tests {
             "kind override forces movie: {:?}",
             discovered[0].class
         );
+    }
+
+    #[tokio::test]
+    async fn scan_trigger_delivers_and_no_ops_after_drop() {
+        // A trigger delivers a tick to the signal receiver, and after the receiver is
+        // dropped (worker not running) `trigger()` is a harmless no-op — the API can fire
+        // it fire-and-forget without caring whether ingestion is up.
+        let (trigger, mut signal) = ScanTrigger::new();
+        trigger.trigger();
+        assert!(signal.rx.recv().await.is_some(), "trigger delivers a tick");
+
+        drop(signal);
+        // No panic, no error — the closed-channel send is swallowed.
+        trigger.trigger();
     }
 }

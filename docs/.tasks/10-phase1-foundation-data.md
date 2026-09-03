@@ -52,6 +52,10 @@ backend/
    > The same `-show_streams` output also carries every **audio** stream. `70-audio-quality-and-profiles.md`
    > widens this parser (no new invocation) to persist all audio tracks into the `audio_streams`
    > table; this task remains video-only.
+   > `90-format-coverage-and-subtitles.md` widens it further (still the same invocation): it
+   > parses every **subtitle** stream into `subtitle_streams`, and recognizes a broader
+   > video/audio codec set (VC-1 / MPEG-2 / MPEG-4 / VP9 video, MP3 / Vorbis / WMA / ALAC
+   > audio) that previously collapsed to `Other`.
 5. **Watch mode** (`notify`): watch `/media` for changes to trigger incremental re-scans.
 6. **API skeleton** (`api`): implement `/api/health`, `/api/library`, `/api/movies/:id`,
    `/api/series/:id` from `02-api-contract.md`, backed by `db` + moka; run all DB calls under

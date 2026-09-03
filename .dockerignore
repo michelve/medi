@@ -6,6 +6,8 @@
 **/node_modules
 # NOTE: `client/` is intentionally NOT ignored — the web stage builds @medi/web from it.
 client/apps/*/dist
+# Windows dev loop bind-mount data (docker/compose.dev.yml, docs/.tasks/92) — never build context.
+docker/devdata
 docs
 unraid-templates
 .git

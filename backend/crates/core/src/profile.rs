@@ -12,7 +12,33 @@ pub enum VideoCodec {
     H264,
     Hevc,
     Av1,
+    // NEW (`docs/.tasks/90`) — recognized sources no TV client natively decodes; always
+    // transcoded to H.264. VP9 is the one where the host may still HW-*decode* it.
+    Vc1,
+    Mpeg2,
+    Mpeg4,
+    Vp9,
+    /// Genuinely unknown (RealMedia, etc.) — still yields a transcode, never a crash.
     Other,
+}
+
+impl VideoCodec {
+    /// Map an ffprobe `codec_name` to a typed codec (`docs/.tasks/90` §1). The single
+    /// source of truth — used by both `ingest` (normalize before persist) and
+    /// `db::MediaFile::profile()` (read back) so the mapping never drifts between them.
+    pub fn from_ffprobe(name: &str) -> Self {
+        match name {
+            "h264" => VideoCodec::H264,
+            "hevc" => VideoCodec::Hevc,
+            "av1" => VideoCodec::Av1,
+            "vc1" => VideoCodec::Vc1,
+            "mpeg2video" => VideoCodec::Mpeg2,
+            // DivX/Xvid + the MS-MPEG4 variants old rips carry.
+            "mpeg4" | "msmpeg4v2" | "msmpeg4v3" => VideoCodec::Mpeg4,
+            "vp9" => VideoCodec::Vp9,
+            _ => VideoCodec::Other,
+        }
+    }
 }
 
 /// HDR classification. `hdr_type` column in `media_files`.
@@ -72,12 +98,21 @@ pub enum AudioCodec {
     Flac,
     Opus,
     Pcm,
+    // NEW (`docs/.tasks/90`) — mainstream codecs that previously collapsed to `Other`.
+    // MP3 is universally decodable (a client default); the rest transcode by default but
+    // the enum lets a detected `AudioCapabilities` payload opt a device in.
+    Mp3,
+    Vorbis,
+    Wma,
+    /// Apple Lossless — lossless but always *decoded*, never HDMI-bitstreamed.
+    Alac,
     Other,
 }
 
 impl AudioCodec {
     /// Lossless bitstream formats that only a passthrough-capable sink plays as-is.
-    /// Apple TV cannot bitstream these; NVIDIA Shield can.
+    /// Apple TV cannot bitstream these; NVIDIA Shield can. ALAC is lossless but is
+    /// always decoded (never bitstreamed), so it is deliberately excluded here.
     pub fn is_lossless_bitstream(self) -> bool {
         matches!(self, AudioCodec::TrueHd | AudioCodec::DtsHd)
     }
@@ -91,6 +126,38 @@ pub enum ImmersiveAudio {
     None,
     DolbyAtmos,
     DtsX,
+}
+
+/// How a subtitle track can be served (`docs/.tasks/90` §5). Drives the passthrough-vtt
+/// vs burn-in split: **text** subtitles convert to WebVTT and ride as a sidecar without a
+/// video transcode; **image** subtitles (PGS / VobSub) can only be burned into the video.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubtitleFormat {
+    Text,
+    Image,
+}
+
+impl SubtitleFormat {
+    /// Classify an ffprobe subtitle `codec_name`. Text formats convert to WebVTT; image
+    /// formats must be burned in. An unknown codec defaults to **text** — a WebVTT
+    /// passthrough attempt is cheap and non-destructive, unlike a forced burn-in.
+    pub fn from_ffprobe(name: &str) -> Self {
+        match name {
+            "hdmv_pgs_subtitle" | "dvd_subtitle" | "dvdsub" | "dvb_subtitle" | "xsub" => {
+                SubtitleFormat::Image
+            }
+            _ => SubtitleFormat::Text,
+        }
+    }
+
+    /// The `subtitle_streams.format` string persisted in the DB.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubtitleFormat::Text => "text",
+            SubtitleFormat::Image => "image",
+        }
+    }
 }
 
 /// "Best available quality" control (`docs/.tasks/70`). Default is `Auto`; the client's
@@ -122,6 +189,9 @@ pub enum Platform {
     AppleTv,
     Shield,
     AndroidTv,
+    /// A desktop/mobile web browser (the SPA). Conservative codec support — see
+    /// `ClientProfile::web` — so undecodable sources transcode instead of black-screening.
+    Web,
     Unknown,
 }
 

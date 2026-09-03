@@ -23,6 +23,11 @@ dist/
 *.db-wal
 *.db-shm
 
+# Windows dev loop (docker/compose.dev.yml, docs/.tasks/92): bind-mounted media + appdata
+/docker/devdata/
+# Host-specific dev compose override (SMB mount, local paths) — never committed.
+/docker/compose.dev.override.yml
+
 # OS / editor
 .DS_Store
 Thumbs.db

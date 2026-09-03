@@ -34,8 +34,16 @@ export function SeriesDetailPage() {
   const series = state.data;
   // Seasons in order; episodes are already ordered by the backend.
   const seasons = [...series.seasons].sort((a, b) => a.season_number - b.season_number);
-  const playFile = (fileId: number) =>
-    navigate(`/play/${fileId}`, { state: { title: series.title } });
+  // Carry the title + the episode file's subtitle tracks into the player (`docs/.tasks/90`).
+  const playFile = (fileId: number) => {
+    const file = seasons
+      .flatMap((s) => s.episodes)
+      .flatMap((e) => e.media_files)
+      .find((f) => f.id === fileId);
+    navigate(`/play/${fileId}`, {
+      state: { title: series.title, subtitles: file?.subtitle_streams ?? [] },
+    });
+  };
 
   return (
     <article>

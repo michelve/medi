@@ -17,7 +17,15 @@ use std::path::{Path, PathBuf};
 /// skipped by the walk.
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mkv", "mp4", "m4v", "mov", "avi", "ts", "m2ts", "webm", "wmv", "mpg", "mpeg",
+    // NEW (`docs/.tasks/90`) — mainstream containers. No RealMedia (rm/rmvb) or raw disc
+    // images (.iso / VIDEO_TS) — those are out of scope.
+    "flv", "ogv", "ogm", "3gp", "3g2", "vob", "mk3d",
 ];
+
+/// External subtitle sidecar extensions the scanner discovers next to a video file
+/// (`docs/.tasks/90` §External sidecar discovery). `.sub` is VobSub (image, paired with a
+/// `.idx`); the rest are text.
+const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub"];
 
 /// How the scanner classified a discovered file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,6 +128,106 @@ fn is_video(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .is_some_and(|e| VIDEO_EXTENSIONS.contains(&e.as_str()))
+}
+
+/// Discover external subtitle sidecars sibling to `video_path` (`docs/.tasks/90`
+/// §External sidecar discovery). A sidecar matches when its filename stem starts with the
+/// video's stem, so `Movie (2020).mkv` picks up `Movie (2020).srt`,
+/// `Movie (2020).en.srt`, and `Movie (2020).en.forced.srt`. The trailing tokens after the
+/// video stem are parsed for an optional ISO-639 `.<lang>` and a `.forced` marker.
+///
+/// Discovery is **filename-only** — no ffprobe pass on the sidecar — and sidecars are
+/// never written (they live under `/media`, read-only). Returns one
+/// [`SubtitleStreamWrite`] per matched sidecar (`is_external = true`), ready to persist
+/// alongside the file's embedded subtitle tracks.
+pub fn discover_sidecars(
+    video_path: &Path,
+) -> Vec<medi_db::writes::SubtitleStreamWrite> {
+    let Some(dir) = video_path.parent() else {
+        return Vec::new();
+    };
+    let Some(video_stem) = video_path.file_stem().and_then(|s| s.to_str()) else {
+        return Vec::new();
+    };
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let ext = ext.to_ascii_lowercase();
+        if !SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
+            continue;
+        }
+        let Some(sub_stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // The sidecar must belong to *this* video: its stem starts with the video stem.
+        // The remainder (`.en`, `.en.forced`, or "") carries the language / forced tokens.
+        let Some(rest) = sub_stem.strip_prefix(video_stem) else {
+            continue;
+        };
+        let (language, is_forced) = parse_sidecar_tokens(rest);
+        // `.sub` is VobSub (image, paired with a `.idx`); the text formats become WebVTT.
+        let format = if ext == "sub" {
+            medi_core::SubtitleFormat::Image
+        } else {
+            medi_core::SubtitleFormat::Text
+        };
+        out.push(medi_db::writes::SubtitleStreamWrite {
+            stream_index: None,
+            codec: Some(sidecar_codec(&ext).to_string()),
+            format: format.as_str().to_string(),
+            language,
+            title: None,
+            is_default: false,
+            is_forced,
+            is_external: true,
+            external_path: Some(path.to_string_lossy().into_owned()),
+        });
+    }
+    // Stable ordering so a re-scan writes the same set in the same order.
+    out.sort_by(|a, b| a.external_path.cmp(&b.external_path));
+    out
+}
+
+/// The ffprobe-style codec name for a sidecar extension (so the serving route knows how
+/// to convert it): `.srt` → `subrip`, `.vtt` → `webvtt`, `.sub` → VobSub image.
+fn sidecar_codec(ext: &str) -> &'static str {
+    match ext {
+        "srt" => "subrip",
+        "ass" => "ass",
+        "ssa" => "ssa",
+        "vtt" => "webvtt",
+        "sub" => "dvd_subtitle",
+        _ => "subrip",
+    }
+}
+
+/// Parse the tokens trailing a sidecar's video-stem prefix into `(language, is_forced)`.
+/// `rest` is e.g. `""`, `".en"`, `".en.forced"`, `".forced"`. A 2–3 char alpha token is
+/// taken as an ISO-639 language; a `forced` token sets the forced flag.
+fn parse_sidecar_tokens(rest: &str) -> (Option<String>, bool) {
+    let mut language = None;
+    let mut is_forced = false;
+    for tok in rest.split('.').filter(|t| !t.is_empty()) {
+        let lower = tok.to_ascii_lowercase();
+        if lower == "forced" {
+            is_forced = true;
+        } else if (2..=3).contains(&lower.len()) && lower.chars().all(|c| c.is_ascii_alphabetic()) {
+            language = Some(lower);
+        }
+    }
+    (language, is_forced)
 }
 
 /// Stat and classify one file into a [`DiscoveredFile`]. `None` if it cannot be
@@ -583,5 +691,58 @@ mod tests {
         assert!(is_video(&PathBuf::from("/media/a.mp4")));
         assert!(!is_video(&PathBuf::from("/media/a.srt")));
         assert!(!is_video(&PathBuf::from("/media/a.nfo")));
+    }
+
+    #[test]
+    fn widened_containers_are_ingested() {
+        // Task 90 container widening — .flv / .vob / .3gp etc. are now discovered.
+        assert!(is_video(&PathBuf::from("/media/a.flv")));
+        assert!(is_video(&PathBuf::from("/media/a.vob")));
+        assert!(is_video(&PathBuf::from("/media/a.3gp")));
+        assert!(is_video(&PathBuf::from("/media/a.mk3d")));
+        // Out of scope: RealMedia / disc images stay unrecognized.
+        assert!(!is_video(&PathBuf::from("/media/a.rmvb")));
+        assert!(!is_video(&PathBuf::from("/media/a.iso")));
+    }
+
+    #[test]
+    fn parse_sidecar_tokens_reads_lang_and_forced() {
+        assert_eq!(parse_sidecar_tokens(""), (None, false));
+        assert_eq!(parse_sidecar_tokens(".en"), (Some("en".into()), false));
+        assert_eq!(parse_sidecar_tokens(".forced"), (None, true));
+        assert_eq!(parse_sidecar_tokens(".en.forced"), (Some("en".into()), true));
+        assert_eq!(parse_sidecar_tokens(".eng"), (Some("eng".into()), false));
+    }
+
+    #[test]
+    fn discover_sidecars_matches_stem_and_parses_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // The video and three matching sidecars, plus one unrelated sidecar.
+        std::fs::write(dir.join("Movie (2020).mkv"), b"x").unwrap();
+        std::fs::write(dir.join("Movie (2020).srt"), b"x").unwrap();
+        std::fs::write(dir.join("Movie (2020).en.forced.srt"), b"x").unwrap();
+        std::fs::write(dir.join("Movie (2020).sub"), b"x").unwrap();
+        std::fs::write(dir.join("Other Movie.srt"), b"x").unwrap();
+
+        let subs = discover_sidecars(&dir.join("Movie (2020).mkv"));
+        assert_eq!(subs.len(), 3, "only the three matching sidecars: {subs:?}");
+        assert!(subs.iter().all(|s| s.is_external && s.stream_index.is_none()));
+
+        let forced = subs
+            .iter()
+            .find(|s| s.external_path.as_deref().unwrap().ends_with("en.forced.srt"))
+            .unwrap();
+        assert_eq!(forced.language.as_deref(), Some("en"));
+        assert!(forced.is_forced);
+        assert_eq!(forced.format, "text");
+        assert_eq!(forced.codec.as_deref(), Some("subrip"));
+
+        // The VobSub .sub sidecar is classified image.
+        let vobsub = subs
+            .iter()
+            .find(|s| s.external_path.as_deref().unwrap().ends_with(".sub"))
+            .unwrap();
+        assert_eq!(vobsub.format, "image");
     }
 }

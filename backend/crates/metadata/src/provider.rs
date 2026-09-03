@@ -86,6 +86,40 @@ pub struct CreditIn {
     /// The character played, for actors. `None` for crew.
     pub character: Option<String>,
     pub ord: i64,
+    /// The provider's person id, when known — the link-out enrichment uses to fetch the
+    /// person's bio + headshot (`docs/.tasks/91` Phase B). `None` for a provider without
+    /// person ids (OMDb) so a name-only credit still writes. TMDB fills it from the
+    /// `credits.cast[].id` / `credits.crew[].id` already present in the details response.
+    pub person_tmdb_id: Option<i64>,
+}
+
+/// A TMDB genre (`{ id, name }`) parsed from the same `details()` response the pipeline
+/// already fetches — no extra request (`docs/.tasks/91` Phase A). `tmdb_id` is TMDB's
+/// stable genre id ("Science Fiction" = 878); `name` is display text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Genre {
+    pub tmdb_id: i64,
+    pub name: String,
+}
+
+/// A TMDB collection (franchise) a movie belongs to, from `belongs_to_collection` in the
+/// same `details()` response (Task 91 detail extensions — no extra request). `poster_url` is
+/// absolute + provider-resolved so enrichment can download the collection art like a poster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Collection {
+    pub tmdb_id: i64,
+    pub name: String,
+    pub poster_url: Option<String>,
+}
+
+/// A trailer/teaser video for a title, from TMDB `videos` (appended to the `details()`
+/// response). Only YouTube-hosted videos are kept — the only site the client embeds. `key`
+/// is the YouTube video id; `kind` is TMDB's `type` ("Trailer" / "Teaser" / …).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailerIn {
+    pub youtube_key: String,
+    pub name: Option<String>,
+    pub kind: Option<String>,
 }
 
 /// The full descriptive metadata for one matched title, ready to write to the catalog.
@@ -101,6 +135,29 @@ pub struct Details {
     pub backdrop_url: Option<String>,
     pub imdb_id: Option<String>,
     pub tmdb_id: Option<i64>,
+    /// TMDB genres, parsed from the same `details()` response (`docs/.tasks/91` Phase A).
+    /// Empty for a provider without genres (OMDb) — the enrichment write then leaves the
+    /// title with no genre rows, exactly as today.
+    pub genres: Vec<Genre>,
+    /// The franchise this title belongs to (TMDB `belongs_to_collection`), or `None`. Only
+    /// TMDB movies carry one; OMDb and TV leave it `None`.
+    pub collection: Option<Collection>,
+    /// Trailer/teaser videos (TMDB `videos`), best-first. Empty for a provider without
+    /// videos (OMDb) or a title with none.
+    pub trailers: Vec<TrailerIn>,
+}
+
+/// A person's descriptive metadata (`docs/.tasks/91` Phase B), fetched by
+/// [`MetadataProvider::person_details`]. `photo_url` is absolute and provider-resolved (the
+/// TMDB profile-image base applied) so [`crate::enrich`] can download it without knowing the
+/// provider, exactly like a poster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersonDetails {
+    pub tmdb_id: i64,
+    pub name: String,
+    pub biography: Option<String>,
+    /// Absolute URL of the headshot, or `None` when the person has no profile image.
+    pub photo_url: Option<String>,
 }
 
 /// A pluggable source of descriptive metadata. Implemented by [`crate::tmdb::TmdbProvider`]
@@ -122,6 +179,14 @@ pub trait MetadataProvider: Send + Sync {
 
     /// Fetch the full details of a specific candidate.
     async fn details(&self, id: &ProviderId) -> Result<Details>;
+
+    /// Fetch a person's bio + headshot by the provider's person id (`docs/.tasks/91`
+    /// Phase B). The default returns `Ok(None)` for providers without a people endpoint
+    /// (OMDb), so enrichment simply writes a name-only credit for them.
+    async fn person_details(&self, person_tmdb_id: i64) -> Result<Option<PersonDetails>> {
+        let _ = person_tmdb_id;
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

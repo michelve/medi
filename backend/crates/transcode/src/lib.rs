@@ -31,8 +31,8 @@ pub mod session;
 pub use caps::HwCaps;
 pub use command::{AudioTarget, PLAYLIST_NAME};
 pub use decision::{
-    audio_plan, decide, AudioPlan, AudioTrack, ClientProfile, Decision, Quality, TranscodeTarget,
-    Vendor,
+    audio_plan, decide, AudioPlan, AudioTrack, ClientProfile, Decision, Quality, SubtitlePlan,
+    TranscodeTarget, Vendor,
 };
 // `AudioCodec` is promoted to `medi-core` (`docs/.tasks/70`); re-export here so existing
 // `medi_transcode::AudioCodec` paths keep working after the move.

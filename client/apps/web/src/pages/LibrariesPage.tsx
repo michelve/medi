@@ -26,6 +26,10 @@ export function LibrariesPage() {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
+  // Backfill (refresh metadata & artwork) state.
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillMsg, setBackfillMsg] = useState<string | null>(null);
+
   const refresh = useCallback(() => {
     const controller = new AbortController();
     api
@@ -63,15 +67,51 @@ export function LibrariesPage() {
     }
   };
 
+  const backfill = async () => {
+    if (backfilling) return;
+    setBackfilling(true);
+    setBackfillMsg(null);
+    try {
+      const res = await api.backfillMetadata();
+      setBackfillMsg(
+        res.already_running
+          ? 'A refresh is already running.'
+          : 'Refresh started — new artwork and metadata will appear as it completes.',
+      );
+    } catch (err) {
+      // A 501 means no metadata provider (TMDB) is configured.
+      const msg =
+        err instanceof ApiError && err.status === 501
+          ? 'Metadata is disabled — set a TMDB API key to enable enrichment.'
+          : err instanceof ApiError
+            ? err.message
+            : String(err);
+      setBackfillMsg(msg);
+    } finally {
+      setBackfilling(false);
+    }
+  };
+
   if (libraries === null && error === null) return <Loading label="Loading libraries…" />;
   if (error && libraries === null) return <ErrorState message={error} />;
 
   return (
     <section style={{ maxWidth: 760 }}>
       <h1 style={{ fontSize: 24, margin: '0 0 4px' }}>Libraries</h1>
-      <p style={{ color: theme.colors.textMuted, margin: '0 0 24px', fontSize: 14 }}>
+      <p style={{ color: theme.colors.textMuted, margin: '0 0 16px', fontSize: 14 }}>
         Add a folder under your media root, then rescan to populate the grid.
       </p>
+
+      {/* Library-wide metadata refresh: fill genres, collections, and fanart logos/wallpapers
+          for already-matched titles that predate a feature or a newly-added API key. */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
+        <button type="button" onClick={backfill} disabled={backfilling} style={secondaryBtn}>
+          {backfilling ? 'Refreshing…' : 'Refresh metadata & artwork'}
+        </button>
+        {backfillMsg && (
+          <span style={{ fontSize: 13, color: theme.colors.textMuted }}>{backfillMsg}</span>
+        )}
+      </div>
 
       {/* Create form */}
       <div
@@ -152,4 +192,14 @@ const primaryBtn: React.CSSProperties = {
   cursor: 'pointer',
   color: '#fff',
   background: theme.colors.accent,
+};
+const secondaryBtn: React.CSSProperties = {
+  padding: '8px 16px',
+  borderRadius: 8,
+  border: `1px solid ${theme.colors.accent}`,
+  fontSize: 14,
+  fontWeight: 600,
+  cursor: 'pointer',
+  color: theme.colors.accent,
+  background: 'transparent',
 };

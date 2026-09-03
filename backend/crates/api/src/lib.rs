@@ -12,6 +12,7 @@ pub mod error;
 pub mod libraries;
 pub mod routes;
 pub mod state;
+pub mod status;
 
-pub use routes::router;
+pub use routes::{router, spawn_backfill};
 pub use state::AppState;

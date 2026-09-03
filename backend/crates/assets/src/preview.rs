@@ -229,11 +229,13 @@ fn filter_graph(vendor: Option<Vendor>, hdr: bool) -> Option<String> {
              scale=-2:{TARGET_HEIGHT}"
         ),
         (None, false) => format!("scale=-2:{TARGET_HEIGHT}"),
-        // Intel: VPP scales (and tone-maps when HDR) on the GPU.
+        // Intel: VPP scales (and tone-maps when HDR) on the GPU. `vpp_qsv` only accepts `-1`
+        // for auto-dimension (unlike software `scale`'s `-2`); `w=-2` errors with
+        // "Size values less than -1 are not acceptable" and the encode writes nothing.
         (Some(Vendor::Intel), true) => {
-            format!("vpp_qsv=tonemap=1:w=-2:h={TARGET_HEIGHT}:format=nv12")
+            format!("vpp_qsv=tonemap=1:w=-1:h={TARGET_HEIGHT}:format=nv12")
         }
-        (Some(Vendor::Intel), false) => format!("vpp_qsv=w=-2:h={TARGET_HEIGHT}"),
+        (Some(Vendor::Intel), false) => format!("vpp_qsv=w=-1:h={TARGET_HEIGHT}"),
         // NVIDIA: CUDA tone-map then scale, or scale_cuda alone.
         (Some(Vendor::Nvidia), true) => format!(
             "tonemap_cuda=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709,\
@@ -347,5 +349,17 @@ mod tests {
         let s = joined(&argv(Some(Vendor::Intel), false));
         assert!(s.contains("h264_qsv"));
         assert!(!s.contains("tonemap"));
+    }
+
+    #[test]
+    fn intel_vpp_uses_minus_one_auto_width_not_minus_two() {
+        // `vpp_qsv` rejects `-2` ("Size values less than -1 are not acceptable"); it must be
+        // `-1` for auto-width. Assert both the SDR and HDR Intel filter graphs use `w=-1`.
+        for hdr in [false, true] {
+            let g = filter_graph(Some(Vendor::Intel), hdr).unwrap();
+            assert!(g.contains("vpp_qsv"), "intel uses vpp_qsv: {g}");
+            assert!(g.contains("w=-1"), "vpp_qsv auto-width must be -1: {g}");
+            assert!(!g.contains("w=-2"), "vpp_qsv must not use -2: {g}");
+        }
     }
 }

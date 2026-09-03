@@ -160,6 +160,8 @@ pub fn parse_details(v: &Value) -> Result<Details> {
                     role: "actor".to_string(),
                     character: None,
                     ord: i as i64,
+                    // OMDb has no person ids — a name-only credit still writes.
+                    person_tmdb_id: None,
                 });
             }
         }
@@ -179,6 +181,7 @@ pub fn parse_details(v: &Value) -> Result<Details> {
                     role: "director".to_string(),
                     character: None,
                     ord: base + i as i64,
+                    person_tmdb_id: None,
                 });
             }
         }
@@ -192,6 +195,11 @@ pub fn parse_details(v: &Value) -> Result<Details> {
         backdrop_url: None,
         imdb_id,
         tmdb_id: None,
+        // OMDb has no genres in the shape we use — the title gets no genre rows.
+        genres: Vec::new(),
+        // OMDb exposes no collection/franchise or video data.
+        collection: None,
+        trailers: Vec::new(),
     })
 }
 

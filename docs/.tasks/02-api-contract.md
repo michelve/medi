@@ -19,6 +19,9 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
   **audio** half of that decision and the client capability hints (`platform`,
   `max_channels`, `audio`, `atmos`, `max_bitrate`, `quality`) are specified in
   `70-audio-quality-and-profiles.md`; the `MediaFile` detail carries an `audio_streams` list.
+  Subtitle handling (`GET /api/subtitles/:file_id/:index.vtt`, the `sub` / `sub_burn` stream
+  params, and the `subtitle_streams` list on the `MediaFile` detail) is specified in
+  `90-format-coverage-and-subtitles.md`.
 - Transcoded output is HLS (playlist + segments) produced by the `transcode` crate.
 - Generated assets (`/config/previews`, `/config/trickplay`) are served by dedicated routes.
 - **`/` (and any non-`/api` path) serves the browser SPA** (`client/apps/web`) via a static
@@ -39,8 +42,9 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
 | `GET /api/library?cursor=&limit=&sort=` | Paginated unified catalog (movies + series cards) | Keyset cursor; `sort=sort_title\|added_at`. Cached. |
 | `GET /api/movies/:id` | Movie detail + media_files + credits | Cached; ETag. |
 | `GET /api/series/:id` | Series detail + seasons + episodes + credits | Cached; ETag. |
-| `GET /api/stream/:file_id` | Playback decision for a media file | Returns `{ "mode": "direct" \| "hls", "url": ... }`. Client hints: `hdr`, `dv`, `sdr` (video) plus `platform`, `max_channels`, `audio`, `atmos`, `max_bitrate`, `quality` (audio + capability negotiation — see `70-audio-quality-and-profiles.md`). |
+| `GET /api/stream/:file_id` | Playback decision for a media file | Returns `{ "mode": "direct" \| "hls", "url": ... }`. Client hints: `hdr`, `dv`, `sdr` (video) plus `platform`, `max_channels`, `audio`, `atmos`, `max_bitrate`, `quality` (audio + capability negotiation — see `70-audio-quality-and-profiles.md`), plus `sub` / `sub_burn` for image-subtitle burn-in (see `90-format-coverage-and-subtitles.md`). |
 | `GET /api/direct/:file_id` | Direct-play byte-range stream of the source | Supports `Range`; no transcode. |
+| `GET /api/subtitles/:file_id/:index.vtt` | A text subtitle track as WebVTT | `:index` is the embedded `stream_index`, or `ext<id>` for an external sidecar. Embedded/SRT/ASS convert + cache under `/config/subs`; external `.vtt` served directly. `415` for an image track (request a burn-in instead). (`90-format-coverage-and-subtitles.md`) |
 | `GET /api/hls/:session_id/index.m3u8` | HLS master/media playlist for a transcode session | Session created by `/api/stream`. |
 | `GET /api/hls/:session_id/:segment.ts` | HLS media segment | Served as generated. |
 | `GET /api/preview/:file_id` | 720p silent hover clip (mp4) | From `/config/previews`; 404 if not yet generated. |

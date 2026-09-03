@@ -12,9 +12,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { usePlayerControls } from '@medi/player/usePlayerControls';
 import type { TrickplayMeta } from '@medi/player/trickplay';
-import { ApiError } from '@medi/api-client';
+import { ApiError, type SubtitleStream } from '@medi/api-client';
 import { useApi } from '../api';
-import { VideoPlayer } from '../components/VideoPlayer';
+import { VideoPlayer, type WebTextTrack } from '../components/VideoPlayer';
 import { PlayerControls } from '../components/PlayerControls';
 import { NotFound } from '../components/Status';
 import { theme } from '../theme';
@@ -25,14 +25,41 @@ export function PlayerPage() {
   const location = useLocation();
   const api = useApi();
   const id = Number(fileId);
-  // Detail pages pass a friendly title through router state; fall back to the file id.
-  const navTitle = (location.state as { title?: string } | null)?.title;
+  // Detail pages pass a friendly title + the file's subtitle tracks through router state;
+  // both fall back gracefully on a deep link (no state).
+  const navState = location.state as
+    | { title?: string; subtitles?: SubtitleStream[] }
+    | null;
+  const navTitle = navState?.title;
+
+  // Text subtitles → WebVTT `<track>`s (`docs/.tasks/90`). Image tracks are burned in
+  // server-side and never listed here. A forced/default track is shown by default.
+  const textTracks = useMemo<WebTextTrack[]>(() => {
+    const subs = navState?.subtitles ?? [];
+    return subs
+      .filter((s) => s.format === 'text')
+      .map((s) => {
+        const index = s.is_external ? `ext${s.id}` : String(s.stream_index);
+        return {
+          src: api.subtitleUrl(id, index),
+          srclang: s.language ?? 'und',
+          label: s.title ?? subtitleLabel(s),
+          default: s.is_default || s.is_forced,
+        };
+      });
+    // `id`/`api` are stable for the page; recompute only if the nav subtitles change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, id, navState?.subtitles]);
 
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const [trickplay, setTrickplay] = useState<TrickplayMeta | undefined>(undefined);
 
-  // The reducer commits seeks / play / pause onto the <video> element.
+  // The reducer commits seeks / play / pause onto the <video> element. `reflectFromEvents`
+  // lets the element's own play/pause events drive the UI play-state (the browser autostarts
+  // via `video.play()`), keeping the two in lockstep and avoiding the mount desync that left
+  // the video paused on a black first frame.
   const controls = usePlayerControls({
+    reflectFromEvents: true,
     onSeek: (positionMs) => {
       if (videoElRef.current) videoElRef.current.currentTime = positionMs / 1000;
     },
@@ -140,7 +167,7 @@ export function PlayerPage() {
         onPointerMove={showOverlay}
         onClick={() => handleRemote('playPause')}
       >
-        <VideoPlayer fileId={id} onVideoRef={handleVideoRef} />
+        <VideoPlayer fileId={id} onVideoRef={handleVideoRef} textTracks={textTracks} />
         {/* Controls overlay: its own buttons/scrub bar must not bubble a click up to the
             video-area play-toggle, so stop propagation at this boundary. */}
         <div style={{ position: 'absolute', inset: 0 }} onClick={(e) => e.stopPropagation()}>
@@ -149,4 +176,13 @@ export function PlayerPage() {
       </div>
     </section>
   );
+}
+
+/**
+ * A caption-menu label for a subtitle track with no explicit title (`docs/.tasks/90`):
+ * uppercased language, marked `(forced)` for a forced track, else a generic fallback.
+ */
+function subtitleLabel(s: SubtitleStream): string {
+  const lang = s.language ? s.language.toUpperCase() : 'Subtitles';
+  return s.is_forced ? `${lang} (forced)` : lang;
 }

@@ -107,6 +107,14 @@ pub async fn create_library(
 
     // A new library changes what the catalog contains once scanned → drop cached pages.
     state.cache.invalidate_all();
+
+    // Ask the ingest worker to scan now so a library pointed at already-present files is
+    // populated immediately, without waiting for the next filesystem change or restart.
+    if let Some(trigger) = &state.scan_trigger {
+        trigger.trigger();
+        tracing::info!(library_id = id, "library created; requested immediate scan");
+    }
+
     let created_lib = run_blocking(&state.db, move |conn| queries::get_library(conn, id)).await?;
     Ok((axum::http::StatusCode::CREATED, Json(created_lib)).into_response())
 }
@@ -171,20 +179,26 @@ pub async fn delete_library(
     Ok(axum::http::StatusCode::NO_CONTENT.into_response())
 }
 
-/// `POST /api/libraries/:id/scan` — trigger an immediate scan of one library.
+/// `POST /api/libraries/:id/scan` — trigger an immediate scan.
 ///
-/// Phase B ships the endpoint and its 404/kind plumbing; the actual multi-root rescan is
-/// driven by the ingest worker's watch loop (a scan is already incremental + idempotent).
-/// Returns `202 Accepted` to signal the scan was enqueued, matching the fire-and-forget
-/// posture of the background worker.
+/// Signals the ingest worker to run an incremental scan now, rather than waiting for a
+/// filesystem change. A scan is multi-root, incremental, and idempotent (`run_scan` diffs
+/// against `scan_state`), so it picks up files added to *any* library folder — the per-id
+/// route is the UI's per-library "Rescan" button; the scan itself is library-wide and cheap
+/// when nothing changed. Returns `202 Accepted` (fire-and-forget) — the worker debounces and
+/// runs it shortly after. `404` if the library does not exist. When ingestion isn't running
+/// (no MEDIA_DIR), it still `202`s but no scan happens (nothing to scan).
 pub async fn scan_library(
     State(state): State<AppState>,
     AxPath(id): AxPath<i64>,
 ) -> ApiResult<Response> {
     run_blocking(&state.db, move |conn| queries::get_library(conn, id)).await?;
-    // The worker owns scanning; here we only acknowledge. A future enhancement can push
-    // an explicit "scan library N now" signal onto the worker's channel.
-    tracing::info!(library_id = id, "manual library scan requested");
+    if let Some(trigger) = &state.scan_trigger {
+        trigger.trigger();
+        tracing::info!(library_id = id, "manual library scan requested → worker triggered");
+    } else {
+        tracing::info!(library_id = id, "scan requested but ingestion is not running");
+    }
     Ok(axum::http::StatusCode::ACCEPTED.into_response())
 }
 

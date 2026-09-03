@@ -119,6 +119,11 @@ CREATE TABLE media_files (
     -- lossless+lossy), so audio lives in the child `audio_streams` table added by
     -- `V4__audio_streams.sql` (task `70-audio-quality-and-profiles.md`). media_files
     -- stays the 1:1 home for the single primary VIDEO stream. Do not add audio columns here.
+    -- NOTE: subtitles are NOT stored here either. A file has 1..N subtitle tracks
+    -- (embedded commentary/foreign/forced tracks + external sidecars), so subtitles live in
+    -- the child `subtitle_streams` table added by `V5__subtitle_streams.sql`
+    -- (task `90-format-coverage-and-subtitles.md`), for the same 1:N reason as audio.
+    -- Do not add subtitle columns here.
 );
 
 CREATE TABLE people (

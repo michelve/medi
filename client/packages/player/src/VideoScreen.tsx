@@ -42,6 +42,24 @@ interface VideoSource {
   /** `'m3u8'` for HLS; omitted for a direct progressive/byte-range source. */
   type?: 'm3u8';
 }
+/**
+ * A WebVTT sidecar subtitle for react-native-video's `textTracks` (`docs/.tasks/90`).
+ * `uri` points at `GET /api/subtitles/:file_id/:index.vtt`; both AVPlayer and ExoPlayer
+ * consume `text/vtt` this way, so a **text** subtitle shows on a direct-played file with
+ * no video transcode. Image subtitles are burned in upstream (in the stream decision), so
+ * they never appear here.
+ */
+export interface TextTrack {
+  title: string;
+  language: string;
+  type: 'text/vtt';
+  uri: string;
+}
+/** react-native-video's selected-text-track selector (by index into `textTracks`). */
+interface SelectedTextTrack {
+  type: 'index' | 'disabled';
+  value?: number;
+}
 interface VideoProgress {
   currentTime: number; // seconds
   seekableDuration?: number;
@@ -59,6 +77,9 @@ type VideoComponent = React.ComponentType<{
   paused?: boolean;
   resizeMode?: 'cover' | 'contain' | 'stretch' | 'none';
   progressUpdateInterval?: number;
+  /** WebVTT sidecar subtitles (`docs/.tasks/90`) — text tracks shown without a transcode. */
+  textTracks?: TextTrack[];
+  selectedTextTrack?: SelectedTextTrack;
   onLoad?: (data: VideoLoad) => void;
   onProgress?: (data: VideoProgress) => void;
   onError?: (e: unknown) => void;
@@ -77,6 +98,17 @@ try {
 export interface ResolvedStream {
   uri: string;
   isHls: boolean;
+  /**
+   * WebVTT sidecar subtitles to attach (`docs/.tasks/90`). The host builds these from the
+   * file's `subtitle_streams` (text tracks → `client.subtitleUrl(fileId, index)`). Image
+   * tracks are handled by the stream decision (burn-in), never here.
+   */
+  textTracks?: TextTrack[];
+  /**
+   * Index into `textTracks` to show by default (e.g. a forced or default track), or
+   * omitted / `-1` for none.
+   */
+  defaultTextTrack?: number;
 }
 
 export interface VideoScreenProps {
@@ -105,7 +137,12 @@ export interface VideoScreenProps {
 
 type Phase =
   | { kind: 'loading' }
-  | { kind: 'ready'; source: VideoSource }
+  | {
+      kind: 'ready';
+      source: VideoSource;
+      textTracks?: TextTrack[];
+      defaultTextTrack?: number;
+    }
   | { kind: 'error'; message: string; busy: boolean };
 
 export function VideoScreen({
@@ -128,6 +165,8 @@ export function VideoScreen({
         setPhase({
           kind: 'ready',
           source: s.isHls ? { uri: s.uri, type: 'm3u8' } : { uri: s.uri },
+          textTracks: s.textTracks,
+          defaultTextTrack: s.defaultTextTrack,
         });
       })
       .catch((e: unknown) => {
@@ -202,6 +241,12 @@ export function VideoScreen({
           paused={!controls.isPlaying}
           resizeMode="contain"
           progressUpdateInterval={500}
+          textTracks={phase.textTracks}
+          selectedTextTrack={
+            phase.textTracks && phase.textTracks.length && phase.defaultTextTrack != null
+              ? { type: 'index', value: phase.defaultTextTrack }
+              : { type: 'disabled' }
+          }
           onLoad={onLoad}
           onProgress={onProgress}
           onError={onError}

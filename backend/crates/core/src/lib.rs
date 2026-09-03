@@ -13,5 +13,5 @@ pub use config::AppConfig;
 pub use error::{Error, Result};
 pub use profile::{
     AudioCodec, ClientCapabilities, DvProfile, HdrType, ImmersiveAudio, MediaProfile, Platform,
-    QualityProfile, VideoCodec,
+    QualityProfile, SubtitleFormat, VideoCodec,
 };
