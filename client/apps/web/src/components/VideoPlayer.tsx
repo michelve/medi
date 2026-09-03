@@ -192,30 +192,37 @@ export function VideoPlayer({
       };
     }
 
-    // HLS. Prefer native (Safari); else hls.js.
+    // HLS. IMPORTANT: prefer hls.js (MSE) wherever it is supported, and only fall back to the
+    // browser's *native* HLS when hls.js is NOT supported (real Safari / iOS).
+    //
+    // Chromium (Chrome/Edge) reports `canPlayType('application/vnd.apple.mpegurl') === 'maybe'`
+    // but its "native HLS" is a lie: it hands the .m3u8 straight to the <video> element, which
+    // tries to demux the PLAYLIST TEXT as a media file and fails with
+    // `MEDIA_ERR_SRC_NOT_SUPPORTED / DEMUXER_ERROR_COULD_NOT_PARSE`. So `canPlayType` must NOT
+    // gate the native path — `Hls.isSupported()` (MSE present) does. hls.js is the default on
+    // every MSE browser; native HLS is the fallback only for Safari, which lacks MSE for fMP4.
     const hlsUrl = api.hlsUrl(decision);
-    const nativeHls = video.canPlayType('application/vnd.apple.mpegurl');
-    if (nativeHls) {
-      diag.info('hls', 'using native HLS (Safari)', { canPlayType: nativeHls, url: hlsUrl });
-      video.src = hlsUrl;
-      void startPlayback(video);
-      return () => {
-        detachVideoEvents();
-        video.removeAttribute('src');
-        video.load();
-      };
-    }
 
     // hls.js is loaded on demand (dynamic import) so it stays OUT of the browse bundle —
     // only the player route pulls it. `cancelled`/`instance` bridge the async gap so the
     // effect cleanup can still destroy whatever got created.
     let cancelled = false;
     let instance: import('hls.js').default | null = null;
+    let nativeSrcSet = false;
     diag.info('hls', 'loading hls.js', { url: hlsUrl });
     void import('hls.js').then(({ default: Hls }) => {
       if (cancelled) return;
       if (!Hls.isSupported()) {
-        diag.error('hls', 'Hls.isSupported() = false (no MSE)');
+        // No MSE — this is Safari/iOS. Use the browser's genuine native HLS support.
+        const native = video.canPlayType('application/vnd.apple.mpegurl');
+        if (native) {
+          diag.info('hls', 'no MSE → native HLS (Safari)', { canPlayType: native, url: hlsUrl });
+          video.src = hlsUrl;
+          nativeSrcSet = true;
+          void startPlayback(video);
+          return;
+        }
+        diag.error('hls', 'no MSE and no native HLS — cannot play');
         setPhase({
           kind: 'error',
           message: 'This browser cannot play the transcoded (HLS) stream.',
@@ -251,6 +258,11 @@ export function VideoPlayer({
       cancelled = true;
       detachVideoEvents();
       instance?.destroy();
+      // Native-HLS (Safari) path: clear the src we set so a re-resolve starts clean.
+      if (nativeSrcSet) {
+        video.removeAttribute('src');
+        video.load();
+      }
     };
   }, [api, fileId, phase, diag]);
 
