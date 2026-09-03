@@ -25,8 +25,8 @@
 use serde::{Deserialize, Serialize};
 
 use medi_core::{
-    AudioCodec, ClientCapabilities, HdrType, ImmersiveAudio, MediaProfile, Platform, QualityProfile,
-    VideoCodec,
+    AudioCodec, ClientCapabilities, DvProfile, HdrType, ImmersiveAudio, MediaProfile, Platform,
+    QualityProfile, VideoCodec,
 };
 
 use crate::caps::HwCaps;
@@ -86,6 +86,19 @@ pub struct ClientProfile {
     pub atmos_passthrough: bool,
     /// Containers the client can open directly (for the direct-play remux decision).
     pub containers: Vec<String>,
+    /// Whether the client can itself remux a direct byte stream — i.e. cope when only the
+    /// **container** or **audio codec** differs while the video is copyable (`/api/direct`
+    /// serves the raw file untouched). Native players (Apple TV / Android TV / Shield) do this
+    /// internally; a browser `<video>` element cannot, so a browser must instead be handed a
+    /// server-side transcode. `false` promotes a would-be `DirectPlay { remux: true }` to a
+    /// real transcode in [`decide`]. Defaults to `true` for the TV profiles.
+    #[serde(default = "yes")]
+    pub can_remux_direct: bool,
+}
+
+/// serde default for [`ClientProfile::can_remux_direct`] on payloads that predate the field.
+fn yes() -> bool {
+    true
 }
 
 impl ClientProfile {
@@ -102,10 +115,17 @@ impl ClientProfile {
             bit_depth_10: true,
             hdr_display: true,
             dolby_vision: true,
-            audio_codecs: vec![AudioCodec::Aac, AudioCodec::Ac3, AudioCodec::Eac3],
+            // MP3 is universally decodable (`docs/.tasks/90` §4).
+            audio_codecs: vec![
+                AudioCodec::Aac,
+                AudioCodec::Ac3,
+                AudioCodec::Eac3,
+                AudioCodec::Mp3,
+            ],
             max_channels: 8,
             atmos_passthrough: true,
             containers: vec!["mp4".into(), "mov".into(), "m4v".into(), "hls".into()],
+            can_remux_direct: true,
         }
     }
 
@@ -125,16 +145,20 @@ impl ClientProfile {
                 AudioCodec::Dts,
                 AudioCodec::DtsHd,
                 AudioCodec::TrueHd,
+                AudioCodec::Mp3,
             ],
             max_channels: 8,
             atmos_passthrough: true,
+            // `ts` (MPEG-TS): ExoPlayer opens it directly (`docs/.tasks/90` §2).
             containers: vec![
                 "mp4".into(),
                 "mov".into(),
                 "m4v".into(),
                 "mkv".into(),
+                "ts".into(),
                 "hls".into(),
             ],
+            can_remux_direct: true,
         }
     }
 
@@ -147,10 +171,16 @@ impl ClientProfile {
             bit_depth_10: true,
             hdr_display: false,
             dolby_vision: false,
-            audio_codecs: vec![AudioCodec::Aac, AudioCodec::Ac3, AudioCodec::Eac3],
+            audio_codecs: vec![
+                AudioCodec::Aac,
+                AudioCodec::Ac3,
+                AudioCodec::Eac3,
+                AudioCodec::Mp3,
+            ],
             max_channels: 2,
             atmos_passthrough: false,
             containers: vec!["mp4".into(), "mkv".into(), "hls".into()],
+            can_remux_direct: true,
         }
     }
 
@@ -166,6 +196,35 @@ impl ClientProfile {
             max_channels: 2,
             atmos_passthrough: false,
             containers: vec!["mp4".into(), "hls".into()],
+            can_remux_direct: true,
+        }
+    }
+
+    /// A web-browser baseline (the SPA, `platform=web`). Deliberately conservative to what a
+    /// desktop/mobile browser can reliably decode via `<video>` / hls.js: **H.264 only**
+    /// (HEVC/AV1 support is patchy and licence-gated, so treat them as needing a transcode),
+    /// 8-bit SDR, and **AAC / MP3 / Opus / FLAC** audio — **no AC-3 / E-AC-3 / DTS / TrueHD**
+    /// (browsers can't decode those). Containers `mp4`/`m4v` direct-play; everything else
+    /// transcodes to H.264+AAC HLS, which hls.js plays anywhere. This stops the server handing
+    /// a browser a direct stream it can only render as a black screen.
+    pub fn web() -> Self {
+        Self {
+            video_codecs: vec![VideoCodec::H264],
+            bit_depth_10: false,
+            hdr_display: false,
+            dolby_vision: false,
+            audio_codecs: vec![
+                AudioCodec::Aac,
+                AudioCodec::Mp3,
+                AudioCodec::Opus,
+                AudioCodec::Flac,
+            ],
+            max_channels: 2,
+            atmos_passthrough: false,
+            containers: vec!["mp4".into(), "m4v".into(), "hls".into()],
+            // A browser <video> can't remux a raw /api/direct stream itself — a container or
+            // audio-codec mismatch must be fixed by a server transcode.
+            can_remux_direct: false,
         }
     }
 
@@ -175,6 +234,7 @@ impl ClientProfile {
             Platform::AppleTv => Self::apple_tv_4k(),
             Platform::Shield => Self::nvidia_shield(),
             Platform::AndroidTv => Self::generic_android_tv(),
+            Platform::Web => Self::web(),
             // Unknown: fall back to the Apple TV baseline (its authoritative, safe set).
             Platform::Unknown => Self::apple_tv_4k(),
         }
@@ -216,6 +276,8 @@ impl From<ClientCapabilities> for ClientProfile {
             max_channels: c.max_channels.max(2),
             atmos_passthrough: c.atmos_passthrough,
             containers: c.containers,
+            // A detected-capability payload comes from a native client that can remux.
+            can_remux_direct: true,
         }
     }
 }
@@ -239,6 +301,12 @@ pub struct TranscodeTarget {
     /// `QualityProfile::Capped` bitrate ceiling (bits/sec) applied to video via
     /// `-maxrate`/`-bufsize` in `command.rs`. `None` = uncapped (`docs/.tasks/70`).
     pub max_bitrate: Option<u64>,
+    /// An image subtitle (`docs/.tasks/90` §5) to burn into the video: `Some(n)` is the
+    /// ffprobe subtitle stream index overlaid onto the frame **after** any tone-map.
+    /// `None` = no burn-in. Set only via [`Decision::with_burn_in`]; a text subtitle never
+    /// sets this (it rides as a client WebVTT sidecar).
+    #[serde(default)]
+    pub subtitle_burn_in: Option<i64>,
 }
 
 /// The audio plan for a track + client: copy through (passthrough / within cap) or
@@ -316,6 +384,84 @@ impl Decision {
             Decision::Transcode { reason, .. } => reason,
         }
     }
+
+    /// Force this decision to burn an **image** subtitle into the video (`docs/.tasks/90`
+    /// §5). Applied by the api layer when the client selects an image (PGS / VobSub) track
+    /// via `sub_burn=1`: an image subtitle cannot become a text sidecar, so it must be
+    /// overlaid onto the frame, which forces a **video transcode** even when the video
+    /// would otherwise direct-play.
+    ///
+    /// - A [`Decision::DirectPlay`] is promoted to a [`Decision::Transcode`] carrying a
+    ///   fresh [`TranscodeTarget`] (built for this host / source) with the burn-in index.
+    /// - An existing [`Decision::Transcode`] keeps its vendor path / tone-map and just
+    ///   records the burn-in index so `command.rs` adds the overlay after any tone-map.
+    ///
+    /// A **text** subtitle never calls this — it rides as a react-native-video `textTracks`
+    /// sidecar and the video can still direct-play.
+    pub fn with_burn_in(
+        self,
+        stream_index: i64,
+        profile: &MediaProfile,
+        client: &ClientProfile,
+        quality: Quality,
+        caps: &HwCaps,
+    ) -> Decision {
+        match self {
+            Decision::Transcode { mut target, reason } => {
+                target.subtitle_burn_in = Some(stream_index);
+                Decision::Transcode { target, reason }
+            }
+            Decision::DirectPlay { .. } => {
+                let tone_map = needs_tonemap(profile, client);
+                let mut target = transcode_target(caps, false, tone_map, profile, quality);
+                target.subtitle_burn_in = Some(stream_index);
+                Decision::Transcode {
+                    target,
+                    reason: "subtitle_burn_in",
+                }
+            }
+        }
+    }
+
+    /// Force a would-be direct-play into a real HLS transcode (`force_transcode=1`).
+    ///
+    /// A browser `<video>` that finds a `DirectPlay` stream unplayable (a `direct` decision
+    /// the server guessed wrong, or an exotic profile the element rejects) re-requests the
+    /// stream with this flag to demand a server-side H.264+AAC HLS transcode it can always
+    /// play. A [`Decision::Transcode`] is returned unchanged (already the safe path); a
+    /// [`Decision::DirectPlay`] is promoted to a fresh [`TranscodeTarget`] built for this
+    /// host + source, tone-mapping only when the display needs it.
+    pub fn force_transcode(
+        self,
+        profile: &MediaProfile,
+        client: &ClientProfile,
+        quality: Quality,
+        caps: &HwCaps,
+    ) -> Decision {
+        match self {
+            Decision::Transcode { .. } => self,
+            Decision::DirectPlay { .. } => {
+                let tone_map = needs_tonemap(profile, client);
+                let target = transcode_target(caps, /*software_decode=*/ false, tone_map, profile, quality);
+                Decision::Transcode {
+                    target,
+                    reason: "forced_transcode",
+                }
+            }
+        }
+    }
+}
+
+/// The subtitle handling a stream request resolves to (`docs/.tasks/90` §5). Built by the
+/// api layer from the selected `sub` / `sub_burn` params against the file's
+/// `subtitle_streams`; only [`SubtitlePlan::BurnIn`] affects the transcode decision (text
+/// subtitles ride as a client WebVTT sidecar and never force a transcode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubtitlePlan {
+    /// No subtitle selected, or the client renders a text sidecar itself.
+    None,
+    /// An image subtitle (PGS / VobSub) to overlay onto the video — forces a transcode.
+    BurnIn { stream_index: i64 },
 }
 
 /// The "best available quality" control + bitrate ceiling carried alongside the client
@@ -364,7 +510,13 @@ pub fn decide(
     }
 
     // --- Can the client present the *video* as-is? ---------------------------
-    let video_ok = client.supports_video(profile.codec)
+    // Dolby Vision Profile 7 is never directly presentable (no TV client shows its
+    // dual-layer BL+EL). It always transcodes — dropping the EL and keeping/tone-mapping
+    // the HDR10 base layer — so it can never satisfy the direct-play branch below, even
+    // when the client lists HEVC (`docs/.tasks/90` §3).
+    let dv_p7 = profile.hdr == HdrType::DolbyVision && matches!(profile.dv, Some(DvProfile::P7));
+    let video_ok = !dv_p7
+        && client.supports_video(profile.codec)
         && (profile.bit_depth <= 8 || client.bit_depth_10);
 
     // --- HDR / Dolby Vision vs the display. ----------------------------------
@@ -384,10 +536,18 @@ pub fn decide(
         if audio_ok && container_ok {
             return Decision::DirectPlay { remux: false };
         }
-        // Video can be copied; only the container or audio needs work. A remux (served
-        // over `/api/direct`, or a copy-video HLS) is far cheaper than re-encoding — and
-        // an audio-only fix does not count against the GPU transcode cap (`docs/.tasks/70`).
-        return Decision::DirectPlay { remux: true };
+        // Video can be copied; only the container or audio needs work. A client that can remux
+        // a direct byte stream itself (native TV players) gets a cheap `remux` served over
+        // `/api/direct`. A client that cannot (a browser `<video>`) must instead be handed a
+        // real server transcode — copying the video, fixing the audio/container into HLS — or
+        // it would black-screen on the raw file.
+        if client.can_remux_direct {
+            return Decision::DirectPlay { remux: true };
+        }
+        return Decision::Transcode {
+            target: transcode_target(caps, /*software_decode=*/ false, /*tone_map=*/ false, profile, quality),
+            reason: "web_remux_to_transcode",
+        };
     }
 
     // --- Otherwise transcode. Pick the reason for logs/debugging. ------------
@@ -413,7 +573,14 @@ fn needs_tonemap(profile: &MediaProfile, client: &ClientProfile) -> bool {
     match profile.hdr {
         HdrType::None => false,
         HdrType::DolbyVision => {
-            // A DV-capable client on a DV display presents it directly; otherwise, if
+            // Profile 7 (BL(HDR10)+EL) is never directly presentable — no TV client shows
+            // dual-layer DV (`docs/.tasks/90` §3). It always transcodes (see the P7 gate in
+            // `decide`); the *tone-map* question is only about its HDR10 base layer vs the
+            // display: keep HDR10 on an HDR display (no tone-map), tone-map on SDR.
+            if matches!(profile.dv, Some(DvProfile::P7)) {
+                return !client.hdr_display;
+            }
+            // A DV-capable client on a DV display presents P5/P8 directly; otherwise, if
             // the source is P8 with an HDR10 base layer and the display is plain HDR10,
             // it can still show as HDR10 (no tone-map). Everything else → tone-map.
             if client.dolby_vision {
@@ -443,10 +610,20 @@ fn transcode_reason(
     tone_map: bool,
     video_ok: bool,
 ) -> &'static str {
+    // Dolby Vision Profile 7 (`docs/.tasks/90` §3): always a transcode. On an HDR display
+    // the EL is dropped and the HDR10 base layer is kept (no tone-map); on SDR the base is
+    // tone-mapped via the normal VPP/CUDA path (not the P5-only OpenCL path).
+    if matches!(profile.dv, Some(DvProfile::P7)) {
+        return if tone_map {
+            "dv_p7_sdr_display"
+        } else {
+            "dv_p7_hdr10_display"
+        };
+    }
     if tone_map {
         return match profile.hdr {
             HdrType::DolbyVision => {
-                if matches!(profile.dv, Some(medi_core::DvProfile::P5)) {
+                if matches!(profile.dv, Some(DvProfile::P5)) {
                     "dv_p5_sdr_display"
                 } else {
                     "dv_p8_sdr_display"
@@ -478,14 +655,20 @@ fn transcode_target(
 ) -> TranscodeTarget {
     let vendor = caps.vendor;
 
-    // AV1 source but no HW AV1 decode → software (dav1d) decode.
-    if profile.codec == VideoCodec::Av1 && !caps.hwaccels.iter().any(|h| h == "av1") {
+    // Per-codec HW-decode fallback (`docs/.tasks/90` §per-codec HW-decode): a source the
+    // host cannot hardware-decode (AV1 without an AV1 hwaccel, VP9/VC-1/MPEG-2 on a host
+    // lacking that accel, or any `Other`) falls back to a software decoder feeding the HW
+    // (or SW) encoder. AV1→dav1d is now one arm of this general rule.
+    if !caps.can_hw_decode(profile.codec) {
         software_decode = true;
     }
 
-    // DV tone-map requires OpenCL/CUDA; if the host can't, fall back to software
-    // decode + software tonemap so playback still works (just on the CPU).
-    let dv_tone_map = tone_map && profile.hdr == HdrType::DolbyVision;
+    // DV tone-map requires OpenCL/CUDA, and is reserved for **Profile 5** (proprietary
+    // IPTPQc2). A P7 source tone-maps its HDR10 base layer via the normal VPP/CUDA path,
+    // so it never sets `dv_tone_map` (`docs/.tasks/90` §3). If the host can't run the
+    // OpenCL/CUDA path for a P5 source, fall back to software decode + software tonemap.
+    let dv_tone_map =
+        tone_map && profile.hdr == HdrType::DolbyVision && matches!(profile.dv, Some(DvProfile::P5));
     if dv_tone_map && !caps.can_tonemap_dv() {
         software_decode = true;
     }
@@ -509,6 +692,9 @@ fn transcode_target(
         // Audio target is decided by the caller against the client via `audio_plan`.
         audio_transcode_to: None,
         max_bitrate,
+        // Burn-in is layered on by the api via `Decision::with_burn_in` only when the
+        // client selects an image subtitle.
+        subtitle_burn_in: None,
     }
 }
 
@@ -559,6 +745,77 @@ mod tests {
         let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
         assert_eq!(d, Decision::DirectPlay { remux: false });
         assert_eq!(d.mode(), "direct");
+    }
+
+    #[test]
+    fn h264_aac_mp4_direct_plays_to_web() {
+        // The common browser-friendly case: H.264 + AAC in mp4 direct-plays for `platform=web`.
+        let p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        let d = decide(&p, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel());
+        assert_eq!(d, Decision::DirectPlay { remux: false });
+    }
+
+    #[test]
+    fn force_transcode_promotes_web_direct_play_to_hls() {
+        // A browser that finds a `direct` stream unplayable re-requests with force_transcode=1;
+        // even the normally direct-playing H.264/AAC/mp4 case must then become an HLS transcode.
+        let p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        let web = ClientProfile::web();
+        let base = decide(&p, aac(), "mp4", &web, q(), &hw_intel());
+        assert_eq!(base, Decision::DirectPlay { remux: false });
+
+        let forced = base.force_transcode(&p, &web, q(), &hw_intel());
+        assert_eq!(forced.mode(), "hls");
+        assert_eq!(forced.reason(), "forced_transcode");
+        match forced {
+            Decision::Transcode { target, .. } => {
+                assert_eq!(target.video_codec, VideoCodec::H264);
+                assert!(!target.tone_map, "SDR source needs no tone-map");
+            }
+            _ => panic!("expected transcode"),
+        }
+    }
+
+    #[test]
+    fn force_transcode_leaves_existing_transcode_unchanged() {
+        // An already-transcoding decision is the safe path; force_transcode is a no-op on it.
+        let p = prof(VideoCodec::Hevc, 10, HdrType::Hdr10, None);
+        let web = ClientProfile::web();
+        let base = decide(&p, aac(), "mp4", &web, q(), &hw_intel());
+        assert_eq!(base.mode(), "hls");
+        let forced = base.clone().force_transcode(&p, &web, q(), &hw_intel());
+        assert_eq!(forced, base, "no-op on an existing transcode");
+    }
+
+    #[test]
+    fn hevc_transcodes_for_web() {
+        // A browser can't reliably decode HEVC → the web profile forces a transcode instead of
+        // handing back a direct stream that would black-screen.
+        let p = prof(VideoCodec::Hevc, 10, HdrType::Hdr10, None);
+        let d = decide(&p, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel());
+        assert_eq!(d.mode(), "hls", "HEVC must transcode for a browser");
+    }
+
+    #[test]
+    fn ac3_audio_transcodes_for_web() {
+        // AC-3 audio is undecodable in most browsers. Since a browser can't remux a raw direct
+        // stream itself, a would-be `remux` is promoted to a real transcode (H.264 copy + audio
+        // fixed into HLS) rather than served as an unplayable `/api/direct` file.
+        let p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        let d = decide(&p, aud(AudioCodec::Ac3, 6, ImmersiveAudio::None), "mp4", &ClientProfile::web(), q(), &hw_intel());
+        assert_eq!(d.mode(), "hls", "AC-3 audio must transcode for a browser");
+        assert_eq!(d.reason(), "web_remux_to_transcode");
+    }
+
+    #[test]
+    fn mkv_transcodes_for_web_but_remuxes_for_shield() {
+        // An MKV with browser-OK codecs: Shield opens MKV directly; a browser can't, and can't
+        // remux a direct stream, so it gets a real transcode rather than a raw `/api/direct`.
+        let p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        let shield = decide(&p, aac(), "mkv", &ClientProfile::nvidia_shield(), q(), &hw_intel());
+        assert_eq!(shield, Decision::DirectPlay { remux: false }, "Shield opens MKV directly");
+        let web = decide(&p, aac(), "mkv", &ClientProfile::web(), q(), &hw_intel());
+        assert_eq!(web.mode(), "hls", "browser can't open MKV → transcode");
     }
 
     #[test]
@@ -661,6 +918,134 @@ mod tests {
             }
             _ => panic!("expected transcode"),
         }
+    }
+
+    // --- widened codecs + DV P7 + subtitle burn-in (`docs/.tasks/90`) --------
+
+    #[test]
+    fn legacy_codecs_transcode_to_h264() {
+        // VC-1 / MPEG-2 / MPEG-4 are not in any client's video list → always transcode,
+        // and the host here has no matching hwaccel → software decode.
+        for codec in [VideoCodec::Vc1, VideoCodec::Mpeg2, VideoCodec::Mpeg4] {
+            let p = prof(codec, 8, HdrType::None, None);
+            let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
+            match d {
+                Decision::Transcode { target, reason } => {
+                    assert_eq!(target.video_codec, VideoCodec::H264);
+                    assert!(target.software_decode, "{codec:?} has no hwaccel here → sw decode");
+                    assert_eq!(reason, "codec_unsupported");
+                }
+                _ => panic!("expected transcode for {codec:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn vp9_hw_decode_gated_on_hwaccel() {
+        let p = prof(VideoCodec::Vp9, 8, HdrType::None, None);
+        // No VP9 hwaccel → software decode.
+        let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
+        match d {
+            Decision::Transcode { target, .. } => assert!(target.software_decode),
+            _ => panic!("expected transcode"),
+        }
+        // With a VP9 hwaccel advertised → HW decode.
+        let mut caps = hw_intel();
+        caps.hwaccels = vec!["vp9".into(), "qsv".into()];
+        let d = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &caps);
+        match d {
+            Decision::Transcode { target, .. } => {
+                assert!(!target.software_decode, "VP9 hwaccel → HW decode");
+                assert_eq!(target.video_codec, VideoCodec::H264);
+            }
+            _ => panic!("expected transcode"),
+        }
+    }
+
+    #[test]
+    fn dv_p7_on_hdr_display_keeps_hdr10_no_tonemap() {
+        // P7 never direct-plays; on an HDR display drop the EL, keep the HDR10 base (no
+        // tone-map), and never use the P5 OpenCL path.
+        let p = prof(VideoCodec::Hevc, 10, HdrType::DolbyVision, Some(DvProfile::P7));
+        let d = decide(
+            &p,
+            aud(AudioCodec::Eac3, 6, ImmersiveAudio::None),
+            "mp4",
+            &ClientProfile::apple_tv_4k(),
+            q(),
+            &hw_intel(),
+        );
+        match d {
+            Decision::Transcode { target, reason } => {
+                assert_eq!(reason, "dv_p7_hdr10_display");
+                assert!(!target.tone_map, "HDR display keeps HDR10 base");
+                assert!(!target.dv_tone_map, "P7 never uses the P5 OpenCL path");
+            }
+            _ => panic!("P7 must transcode even on a DV-capable client"),
+        }
+    }
+
+    #[test]
+    fn dv_p7_on_sdr_display_tonemaps_via_vpp_not_opencl() {
+        let p = prof(VideoCodec::Hevc, 10, HdrType::DolbyVision, Some(DvProfile::P7));
+        let d = decide(&p, aac(), "mp4", &ClientProfile::sdr_baseline(), q(), &hw_intel());
+        match d {
+            Decision::Transcode { target, reason } => {
+                assert_eq!(reason, "dv_p7_sdr_display");
+                assert!(target.tone_map, "SDR display tone-maps the HDR10 base");
+                assert!(!target.dv_tone_map, "P7 uses VPP/CUDA, not the OpenCL P5 path");
+                assert!(!target.software_decode, "Intel HEVC decodes in HW");
+            }
+            _ => panic!("expected transcode"),
+        }
+    }
+
+    #[test]
+    fn image_subtitle_burn_in_forces_transcode() {
+        // A text sub leaves a direct-play alone; an image sub burn-in promotes it to a
+        // transcode carrying the burn-in index.
+        let p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        let base = decide(&p, aac(), "mp4", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
+        assert_eq!(base, Decision::DirectPlay { remux: false });
+
+        let burned = base.with_burn_in(0, &p, &ClientProfile::apple_tv_4k(), q(), &hw_intel());
+        match burned {
+            Decision::Transcode { target, reason } => {
+                assert_eq!(reason, "subtitle_burn_in");
+                assert_eq!(target.subtitle_burn_in, Some(0));
+            }
+            _ => panic!("image sub must force a transcode"),
+        }
+    }
+
+    #[test]
+    fn mp3_audio_copies_on_all_clients() {
+        let mp3 = aud(AudioCodec::Mp3, 2, ImmersiveAudio::None);
+        assert_eq!(audio_plan(mp3, &ClientProfile::apple_tv_4k()), AudioPlan::Copy);
+        assert_eq!(audio_plan(mp3, &ClientProfile::nvidia_shield()), AudioPlan::Copy);
+        assert_eq!(audio_plan(mp3, &ClientProfile::generic_android_tv()), AudioPlan::Copy);
+    }
+
+    #[test]
+    fn vorbis_wma_alac_transcode_by_default() {
+        for codec in [AudioCodec::Vorbis, AudioCodec::Wma, AudioCodec::Alac] {
+            let t = aud(codec, 2, ImmersiveAudio::None);
+            assert!(
+                matches!(audio_plan(t, &ClientProfile::apple_tv_4k()), AudioPlan::Transcode { .. }),
+                "{codec:?} transcodes by default on Apple TV"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_container_direct_plays_on_shield() {
+        // MPEG-TS opens directly on ExoPlayer/Shield → no remux for an H.264/AAC .ts file.
+        let p = prof(VideoCodec::H264, 8, HdrType::None, None);
+        let d = decide(&p, aac(), "ts", &ClientProfile::nvidia_shield(), q(), &hw_intel());
+        assert_eq!(d, Decision::DirectPlay { remux: false });
+        // Apple TV can't open .ts → remux.
+        let d2 = decide(&p, aac(), "ts", &ClientProfile::apple_tv_4k(), q(), &hw_intel());
+        assert_eq!(d2, Decision::DirectPlay { remux: true });
     }
 
     #[test]

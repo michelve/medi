@@ -462,6 +462,39 @@ async fn capped_bitrate_forces_hls_transcode() {
     assert!(url.starts_with("/api/hls/"));
 }
 
+#[tokio::test]
+async fn force_transcode_promotes_web_direct_play_to_hls() {
+    // File 202 is H.264 + AAC + mp4 — it direct-plays for the web profile. When the browser
+    // finds that `direct` stream unplayable it re-requests with force_transcode=1, which must
+    // flip the decision to an HLS transcode hls.js can always play.
+    std::env::set_var("FFMPEG_BIN", "true");
+    let (app, _dir) = audio_app();
+
+    // Baseline: web direct-plays this file.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/stream/202?platform=web").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "direct", "H.264/AAC/mp4 direct-plays for web");
+
+    // Forced: same file, force_transcode=1 → HLS.
+    let resp = app
+        .oneshot(
+            Request::get("/api/stream/202?platform=web&force_transcode=1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["mode"], "hls");
+    assert_eq!(json["reason"], "forced_transcode");
+    assert!(json["url"].as_str().unwrap().starts_with("/api/hls/"));
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/trickplay/:file_id/meta  (Phase 5 Part A: scrub-thumbnail geometry)
 // ---------------------------------------------------------------------------
@@ -500,6 +533,350 @@ async fn metadata_matches_501_without_provider() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+}
+
+// ---------------------------------------------------------------------------
+// Genres & discovery (`docs/.tasks/91` Phase A)
+// ---------------------------------------------------------------------------
+
+/// An app seeded with three genres joined to the `seeded_app` titles: Sci-Fi (id 878) on
+/// both movies + the series (count 3), Drama (18) on Arrival only (count 1), and Comedy
+/// (35) with no titles (excluded from the list). Reuses `seeded_app`'s catalog rows.
+fn genre_app() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO movies (id, title, sort_title, year, added_at, metadata_state, logo_path) \
+                VALUES (12, 'Blade Runner 2049', 'blade runner 2049', 2017, 100, 'matched', NULL), \
+                       (20, 'Arrival', 'arrival', 2016, 200, 'matched', 'movies/20/logo.png');
+             INSERT INTO series (id, title, sort_title, year, added_at, metadata_state) \
+                VALUES (3, 'Severance', 'severance', 2022, 300, 'matched');
+             INSERT INTO genres (id, name) VALUES (878, 'Science Fiction'), (18, 'Drama'), (35, 'Comedy');
+             INSERT INTO movie_genres (movie_id, genre_id) VALUES (12, 878), (20, 878), (20, 18);
+             INSERT INTO series_genres (series_id, genre_id) VALUES (3, 878);",
+        )
+        .unwrap();
+    }
+
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    (router(state), dir)
+}
+
+#[tokio::test]
+async fn genres_list_ranks_by_count_and_excludes_empty() {
+    let (app, _dir) = genre_app();
+    let resp = app
+        .oneshot(Request::get("/api/genres").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    // ETag'd like the rest of the catalog.
+    assert!(resp.headers().get(header::ETAG).is_some());
+    let json = body_json(resp).await;
+    let arr = json.as_array().unwrap();
+    // Comedy (0 titles) is excluded → only Sci-Fi and Drama.
+    assert_eq!(arr.len(), 2);
+    // Sci-Fi has 3 titles (2 movies + 1 series), Drama has 1 → Sci-Fi first.
+    assert_eq!(arr[0]["id"], 878);
+    assert_eq!(arr[0]["name"], "Science Fiction");
+    assert_eq!(arr[0]["count"], 3);
+    assert_eq!(arr[1]["id"], 18);
+    assert_eq!(arr[1]["count"], 1);
+}
+
+#[tokio::test]
+async fn movie_detail_carries_its_genres() {
+    let (app, _dir) = genre_app();
+    let resp = app
+        .oneshot(Request::get("/api/movies/20").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    // Arrival is joined to Drama (18) + Science Fiction (878); names come back sorted.
+    let genres = json["genres"].as_array().unwrap();
+    let names: Vec<&str> = genres.iter().map(|g| g["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["Drama", "Science Fiction"]);
+    assert_eq!(genres[0]["id"], 18);
+}
+
+#[tokio::test]
+async fn movie_detail_surfaces_logo_path() {
+    // The flattened Movie carries its fanart.tv `logo_path` (Task 93) so the client can
+    // resolve it via imageUrl(); a movie with no logo omits/nulls it.
+    let (app, _dir) = genre_app();
+    // Arrival (20) has a logo.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/movies/20").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["logo_path"], "movies/20/logo.png");
+
+    // Blade Runner 2049 (12) has no logo → null.
+    let resp2 = app
+        .oneshot(Request::get("/api/movies/12").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json2 = body_json(resp2).await;
+    assert!(json2["logo_path"].is_null(), "no logo → logo_path null");
+}
+
+#[tokio::test]
+async fn movie_detail_returns_collection_and_siblings() {
+    // Two matched movies of one franchise (collection 500). The detail for one returns its
+    // `collection` plus the OTHER in-library movie as `collection_movies`.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO collections (id, name) VALUES (500, 'Thor Collection');
+             INSERT INTO movies (id, title, sort_title, year, added_at, metadata_state, collection_id) \
+                VALUES (40, 'Thor', 'thor', 2011, 500, 'matched', 500), \
+                       (41, 'Thor Ragnarok', 'thor ragnarok', 2017, 600, 'matched', 500);",
+        )
+        .unwrap();
+    }
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    let app = router(state);
+
+    let resp = app
+        .oneshot(Request::get("/api/movies/41").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["collection"]["id"], 500);
+    assert_eq!(json["collection"]["name"], "Thor Collection");
+    let siblings = json["collection_movies"].as_array().unwrap();
+    // The current movie (41) is excluded; only Thor (40) remains.
+    assert_eq!(siblings.len(), 1);
+    assert_eq!(siblings[0]["id"], 40);
+    assert_eq!(siblings[0]["title"], "Thor");
+}
+
+#[tokio::test]
+async fn movie_detail_orders_files_best_first() {
+    // A movie with two copies: a 1080p SDR file inserted FIRST (lower id) and a 2160p HDR10
+    // file inserted second. Best-first ordering (resolution → HDR → bitrate) must put the
+    // 2160p file at [0] despite its higher id, so a client's `media_files[0]` plays the best.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO movies (id, title, sort_title, year, added_at) \
+                VALUES (30, 'Dune', 'dune', 2021, 400);
+             -- 1080p SDR, inserted first (id 100).
+             INSERT INTO media_files \
+                (id, movie_id, path, container, video_codec, width, height, bit_depth, bitrate) \
+                VALUES (100, 30, '/media/dune-1080p.mkv', 'mkv', 'h264', 1920, 1080, 8, 8000000);
+             -- 2160p HDR10, inserted second (id 101).
+             INSERT INTO media_files \
+                (id, movie_id, path, container, video_codec, width, height, bit_depth, bitrate, hdr_type) \
+                VALUES (101, 30, '/media/dune-2160p.mkv', 'mkv', 'hevc', 3840, 2160, 10, 40000000, 'hdr10');",
+        )
+        .unwrap();
+    }
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    let app = router(state);
+
+    let resp = app
+        .oneshot(Request::get("/api/movies/30").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let files = json["media_files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    // Best (2160p HDR10) first, despite being inserted later / having the higher id.
+    assert_eq!(files[0]["id"], 101);
+    assert_eq!(files[0]["height"], 2160);
+    assert_eq!(files[1]["id"], 100);
+}
+
+#[tokio::test]
+async fn genre_titles_returns_library_page_shape() {
+    let (app, _dir) = genre_app();
+    // Sci-Fi (878) contains both movies and the series.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/genres/878?limit=50").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    // Same LibraryItem shape as /api/library: kind/id/title present.
+    assert!(items.iter().all(|i| i["kind"].is_string() && i["id"].is_number()));
+    assert!(json["next_cursor"].is_null(), "short page is exhausted");
+
+    // Drama (18) is Arrival only.
+    let resp2 = app
+        .oneshot(Request::get("/api/genres/18").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json2 = body_json(resp2).await;
+    let items2 = json2["items"].as_array().unwrap();
+    assert_eq!(items2.len(), 1);
+    assert_eq!(items2[0]["title"], "Arrival");
+}
+
+#[tokio::test]
+async fn genre_titles_paginates_with_shared_cursor_codec() {
+    let (app, _dir) = genre_app();
+    // Page size 2 over Sci-Fi's 3 titles → first page carries a cursor.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/genres/878?limit=2").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let page1 = body_json(resp).await;
+    assert_eq!(page1["items"].as_array().unwrap().len(), 2);
+    let cursor = page1["next_cursor"].as_str().expect("cursor present");
+
+    let resp2 = app
+        .oneshot(
+            Request::get(format!("/api/genres/878?limit=2&cursor={cursor}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let page2 = body_json(resp2).await;
+    assert_eq!(page2["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn library_rows_has_recently_added_and_genre_rows() {
+    let (app, _dir) = genre_app();
+    let resp = app
+        .oneshot(Request::get("/api/library/rows").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get(header::ETAG).is_some());
+    let json = body_json(resp).await;
+    let rows = json["rows"].as_array().unwrap();
+    // "Recently Added" first, then the two nonempty genres by count (Sci-Fi, Drama).
+    assert_eq!(rows[0]["key"], "recently_added");
+    assert!(rows[0]["genre_id"].is_null());
+    assert!(!rows[0]["items"].as_array().unwrap().is_empty());
+    let genre_keys: Vec<&str> = rows[1..].iter().map(|r| r["key"].as_str().unwrap()).collect();
+    assert!(genre_keys.contains(&"genre:878"));
+    assert!(genre_keys.contains(&"genre:18"));
+    // The Sci-Fi row carries its genre_id for the "See all →" link.
+    let scifi = rows.iter().find(|r| r["key"] == "genre:878").unwrap();
+    assert_eq!(scifi["genre_id"], 878);
+    assert_eq!(scifi["title"], "Science Fiction");
+}
+
+// ---------------------------------------------------------------------------
+// Person pages (`docs/.tasks/91` Phase B)
+// ---------------------------------------------------------------------------
+
+/// An app seeded with an enriched person (Amy Adams) credited on two movies, plus a second
+/// person on an uncredited-to-Amy movie, so the filmography test can assert exclusion.
+fn person_app() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO movies (id, title, sort_title, year, added_at, poster_path) \
+                VALUES (12, 'Arrival', 'arrival', 2016, 100, 'movies/12/poster.jpg'), \
+                       (20, 'Nocturnal', 'nocturnal', 2016, 200, NULL), \
+                       (30, 'The Departed', 'departed', 2006, 50, NULL);
+             INSERT INTO people (id, name, tmdb_id, photo_path, biography) \
+                VALUES (7, 'Amy Adams', 9273, 'people/7/photo.jpg', 'An American actress.'), \
+                       (8, 'Leonardo DiCaprio', 6193, NULL, NULL);
+             INSERT INTO credits (person_id, movie_id, role, ord) VALUES (7, 12, 'actor', 0);
+             INSERT INTO credits (person_id, movie_id, role, ord) VALUES (7, 20, 'actor', 0);
+             INSERT INTO credits (person_id, movie_id, role, ord) VALUES (8, 30, 'actor', 0);",
+        )
+        .unwrap();
+    }
+
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    (router(state), dir)
+}
+
+#[tokio::test]
+async fn person_page_returns_meta_and_filmography() {
+    let (app, _dir) = person_app();
+    let resp = app
+        .oneshot(Request::get("/api/people/7").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get(header::ETAG).is_some());
+    let json = body_json(resp).await;
+    assert_eq!(json["id"], 7);
+    assert_eq!(json["name"], "Amy Adams");
+    assert_eq!(json["tmdb_id"], 9273);
+    assert_eq!(json["biography"], "An American actress.");
+    // Stored photo_path is surfaced as an /api/images URL.
+    assert_eq!(json["photo"], "/api/images/people/7/photo.jpg");
+    // Filmography: her two movies, newest-added first (Nocturnal 200 before Arrival 100).
+    let films = json["filmography"].as_array().unwrap();
+    assert_eq!(films.len(), 2);
+    assert_eq!(films[0]["title"], "Nocturnal");
+    assert_eq!(films[1]["title"], "Arrival");
+    // The Departed (credited to someone else) is excluded.
+    assert!(!films.iter().any(|f| f["title"] == "The Departed"));
+    // A LibraryItem-shaped tile: the poster URL is resolved for Arrival.
+    let arrival = films.iter().find(|f| f["title"] == "Arrival").unwrap();
+    assert_eq!(arrival["poster"], "/api/images/movies/12/poster.jpg");
+}
+
+#[tokio::test]
+async fn person_page_unknown_is_404() {
+    let (app, _dir) = person_app();
+    let resp = app
+        .oneshot(Request::get("/api/people/999").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "not_found");
+}
+
+#[tokio::test]
+async fn metadata_backfill_501_without_provider() {
+    // No enrichment context → the backfill trigger returns 501 (metadata is off), matching
+    // the other manual metadata endpoints.
+    let (app, _dir) = seeded_app();
+    let resp = app
+        .oneshot(Request::post("/api/metadata/backfill").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+    let json = body_json(resp).await;
+    assert_eq!(json["error"]["code"], "not_implemented");
 }
 
 // ---------------------------------------------------------------------------

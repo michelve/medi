@@ -48,8 +48,58 @@ export interface LibraryPage {
   next_cursor: string | null;
 }
 
-/** `sort` query values accepted by `GET /api/library`. */
+/** `sort` query values accepted by `GET /api/library` and `GET /api/genres/:id`. */
 export type LibrarySort = 'sort_title' | 'added_at';
+
+// ---------------------------------------------------------------------------
+// Genres & discovery (`docs/.tasks/91` Phase A)
+// ---------------------------------------------------------------------------
+
+/** A genre carried by a title (id + name), e.g. on a movie detail's metadata line. */
+export interface Genre {
+  id: number;
+  name: string;
+}
+
+/** One entry in `GET /api/genres` — a genre with its title count (movies + series). */
+export interface GenreCount extends Genre {
+  /** Number of titles carrying this genre; always ≥ 1 (empty genres are excluded). */
+  count: number;
+}
+
+/**
+ * One horizontal category row on the landing page (`GET /api/library/rows`). `key` is a
+ * stable machine id (`recently_added` or `genre:878`); `title` is the display heading;
+ * `genre_id` is present for a genre row (so "See all →" can link to `/genre/:id`) and
+ * omitted for the synthetic "Recently Added" row.
+ */
+export interface CategoryRow {
+  key: string;
+  title: string;
+  items: LibraryItem[];
+  genre_id?: number;
+}
+
+/** `GET /api/library/rows` — the landing page's curated rows in one request. */
+export interface LibraryRows {
+  rows: CategoryRow[];
+}
+
+/**
+ * `GET /api/people/:id` — a person page (`docs/.tasks/91` Phase B): the enriched person
+ * plus their in-library filmography (poster tiles, newest first). `photo` is a ready-to-fetch
+ * `/api/images/people/<id>/photo.jpg` URL, omitted before the person is enriched; `biography`
+ * / `tmdb_id` are likewise omitted pre-enrichment. `filmography` is always present (it comes
+ * from credits, not enrichment) though it may be empty.
+ */
+export interface PersonPage {
+  id: number;
+  name: string;
+  photo?: string;
+  biography?: string;
+  tmdb_id?: number;
+  filmography: LibraryItem[];
+}
 
 // ---------------------------------------------------------------------------
 // Detail aggregates. `Movie`/`Series` rows are flattened into their detail
@@ -74,6 +124,19 @@ export interface Movie {
   added_at: number;
   poster_path: string | null;
   backdrop_path: string | null;
+  /**
+   * The movie's transparent-PNG title logo from fanart.tv (Task 93). A stored path relative
+   * to the images root — resolve with `client.imageUrl(...)`, exactly like `poster_path`.
+   * `null`/absent when the movie has no logo or fanart is unconfigured; render the text title.
+   */
+  logo_path?: string | null;
+  /**
+   * The movie's fanart.tv background wallpaper (Task 95). A stored path relative to the
+   * images root — resolve with `client.imageUrl(...)`. When present it's shown on the detail
+   * hero in place of `backdrop_path` (fanart wins, TMDB backdrop is the fallback).
+   * `null`/absent when the movie has no wallpaper or fanart is unconfigured.
+   */
+  wallpaper_path?: string | null;
   /** External ids + match state (Phase A, `docs/.tasks/60`). */
   tmdb_id?: number | null;
   imdb_id?: string | null;
@@ -155,6 +218,32 @@ export interface AudioStream {
 }
 
 /**
+ * How a subtitle track can be served (`docs/.tasks/90`). `text` tracks convert to WebVTT
+ * and ride as a react-native-video `textTracks` sidecar (no video transcode); `image`
+ * tracks (PGS / VobSub) can only be burned in via a forced transcode.
+ */
+export type SubtitleFormat = 'text' | 'image';
+
+/**
+ * One subtitle track of a media file (`subtitle_streams`, Task 90). Mirrors
+ * `medi_db::models::SubtitleStream`. Either an embedded track (`stream_index` set,
+ * `external_path` null) or an external sidecar (`external_path` set, `stream_index` null).
+ */
+export interface SubtitleStream {
+  id: number;
+  media_file_id: number;
+  stream_index: number | null;
+  codec: string | null;
+  format: SubtitleFormat;
+  language: string | null;
+  title: string | null;
+  is_default: boolean;
+  is_forced: boolean;
+  is_external: boolean;
+  external_path: string | null;
+}
+
+/**
  * A `media_files` row. Belongs to exactly one movie OR one episode. Mirrors
  * `medi_db::models::MediaFile`. Many fields are `null` until the file is probed.
  */
@@ -181,6 +270,11 @@ export interface MediaFile {
   hw_decode_unsupported: boolean;
   /** Audio tracks of this file (Task 70). Empty until probed. Drives `selectedAudioTrack`. */
   audio_streams: AudioStream[];
+  /**
+   * Subtitle tracks of this file (Task 90) — embedded + external sidecars. Empty until
+   * probed. Text tracks attach as a `textTracks` sidecar; image tracks force a burn-in.
+   */
+  subtitle_streams: SubtitleStream[];
 }
 
 /** A joined `credits` + `people` billing entry. */
@@ -191,12 +285,43 @@ export interface Credit {
   role: string | null;
   character: string | null;
   ord: number | null;
+  /**
+   * The person's headshot path (Task 91 Phase B), relative to the images root — resolve
+   * with `client.imageUrl(...)`. `null` for a person not yet enriched (show initials).
+   */
+  photo_path: string | null;
 }
 
-/** `GET /api/movies/:id` — movie row (flattened) + its files and credits. */
+/** A YouTube trailer/teaser of a movie (Task 91 detail extensions). */
+export interface Trailer {
+  id: number;
+  youtube_key: string;
+  name: string | null;
+  /** TMDB `type`: "Trailer" | "Teaser" | "Clip" | … */
+  kind: string | null;
+}
+
+/** A TMDB collection (franchise) a movie belongs to (Task 91 detail extensions). */
+export interface Collection {
+  id: number;
+  name: string;
+  /** Resolve with `client.imageUrl(...)`; `null` when the collection has no art. */
+  poster_path: string | null;
+}
+
+/**
+ * `GET /api/movies/:id` — movie row (flattened) + its files, credits, trailers, and
+ * franchise collection (Task 91 detail extensions). `collection_movies` is the other
+ * in-library movies of the same franchise (this movie excluded), as poster tiles.
+ */
 export interface MovieDetail extends Movie {
   media_files: MediaFile[];
   credits: Credit[];
+  trailers: Trailer[];
+  collection: Collection | null;
+  collection_movies: LibraryItem[];
+  /** Genres this movie belongs to, in name order. Empty when unmatched. */
+  genres: Genre[];
 }
 
 /** `GET /api/series/:id` — series row (flattened) + seasons/episodes + credits. */
@@ -241,7 +366,7 @@ export interface TrickplayMetaResponse {
 }
 
 /** The client platform selecting a static per-device capability default (`docs/.tasks/70`). */
-export type StreamPlatform = 'appletv' | 'shield' | 'androidtv';
+export type StreamPlatform = 'appletv' | 'shield' | 'androidtv' | 'web';
 
 /** "Best available quality" control sent to `/api/stream` (`docs/.tasks/70`). */
 export type QualityProfile = 'original' | 'auto' | 'capped';
@@ -273,6 +398,21 @@ export interface StreamHints {
   maxBitrate?: number;
   /** `original` | `auto` | `capped`. */
   quality?: QualityProfile;
+  /**
+   * Selected subtitle track for burn-in (`docs/.tasks/90`): the embedded `stream_index`
+   * of an **image** track. Only meaningful with `subBurn: true`; a text track never sets
+   * this — it is fetched as a `.vtt` sidecar and the video can still direct-play.
+   */
+  sub?: number;
+  /** `true` ⇒ burn the selected image subtitle into the video (forces a transcode). */
+  subBurn?: boolean;
+  /**
+   * `true` ⇒ force a server transcode even when the file would direct-play. The web player
+   * sends this to recover when a `direct` stream turns out to be unplayable in the browser
+   * (a `<video>` `MEDIA_ERR_SRC_NOT_SUPPORTED` / `MEDIA_ERR_DECODE`) — the server then returns
+   * an H.264+AAC HLS stream hls.js can always play.
+   */
+  forceTranscode?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +430,16 @@ export interface RefreshResponse {
   id: number;
   outcome: EnrichOutcome;
   provider_id?: string;
+}
+
+/**
+ * `POST /api/metadata/backfill` response. The backfill runs in the background, so this only
+ * acknowledges acceptance; `already_running` is `true` when a backfill was already in flight
+ * (a re-hit is idempotent, not queued twice).
+ */
+export interface BackfillResponse {
+  status: 'accepted';
+  already_running: boolean;
 }
 
 /** One candidate from `GET /api/movies/:id/matches`. */
@@ -344,4 +494,71 @@ export interface ApiErrorBody {
     code: string;
     message: string;
   };
+}
+
+// -- Enrichment & ingest status (`docs/.tasks/96`) -------------------------
+
+/** Per-`metadata_state` title counts for one kind. */
+export interface StateCounts {
+  total: number;
+  matched: number;
+  pending: number;
+  unmatched: number;
+  failed: number;
+}
+
+/** Whether a provider is configured (+ its name for the metadata provider). */
+export interface ProviderStatus {
+  name?: string;
+  configured: boolean;
+}
+
+/** The full `GET /api/status` envelope. */
+export interface SystemStatus {
+  version: string;
+  media_dir_present: boolean;
+  counts: { movies: StateCounts; series: StateCounts };
+  providers: { metadata: ProviderStatus; fanart: ProviderStatus };
+  last_scan: {
+    started_at: number | null;
+    finished_at: number | null;
+    written: number;
+    probe_failures: number;
+  };
+  last_enrichment: {
+    finished_at: number | null;
+    matched: number;
+    unmatched: number;
+    failed: number;
+  };
+  workers: { watcher_alive: boolean; backfill_interval_hours: number };
+}
+
+/** One `unmatched`/`failed` title the operator can act on. */
+export interface UnmatchedItem {
+  id: number;
+  kind: 'movie' | 'series';
+  title: string;
+  year?: number;
+  state: string;
+  path?: string;
+}
+
+/** A keyset page of unmatched titles (`next_cursor` is the last id, or null). */
+export interface UnmatchedPage {
+  items: UnmatchedItem[];
+  next_cursor: number | null;
+}
+
+/** One ffprobe-failed file. */
+export interface ProbeFailureItem {
+  path: string;
+  error: string;
+  last_attempt_at: number;
+}
+
+/** A keyset page of probe failures (`next_cursor` is the last `last_attempt_at`). */
+export interface ProbeFailuresPage {
+  items: ProbeFailureItem[];
+  next_cursor: number | null;
 }

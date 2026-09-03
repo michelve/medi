@@ -32,8 +32,9 @@ use medi_transcode::{
 
 use crate::cursor;
 use crate::dto::{
-    LibraryItem, LibraryPage, MatchCandidate, MatchRequest, MatchesResponse, RefreshResponse,
-    StreamDecision, TrickplayMeta,
+    BackfillResponse, CategoryRow, GenreListItem, LibraryItem, LibraryPage, LibraryRows,
+    MatchCandidate, MatchRequest, MatchesResponse, PersonPage, RefreshResponse, StreamDecision,
+    TrickplayMeta,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -50,10 +51,28 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         // Liveness (no state needed, but uniform under /api).
         .route("/api/health", get(health))
+        // Enrichment & ingest observability (`docs/.tasks/96`): counts, provider config,
+        // last-scan/enrichment, and lists of unmatched titles + probe failures to act on.
+        .route("/api/status", get(crate::status::status))
+        .route("/api/status/unmatched", get(crate::status::unmatched))
+        .route("/api/status/probe-failures", get(crate::status::probe_failures))
+        // Kick a pending-title enrichment pass on demand (`docs/.tasks/96` Part D).
+        .route("/api/metadata/enrich", axum::routing::post(crate::status::metadata_enrich))
         // Catalog — cached, ETag'd, keyset-paginated.
         .route("/api/library", get(library))
+        // Landing-page category rows (`docs/.tasks/91`): "Recently Added" + top genres, one
+        // request. Placed before `/api/library/:id`-style routes would be (there are none).
+        .route("/api/library/rows", get(library_rows))
         .route("/api/movies/:id", get(movie_detail))
         .route("/api/series/:id", get(series_detail))
+        // Genres & discovery (`docs/.tasks/91` Phase A) — cached + ETag'd.
+        .route("/api/genres", get(genres_list))
+        .route("/api/genres/:id", get(genre_titles))
+        // Person pages (`docs/.tasks/91` Phase B) — cached + ETag'd.
+        .route("/api/people/:id", get(person_page))
+        // Kick a one-shot genre/person backfill over already-matched titles. Reuses the
+        // `require_enrich` 501-when-unconfigured guard.
+        .route("/api/metadata/backfill", axum::routing::post(metadata_backfill))
         // Metadata enrichment — Phase A (`docs/.tasks/60`). Manual controls over the
         // background enrichment: force a refresh, list candidate matches, pin a match.
         .route("/api/movies/:id/refresh", axum::routing::post(movie_refresh))
@@ -78,6 +97,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/stream/:file_id", get(stream_decision))
         .route("/api/direct/:file_id", get(direct_play))
         .route("/api/hls/:session_id/:file", get(hls_asset))
+        // Subtitles — Phase 90. Serve a text subtitle track as WebVTT (embedded → extract
+        // + convert, cached under /config/subs; external .vtt → served directly). Image
+        // tracks are not served here — the client requests a burn-in via /api/stream.
+        .route("/api/subtitles/:file_id/:index", get(subtitle_vtt))
         // Generated assets — Phase 3 (assets crate). Served as static files; a
         // missing file is a natural 404 from ServeDir.
         .nest_service("/api/preview", previews)
@@ -168,21 +191,7 @@ async fn library(
 
             // The next cursor is the ordering key of the last row returned; a short
             // (or empty) page means the list is exhausted → `next_cursor: null`.
-            let next_cursor = if (cards.len() as u32) < clamp(limit) {
-                None
-            } else {
-                cards.last().map(|last| {
-                    let sort_value = match sort {
-                        LibrarySort::SortTitle => last.sort_title.clone(),
-                        LibrarySort::AddedAt => last.added_at.to_string(),
-                    };
-                    cursor::encode(&LibraryCursor {
-                        sort_value,
-                        kind_tag: kind_tag(last),
-                        id: last.id,
-                    })
-                })
-            };
+            let next_cursor = next_cursor_for(&cards, sort, limit);
 
             let page = LibraryPage {
                 items: cards.into_iter().map(LibraryItem::from_card).collect(),
@@ -224,6 +233,249 @@ fn clamp(limit: u32) -> u32 {
     limit.clamp(1, queries::MAX_LIMIT)
 }
 
+/// Build the opaque `next_cursor` for a page of library cards, given the effective sort +
+/// limit. Returns `None` when the page is short (list exhausted). Shared by `/api/library`
+/// and `/api/genres/:id`, whose page shape is identical (`docs/.tasks/91`).
+fn next_cursor_for(cards: &[medi_db::models::LibraryCard], sort: LibrarySort, limit: u32) -> Option<String> {
+    if (cards.len() as u32) < clamp(limit) {
+        return None;
+    }
+    cards.last().map(|last| {
+        let sort_value = match sort {
+            LibrarySort::SortTitle => last.sort_title.clone(),
+            LibrarySort::AddedAt => last.added_at.to_string(),
+        };
+        cursor::encode(&LibraryCursor {
+            sort_value,
+            kind_tag: kind_tag(last),
+            id: last.id,
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Genres & discovery (`docs/.tasks/91` Phase A)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/genres` — genres with ≥1 title, `count` = movies+series, ordered by count desc
+/// then name. Cached + ETag'd via `get_or_render`; invalidated with the catalog whenever a
+/// (re-)match or backfill can change a title's genres.
+async fn genres_list(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let db = state.db.clone();
+    state
+        .cache
+        .get_or_render("genres".to_string(), &headers, move || async move {
+            let genres = run_blocking(&db, queries::list_genres).await?;
+            let body: Vec<GenreListItem> = genres.into_iter().map(GenreListItem::from).collect();
+            serde_json::to_vec(&body).map_err(|e| ApiError::internal(e.to_string()))
+        })
+        .await
+}
+
+/// `GET /api/genres/:id?cursor=&limit=&sort=` — keyset-paginated grid of the titles in one
+/// genre. **Identical page shape to `/api/library`** (same `LibraryPage`/`LibraryItem` +
+/// cursor codec) so the client reuses its paging hook verbatim. Cached + ETag'd.
+async fn genre_titles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(genre_id): Path<i64>,
+    Query(q): Query<LibraryQuery>,
+) -> ApiResult<Response> {
+    let sort = parse_sort(q.sort.as_deref())?;
+    let limit = q.limit.unwrap_or(queries::DEFAULT_LIMIT);
+    let cursor = match q.cursor.as_deref() {
+        Some(token) if !token.is_empty() => Some(cursor::decode(token)?),
+        _ => None,
+    };
+
+    let cache_key = format!(
+        "genre/{genre_id}?sort={}&limit={}&cursor={}",
+        sort_label(sort),
+        limit,
+        q.cursor.as_deref().unwrap_or("")
+    );
+
+    let db = state.db.clone();
+    state
+        .cache
+        .get_or_render(cache_key, &headers, move || async move {
+            let cards = run_blocking(&db, move |conn| {
+                queries::list_by_genre(conn, genre_id, sort, cursor.as_ref(), limit)
+            })
+            .await?;
+            let next_cursor = next_cursor_for(&cards, sort, limit);
+            let page = LibraryPage {
+                items: cards.into_iter().map(LibraryItem::from_card).collect(),
+                next_cursor,
+            };
+            serde_json::to_vec(&page).map_err(|e| ApiError::internal(e.to_string()))
+        })
+        .await
+}
+
+/// `GET /api/people/:id` — a person page (`docs/.tasks/91` Phase B): the enriched person +
+/// their in-library filmography (newest first). Mirrors `movie_detail` (blocking DB read
+/// inside `get_or_render`); a `404` for an unknown id. Cache key `person/{id}`, invalidated
+/// with the catalog whenever a (re-)match / backfill can change a person's filmography.
+async fn person_page(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let key = format!("person/{id}");
+    let db = state.db.clone();
+    state
+        .cache
+        .get_or_render(key, &headers, move || async move {
+            let (person, films) = run_blocking(&db, move |conn| {
+                let person = queries::get_person(conn, id)?;
+                let films = queries::person_filmography(conn, id)?;
+                Ok((person, films))
+            })
+            .await?;
+            let filmography = films.into_iter().map(LibraryItem::from_card).collect();
+            let page = PersonPage::build(person, filmography);
+            serde_json::to_vec(&page).map_err(|e| ApiError::internal(e.to_string()))
+        })
+        .await
+}
+
+/// How many category rows the landing page shows beyond "Recently Added", and how many
+/// tiles each row carries. Small caps: the rows are a browse teaser, not a full grid.
+const ROWS_GENRE_COUNT: usize = 12;
+const ROW_ITEM_CAP: u32 = 20;
+
+/// `GET /api/library/rows` — the landing page's curated category rows in one request
+/// (`docs/.tasks/91`): "Recently Added" (by `added_at`) plus the top genres by count, each
+/// capped to `ROW_ITEM_CAP` tiles. A convenience aggregation so the landing page is one
+/// request instead of N. Cached + ETag'd; invalidated with the catalog.
+async fn library_rows(State(state): State<AppState>, headers: HeaderMap) -> ApiResult<Response> {
+    let db = state.db.clone();
+    state
+        .cache
+        .get_or_render("library/rows".to_string(), &headers, move || async move {
+            let rows = run_blocking(&db, move |conn| {
+                let mut out: Vec<CategoryRow> = Vec::new();
+
+                // "Recently Added" — the existing added_at ordering, capped.
+                let recent = queries::list_library(
+                    conn,
+                    LibrarySort::AddedAt,
+                    None,
+                    ROW_ITEM_CAP,
+                )?;
+                if !recent.is_empty() {
+                    out.push(CategoryRow {
+                        key: "recently_added".to_string(),
+                        title: "Recently Added".to_string(),
+                        items: recent.into_iter().map(LibraryItem::from_card).collect(),
+                        genre_id: None,
+                    });
+                }
+
+                // Top-N genres by count, each capped. list_genres is already count-ordered.
+                let genres = queries::list_genres(conn)?;
+                for g in genres.into_iter().take(ROWS_GENRE_COUNT) {
+                    let cards = queries::list_by_genre(
+                        conn,
+                        g.id,
+                        LibrarySort::AddedAt,
+                        None,
+                        ROW_ITEM_CAP,
+                    )?;
+                    if cards.is_empty() {
+                        continue;
+                    }
+                    out.push(CategoryRow {
+                        key: format!("genre:{}", g.id),
+                        title: g.name,
+                        items: cards.into_iter().map(LibraryItem::from_card).collect(),
+                        genre_id: Some(g.id),
+                    });
+                }
+                Ok(out)
+            })
+            .await?;
+
+            let body = LibraryRows { rows };
+            serde_json::to_vec(&body).map_err(|e| ApiError::internal(e.to_string()))
+        })
+        .await
+}
+
+/// Query params for `POST /api/metadata/backfill`.
+#[derive(Debug, Deserialize)]
+pub struct BackfillQuery {
+    /// `1`/`true` re-fetches **every** matched title (not just those missing genres), so a
+    /// library already genre-enriched picks up newly-added fields (collections, trailers,
+    /// person data). Default (absent) only touches titles still missing genres.
+    #[serde(default)]
+    force: Option<String>,
+}
+
+/// `POST /api/metadata/backfill[?force=1]` — kick a one-shot genre/person/collection/trailer
+/// backfill over already-matched titles (`docs/.tasks/91` §Backfill). `501` when no provider
+/// is configured (reuses `require_enrich`); otherwise spawns the backfill in the background
+/// and returns `202`. Idempotent to re-hit: a concurrent request while one runs is
+/// acknowledged as "already running" rather than starting a second pass. `?force=1` re-fetches
+/// every matched title so a library already genre-enriched picks up the newer detail fields.
+async fn metadata_backfill(
+    State(state): State<AppState>,
+    Query(q): Query<BackfillQuery>,
+) -> ApiResult<Response> {
+    // 501 when metadata is off — a client can tell "no provider" from a real failure.
+    let ctx = require_enrich(&state)?.clone();
+    let force = truthy(q.force.as_deref()) == Some(true);
+
+    // Spawn under the shared run-flag guard; a concurrent run is acknowledged, not doubled.
+    let already_running = spawn_backfill(&state, ctx, force);
+
+    let body = BackfillResponse {
+        status: "accepted",
+        already_running,
+    };
+    Ok((axum::http::StatusCode::ACCEPTED, Json(body)).into_response())
+}
+
+/// Spawn a background genre/person/collection/fanart backfill, guarded by
+/// [`AppState::backfill_running`] so at most one runs at a time. Returns whether one was
+/// **already** running (in which case nothing new is spawned). Shared by the
+/// `POST /api/metadata/backfill` handler and the periodic backfill task (`main.rs`) so both
+/// honor the same single-flight guard.
+pub fn spawn_backfill(
+    state: &AppState,
+    ctx: medi_metadata::EnrichContext,
+    force: bool,
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let already_running = state.backfill_running.swap(true, Ordering::SeqCst);
+    if !already_running {
+        let flag = state.backfill_running.clone();
+        let cache = state.cache.clone();
+        tokio::spawn(async move {
+            match medi_metadata::backfill_genres_people(&ctx, force).await {
+                Ok(report) => {
+                    tracing::info!(
+                        processed = report.processed,
+                        matched = report.matched,
+                        failed = report.failed,
+                        "genre/person/fanart backfill complete",
+                    );
+                    // A backfill can add genres/art to matched titles → drop cached catalog +
+                    // genre + detail responses so the new rows/artwork show up.
+                    if report.matched > 0 {
+                        cache.invalidate_all();
+                    }
+                }
+                Err(err) => tracing::error!(error = %err, "backfill failed"),
+            }
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+    already_running
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/movies/:id  and  GET /api/series/:id
 // ---------------------------------------------------------------------------
@@ -239,9 +491,25 @@ async fn movie_detail(
     state
         .cache
         .get_or_render(key, &headers, move || async move {
-            let detail =
-                run_blocking(&db, move |conn| queries::get_movie_detail(conn, id)).await?;
-            serde_json::to_vec(&detail).map_err(|e| ApiError::internal(e.to_string()))
+            let (detail, collection_cards) = run_blocking(&db, move |conn| {
+                let detail = queries::get_movie_detail(conn, id)?;
+                // The collection's other in-library movies (this one excluded), for the
+                // "Collection" row (Task 91 detail extensions).
+                let cards = match &detail.collection {
+                    Some(c) => queries::collection_movies(conn, c.id, id)?,
+                    None => Vec::new(),
+                };
+                Ok((detail, cards))
+            })
+            .await?;
+            let body = crate::dto::MovieDetailResponse {
+                detail,
+                collection_movies: collection_cards
+                    .into_iter()
+                    .map(LibraryItem::from_card)
+                    .collect(),
+            };
+            serde_json::to_vec(&body).map_err(|e| ApiError::internal(e.to_string()))
         })
         .await
 }
@@ -420,6 +688,22 @@ pub struct StreamQuery {
     /// `original` | `auto` | `capped`.
     #[serde(default)]
     quality: Option<String>,
+    /// Selected subtitle track (`docs/.tasks/90`): the ffprobe `stream_index` of an
+    /// embedded track, or the synthetic id (negative) of an external sidecar. Only used
+    /// together with `sub_burn=1` to force an image-subtitle burn-in; a text sub is
+    /// fetched as a `.vtt` sidecar and does not affect the decision.
+    #[serde(default)]
+    sub: Option<i64>,
+    /// `1` ⇒ burn the selected image subtitle into the video (the client sends this only
+    /// for image tracks). A text sub is never sent as `sub_burn`.
+    #[serde(default)]
+    sub_burn: Option<String>,
+    /// `1` ⇒ force a transcode even when the file would direct-play. The web player sends
+    /// this to recover when a `direct` stream turns out to be unplayable in the browser
+    /// (`<video>` raised `MEDIA_ERR_SRC_NOT_SUPPORTED` / `MEDIA_ERR_DECODE`) — it re-requests
+    /// with this flag to demand an H.264+AAC HLS stream hls.js can always play.
+    #[serde(default)]
+    force_transcode: Option<String>,
 }
 
 fn truthy(v: Option<&str>) -> Option<bool> {
@@ -437,6 +721,7 @@ fn parse_platform(raw: Option<&str>) -> Platform {
         Some("appletv") => Platform::AppleTv,
         Some("shield") => Platform::Shield,
         Some("androidtv") => Platform::AndroidTv,
+        Some("web") => Platform::Web,
         _ => Platform::Unknown,
     }
 }
@@ -554,6 +839,25 @@ fn default_audio_track(streams: &[medi_db::models::AudioStream]) -> AudioTrack {
     }
 }
 
+/// Map a selected absolute ffprobe subtitle `stream_index` to the *subtitle-relative*
+/// index ffmpeg's `0:s:<n>` selector uses — the track's position among the file's embedded
+/// subtitle tracks, ordered by `stream_index`. Returns `None` unless the selected track
+/// exists, is embedded (not an external sidecar), and is an **image** track (only image
+/// subtitles are burned in; a text track rides as a WebVTT sidecar).
+fn image_subtitle_relative_index(
+    subs: &[medi_db::models::SubtitleStream],
+    selected_stream_index: i64,
+) -> Option<i64> {
+    let mut embedded: Vec<&medi_db::models::SubtitleStream> =
+        subs.iter().filter(|s| !s.is_external && s.stream_index.is_some()).collect();
+    embedded.sort_by_key(|s| s.stream_index);
+    embedded
+        .iter()
+        .position(|s| s.stream_index == Some(selected_stream_index))
+        .filter(|&pos| embedded[pos].format == "image")
+        .map(|pos| pos as i64)
+}
+
 /// `GET /api/stream/:file_id` — direct-play vs transcode decision.
 ///
 /// Reads the `media_files` row, reconstructs its [`medi_core::MediaProfile`], and calls
@@ -579,7 +883,27 @@ async fn stream_decision(
     let audio = default_audio_track(&file.audio_streams);
     let container = file.container.as_deref().unwrap_or("");
 
-    let decision = decide(&profile, audio, container, &client, quality, &state.caps);
+    let mut decision = decide(&profile, audio, container, &client, quality, &state.caps);
+
+    // Image-subtitle burn-in (`docs/.tasks/90` §5): when the client selects an image track
+    // with `sub_burn=1`, force a transcode that overlays it. The value threaded to
+    // `command.rs` is the *subtitle-relative* index (`0:s:<n>`), not the absolute ffprobe
+    // stream index — so map the selected `stream_index` to its position among the file's
+    // embedded subtitle tracks. A text track (or a mismatched selection) is ignored here.
+    if truthy(q.sub_burn.as_deref()) == Some(true) {
+        if let Some(sel) = q.sub {
+            if let Some(rel) = image_subtitle_relative_index(&file.subtitle_streams, sel) {
+                decision = decision.with_burn_in(rel, &profile, &client, quality, &state.caps);
+            }
+        }
+    }
+
+    // `force_transcode=1`: promote a would-be direct-play into an HLS transcode. The web
+    // player sends this to recover when a `direct` stream is unplayable in the browser.
+    if truthy(q.force_transcode.as_deref()) == Some(true) {
+        decision = decision.force_transcode(&profile, &client, quality, &state.caps);
+    }
+
     tracing::info!(
         file_id,
         mode = decision.mode(),
@@ -656,6 +980,170 @@ async fn hls_asset(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(resp.into_response())
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/subtitles/:file_id/:index.vtt  — Phase 90 subtitle serving.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/subtitles/:file_id/:index.vtt` — serve a **text** subtitle track as WebVTT
+/// (`docs/.tasks/90` §5). `:index` is `<stream_index>.vtt` (embedded) or `ext<id>.vtt`
+/// (an external sidecar, addressed by its `subtitle_streams` row id).
+///
+/// - **Embedded text** (SRT / ASS / SSA / mov_text) → extract + convert with
+///   jellyfin-ffmpeg (`-map 0:s:<rel> -c:s webvtt`), cached at
+///   `/config/subs/<file_id>.<index>.vtt`, then served. CPU-trivial — it does **not**
+///   count against the GPU transcode-session cap.
+/// - **External `.vtt`** → served directly. **External SRT/ASS/SSA** → converted the same
+///   way and cached.
+/// - **Image** tracks (PGS / VobSub) → `415` (they can't become text; the client requests
+///   a burn-in via `/api/stream?...&sub_burn=1` instead).
+async fn subtitle_vtt(
+    State(state): State<AppState>,
+    Path((file_id, index)): Path<(i64, String)>,
+    req: Request,
+) -> ApiResult<Response> {
+    // Strip the trailing `.vtt` the client requests (the route matches `:index` greedily).
+    let index = index.strip_suffix(".vtt").unwrap_or(&index).to_string();
+
+    let db = state.db.clone();
+    let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
+
+    // Resolve the selected subtitle row: `ext<id>` addresses an external sidecar by row id;
+    // a bare number is an embedded track's ffprobe `stream_index`.
+    let sub = if let Some(rest) = index.strip_prefix("ext") {
+        let row_id: i64 = rest
+            .parse()
+            .map_err(|_| ApiError::bad_request("malformed external subtitle index"))?;
+        file.subtitle_streams
+            .iter()
+            .find(|s| s.is_external && s.id == row_id)
+            .cloned()
+    } else {
+        let stream_index: i64 = index
+            .parse()
+            .map_err(|_| ApiError::bad_request("malformed subtitle index"))?;
+        file.subtitle_streams
+            .iter()
+            .find(|s| !s.is_external && s.stream_index == Some(stream_index))
+            .cloned()
+    };
+    let sub = sub.ok_or_else(|| ApiError::not_found("no such subtitle track"))?;
+
+    // Image subtitles can't become text — the client must request a burn-in instead.
+    if sub.format == "image" {
+        return Err(ApiError::unsupported_media_type(
+            "image subtitle cannot be served as text; request a burn-in via /api/stream",
+        ));
+    }
+
+    // An external .vtt is already WebVTT — serve it straight from /media (read-only).
+    if sub.is_external {
+        if let Some(path) = &sub.external_path {
+            let is_vtt = std::path::Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("vtt"));
+            if is_vtt {
+                return serve_vtt_file(std::path::Path::new(path), req).await;
+            }
+        }
+    }
+
+    // Otherwise convert to WebVTT with jellyfin-ffmpeg and cache under /config/subs.
+    let cache_path = state
+        .config
+        .subs_dir()
+        .join(format!("{file_id}.{}.vtt", cache_key_for(&index)));
+
+    if !cache_path.exists() {
+        convert_to_webvtt(&file, &sub, &cache_path).await?;
+    }
+    serve_vtt_file(&cache_path, req).await
+}
+
+/// A filesystem-safe cache key fragment for a subtitle index (`ext5` / `2`). The index is
+/// already `[0-9]+` or `ext[0-9]+`, so this is a passthrough kept as a single choke point.
+fn cache_key_for(index: &str) -> String {
+    index.replace(|c: char| !c.is_ascii_alphanumeric(), "_")
+}
+
+/// Extract + convert one subtitle track (embedded or an external text sidecar) to WebVTT
+/// with jellyfin-ffmpeg, writing `out`. Text extraction is a stream convert (no video
+/// decode) so it is CPU-trivial and does not touch the GPU transcode-session cap.
+async fn convert_to_webvtt(
+    file: &medi_db::models::MediaFile,
+    sub: &medi_db::models::SubtitleStream,
+    out: &std::path::Path,
+) -> ApiResult<()> {
+    if let Some(parent) = out.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| ApiError::internal(format!("subs dir: {e}")))?;
+    }
+
+    // Input + stream selection: for an external sidecar the input is the sidecar file
+    // (its single stream 0:s:0); for an embedded track the input is the media file and we
+    // select its subtitle-relative index.
+    let (input, map) = if sub.is_external {
+        let path = sub
+            .external_path
+            .clone()
+            .ok_or_else(|| ApiError::internal("external subtitle missing path"))?;
+        (path, "0:s:0".to_string())
+    } else {
+        let rel = embedded_subtitle_relative_index(&file.subtitle_streams, sub)
+            .ok_or_else(|| ApiError::internal("subtitle track not found for conversion"))?;
+        (file.path.clone(), format!("0:s:{rel}"))
+    };
+
+    let status = tokio::process::Command::new(medi_transcode::caps::ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-i"])
+        .arg(&input)
+        .args(["-map", &map, "-c:s", "webvtt", "-f", "webvtt"])
+        .arg(out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| ApiError::internal(format!("ffmpeg spawn: {e}")))?;
+
+    if !status.success() {
+        // Don't leave a partial/empty cache file behind on failure.
+        let _ = tokio::fs::remove_file(out).await;
+        return Err(ApiError::internal("subtitle conversion failed"));
+    }
+    Ok(())
+}
+
+/// The subtitle-relative (`0:s:<n>`) index of an embedded track — its position among the
+/// file's embedded subtitle tracks ordered by `stream_index`.
+fn embedded_subtitle_relative_index(
+    subs: &[medi_db::models::SubtitleStream],
+    target: &medi_db::models::SubtitleStream,
+) -> Option<i64> {
+    let mut embedded: Vec<&medi_db::models::SubtitleStream> =
+        subs.iter().filter(|s| !s.is_external && s.stream_index.is_some()).collect();
+    embedded.sort_by_key(|s| s.stream_index);
+    embedded
+        .iter()
+        .position(|s| s.id == target.id)
+        .map(|p| p as i64)
+}
+
+/// Serve a WebVTT file with the correct content type, via `ServeFile` (handles `Range`).
+async fn serve_vtt_file(path: &std::path::Path, req: Request) -> ApiResult<Response> {
+    let serve = ServeFile::new(path);
+    let mut resp = serve
+        .oneshot(req)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .into_response();
+    resp.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/vtt; charset=utf-8"),
+    );
+    Ok(resp)
 }
 
 // ---------------------------------------------------------------------------

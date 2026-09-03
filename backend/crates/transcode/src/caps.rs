@@ -20,6 +20,8 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
+use medi_core::VideoCodec;
+
 use crate::Vendor;
 
 /// The ffmpeg binary. jellyfin-ffmpeg installs as `ffmpeg` on `PATH` inside the
@@ -73,10 +75,54 @@ impl HwCaps {
     pub fn has_encoder(&self, name: &str) -> bool {
         self.encoders.iter().any(|e| e == name)
     }
+
+    /// Can the host hardware-**decode** this source codec (`docs/.tasks/90` §per-codec
+    /// HW-decode)? Generalizes the old AV1-only special case: a transcode of any codec
+    /// this returns `false` for must fall back to a software decoder feeding the HW (or
+    /// SW) encoder.
+    ///
+    /// H.264 / HEVC are decoded by every HWA vendor path this server targets. The newer
+    /// codecs are gated on the host advertising the matching `-hwaccels` token (e.g. Intel
+    /// QSV decodes MPEG-2 / VC-1 / VP9; NVDEC decodes VP9), keyed off the codec name so
+    /// AV1→dav1d stays one arm of the same rule.
+    pub fn can_hw_decode(&self, codec: VideoCodec) -> bool {
+        match codec {
+            // Ubiquitous HW decode across Intel/NVIDIA/AMD.
+            VideoCodec::H264 | VideoCodec::Hevc => self.vendor.is_some(),
+            // Newer codecs: only when the host advertises the hwaccel token. `Other` is
+            // by definition undecodable in hardware.
+            VideoCodec::Av1 => self.has_hwaccel("av1"),
+            VideoCodec::Vp9 => self.has_hwaccel("vp9"),
+            VideoCodec::Vc1 => self.has_hwaccel("vc1"),
+            VideoCodec::Mpeg2 => self.has_hwaccel("mpeg2") || self.has_hwaccel("mpeg2video"),
+            VideoCodec::Mpeg4 => self.has_hwaccel("mpeg4"),
+            VideoCodec::Other => false,
+        }
+    }
+
+    /// Does ffmpeg report a `-hwaccels` token containing `needle` (case-insensitive)?
+    /// Tokens are stored lowercased by [`probe`]. A substring match tolerates the
+    /// `qsv`/`vaapi`/`cuda`-suffixed variants some builds print.
+    fn has_hwaccel(&self, needle: &str) -> bool {
+        self.hwaccels.iter().any(|h| h.contains(needle))
+    }
 }
 
 /// Probe the host and build [`HwCaps`]. Runs a few subprocesses; call once at boot.
 pub async fn probe() -> HwCaps {
+    // Explicit software override (`docs/.tasks/92` §5): a dev container that wants the
+    // libx264 path — e.g. the Windows software fallback where no GPU can be passed through —
+    // sets `MEDI_GPU_VENDOR=none`. Short-circuit to `software_only()` so a stray host-GPU
+    // signal never misfires and boot skips the probe subprocesses. Every other override and
+    // the auto-detect path below are unchanged.
+    if std::env::var("MEDI_GPU_VENDOR").ok().as_deref() == Some("none") {
+        tracing::info!("MEDI_GPU_VENDOR=none — using software-only transcode (libx264)");
+        warn_if_ffmpeg_missing().await;
+        return HwCaps::software_only();
+    }
+
+    warn_if_ffmpeg_missing().await;
+
     let render_node = first_render_node();
     let nvidia = nvidia_present().await;
 
@@ -123,6 +169,35 @@ pub async fn probe() -> HwCaps {
         "probed host hardware capabilities",
     );
     caps
+}
+
+/// Whether the configured ffmpeg binary can actually be run (`ffmpeg -version` succeeds).
+/// A best-effort check used only for a startup warning — the real transcode still shells
+/// out to `ffmpeg_bin()` per session.
+pub async fn ffmpeg_available() -> bool {
+    Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-version"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Log a loud warning when ffmpeg is not runnable. Without ffmpeg, every transcode
+/// (HEVC / MKV / AC-3 / HDR / a forced browser transcode) fails at session start — the
+/// symptom a user sees is "playback unavailable" with no obvious cause. Surface it once at
+/// boot so a missing binary (e.g. not on PATH on a Windows dev host) is diagnosable.
+async fn warn_if_ffmpeg_missing() {
+    if !ffmpeg_available().await {
+        tracing::warn!(
+            ffmpeg = %ffmpeg_bin(),
+            "ffmpeg is not runnable — direct-play still works, but any file needing a \
+             transcode (HEVC/MKV/AC-3/HDR, or a forced browser transcode) will fail to play. \
+             Install ffmpeg on PATH or set FFMPEG_BIN.",
+        );
+    }
 }
 
 /// First `/dev/dri/renderD*` node, if any (Intel/AMD).
@@ -262,5 +337,18 @@ mod tests {
         caps.encoders = vec!["h264_qsv".into(), "libx264".into()];
         assert!(caps.has_encoder("h264_qsv"));
         assert!(!caps.has_encoder("hevc_nvenc"));
+    }
+
+    /// `MEDI_GPU_VENDOR=none` short-circuits `probe()` to software-only (`docs/.tasks/92` §5),
+    /// so the Windows software-fallback dev loop never misfires on a stray host-GPU signal.
+    /// This is the only `probe`-calling test and the only reader of `MEDI_GPU_VENDOR`, so the
+    /// set/remove around it does not race other tests.
+    #[tokio::test]
+    async fn gpu_vendor_none_forces_software_only() {
+        std::env::set_var("MEDI_GPU_VENDOR", "none");
+        let caps = probe().await;
+        std::env::remove_var("MEDI_GPU_VENDOR");
+        assert_eq!(caps, HwCaps::software_only());
+        assert!(caps.vendor.is_none());
     }
 }

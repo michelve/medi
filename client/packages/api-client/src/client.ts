@@ -15,18 +15,25 @@
 import { ApiError } from './errors';
 import type {
   ApiErrorBody,
+  BackfillResponse,
   CreateLibraryRequest,
+  GenreCount,
   Library,
   LibraryPage,
+  LibraryRows,
   LibrarySort,
   MatchesResponse,
   MovieDetail,
   PatchLibraryRequest,
+  PersonPage,
+  ProbeFailuresPage,
   RefreshResponse,
   SeriesDetail,
   StreamDecision,
   StreamHints,
+  SystemStatus,
   TrickplayMetaResponse,
+  UnmatchedPage,
 } from './types';
 
 export interface ApiClientOptions {
@@ -92,6 +99,36 @@ export class ApiClient {
     return this.getJson<LibraryPage>(`/api/library${qs ? `?${qs}` : ''}`, opts);
   }
 
+  /**
+   * `GET /api/library/rows` — the landing page's curated category rows ("Recently Added"
+   * plus top genres) in one request (`docs/.tasks/91`). ETag-cached like the catalog.
+   */
+  libraryRows(opts: RequestOptions = {}): Promise<LibraryRows> {
+    return this.getJson<LibraryRows>('/api/library/rows', opts);
+  }
+
+  /** `GET /api/genres` — genres with ≥1 title, ordered by count desc then name. */
+  genres(opts: RequestOptions = {}): Promise<GenreCount[]> {
+    return this.getJson<GenreCount[]>('/api/genres', opts);
+  }
+
+  /**
+   * `GET /api/genres/:id` — one genre's keyset-paginated grid. **Same page shape as
+   * `library()`** (`LibraryPage`), so a paging hook can point at either endpoint.
+   */
+  genreTitles(
+    genreId: number,
+    query: LibraryQuery = {},
+    opts: RequestOptions = {},
+  ): Promise<LibraryPage> {
+    const params = new URLSearchParams();
+    if (query.cursor) params.set('cursor', query.cursor);
+    if (query.limit != null) params.set('limit', String(query.limit));
+    if (query.sort) params.set('sort', query.sort);
+    const qs = params.toString();
+    return this.getJson<LibraryPage>(`/api/genres/${genreId}${qs ? `?${qs}` : ''}`, opts);
+  }
+
   /** `GET /api/movies/:id` — full movie detail. */
   movie(id: number, opts: RequestOptions = {}): Promise<MovieDetail> {
     return this.getJson<MovieDetail>(`/api/movies/${id}`, opts);
@@ -100,6 +137,14 @@ export class ApiClient {
   /** `GET /api/series/:id` — full series detail. */
   series(id: number, opts: RequestOptions = {}): Promise<SeriesDetail> {
     return this.getJson<SeriesDetail>(`/api/series/${id}`, opts);
+  }
+
+  /**
+   * `GET /api/people/:id` — a person page (`docs/.tasks/91` Phase B): the person's bio +
+   * headshot and their in-library filmography. ETag-cached like the rest of the catalog.
+   */
+  person(id: number, opts: RequestOptions = {}): Promise<PersonPage> {
+    return this.getJson<PersonPage>(`/api/people/${id}`, opts);
   }
 
   /**
@@ -127,6 +172,15 @@ export class ApiClient {
     if (audio.length) params.set('audio', audio.join(','));
     if (hints.maxBitrate != null) params.set('max_bitrate', String(hints.maxBitrate));
     if (hints.quality) params.set('quality', hints.quality);
+    // Task 90 image-subtitle burn-in: send the selected track + the burn flag. A text
+    // subtitle is never sent here — it is fetched as a `.vtt` sidecar via `subtitleUrl`.
+    if (hints.subBurn && hints.sub != null) {
+      params.set('sub', String(hints.sub));
+      params.set('sub_burn', '1');
+    }
+    // Force a server transcode even when the file would direct-play — the web player's
+    // fallback when a `direct` stream proved unplayable in the browser.
+    if (hints.forceTranscode) params.set('force_transcode', '1');
     const qs = params.toString();
     // Not cached: a stream decision may spin up a transcode session.
     return this.getJson<StreamDecision>(
@@ -207,6 +261,64 @@ export class ApiClient {
     if (!res.ok) throw await ApiError.fromResponse(res);
   }
 
+  /**
+   * `POST /api/metadata/backfill[?force=1]` — run a background pass over already-matched
+   * titles, filling any newer detail fields / artwork (genres, collections, fanart logos +
+   * wallpapers) that landed since they were matched. Returns immediately; `already_running`
+   * is `true` when a backfill was already in flight. `force` re-fetches every matched title.
+   * Throws a `501` `ApiError` when no metadata provider is configured.
+   */
+  backfillMetadata(force = false, opts: RequestOptions = {}): Promise<BackfillResponse> {
+    const qs = force ? '?force=1' : '';
+    return this.sendJson<BackfillResponse>('POST', `/api/metadata/backfill${qs}`, undefined, opts);
+  }
+
+  /**
+   * `POST /api/metadata/enrich` — kick a background enrichment pass over pending/failed
+   * titles (`docs/.tasks/96`), without waiting for the next scan or the periodic backstop.
+   * Returns immediately (`202`); tallies land in `status()`. `501` when no provider is set.
+   */
+  enrichMetadata(opts: RequestOptions = {}): Promise<{ status: string }> {
+    return this.sendJson<{ status: string }>('POST', '/api/metadata/enrich', undefined, opts);
+  }
+
+  // -- Status & observability (`docs/.tasks/96`) ---------------------------
+
+  /** `GET /api/status` — enrichment/ingest status: counts, providers, last runs. */
+  status(opts: RequestOptions = {}): Promise<SystemStatus> {
+    // Not ETag-cached: status must be live.
+    return this.getJson<SystemStatus>('/api/status', opts, false);
+  }
+
+  /** `GET /api/status/unmatched` — a keyset page of unmatched/failed titles. */
+  unmatched(
+    query: { kind?: 'movie' | 'series'; after?: number; limit?: number } = {},
+    opts: RequestOptions = {},
+  ): Promise<UnmatchedPage> {
+    const params = new URLSearchParams();
+    if (query.kind) params.set('kind', query.kind);
+    if (query.after != null) params.set('after', String(query.after));
+    if (query.limit != null) params.set('limit', String(query.limit));
+    const qs = params.toString();
+    return this.getJson<UnmatchedPage>(`/api/status/unmatched${qs ? `?${qs}` : ''}`, opts, false);
+  }
+
+  /** `GET /api/status/probe-failures` — a keyset page of ffprobe-failed files. */
+  probeFailures(
+    query: { after?: number; limit?: number } = {},
+    opts: RequestOptions = {},
+  ): Promise<ProbeFailuresPage> {
+    const params = new URLSearchParams();
+    if (query.after != null) params.set('after', String(query.after));
+    if (query.limit != null) params.set('limit', String(query.limit));
+    const qs = params.toString();
+    return this.getJson<ProbeFailuresPage>(
+      `/api/status/probe-failures${qs ? `?${qs}` : ''}`,
+      opts,
+      false,
+    );
+  }
+
   /** `GET /api/health` — liveness probe. Resolves to `true` on `200`. */
   async health(opts: RequestOptions = {}): Promise<boolean> {
     const res = await this.doFetch(this.abs('/api/health'), {
@@ -239,6 +351,17 @@ export class ApiClient {
   /** `GET /api/direct/:file_id` — direct-play byte-range source stream. */
   directUrl(fileId: number): string {
     return this.abs(`/api/direct/${fileId}`);
+  }
+
+  /**
+   * `GET /api/subtitles/:file_id/:index.vtt` — a **text** subtitle track as WebVTT
+   * (`docs/.tasks/90`). `index` is the embedded `stream_index`, or `ext<id>` for an
+   * external sidecar (its `subtitle_streams` row id). Use as a react-native-video
+   * `textTracks` URI so a direct-played file still shows subtitles without a transcode.
+   * Image tracks are not served here — request a burn-in via `stream(..., { sub, subBurn })`.
+   */
+  subtitleUrl(fileId: number, index: number | string): string {
+    return this.abs(`/api/subtitles/${fileId}/${index}.vtt`);
   }
 
   /**
