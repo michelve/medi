@@ -54,7 +54,21 @@ struct Session {
     dir: PathBuf,
     /// Last time a file of this session was requested — drives idle teardown.
     last_access: Instant,
+    /// When the session was created — used to reap a session that was started but never
+    /// consumed (the client got an error, or double-requested) before it wastes GPU/a slot.
+    created: Instant,
+    /// Whether any file of this session has been fetched yet. A session that has served at
+    /// least one file is a real playback; one that never has is a candidate for early reaping.
+    consumed: bool,
+    /// Fingerprint of `(input, target, audio)` so an identical request reuses this session
+    /// instead of spawning a second ffmpeg for the same output.
+    key: String,
 }
+
+/// How long an unconsumed session (started, but no file ever fetched) may live before the
+/// reaper drops it. Shorter than [`IDLE_TIMEOUT`] so a burst of failed/duplicate requests
+/// (React StrictMode double-mount, rapid reloads) can't exhaust the capacity cap.
+pub const UNCONSUMED_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Shared, cloneable manager of all live transcode sessions.
 #[derive(Clone)]
@@ -99,6 +113,27 @@ impl SessionManager {
         audio: AudioTarget,
     ) -> Result<String, SessionError> {
         let mut sessions = self.inner.sessions.lock().await;
+
+        // Reuse an identical, still-running session instead of spawning a second ffmpeg for
+        // the same output. This is what stops a burst of duplicate requests — a React
+        // StrictMode double-mount, a reload, a retry — from consuming multiple capacity slots
+        // (and multiple GPU pipelines) for one title. A session whose ffmpeg has already
+        // exited is not reused (a failed encode should re-run, not hand back a dead session).
+        let key = session_key(input, target, audio);
+        let reusable = sessions
+            .iter_mut()
+            .find_map(|(id, s)| {
+                let alive = !matches!(s.child.try_wait(), Ok(Some(_)));
+                (s.key == key && alive).then(|| {
+                    s.last_access = Instant::now();
+                    id.clone()
+                })
+            });
+        if let Some(id) = reusable {
+            tracing::info!(session = %id, input = %input.display(), "reusing transcode session");
+            return Ok(id);
+        }
+
         if sessions.len() >= self.inner.max_sessions {
             return Err(SessionError::CapacityReached(self.inner.max_sessions));
         }
@@ -123,12 +158,16 @@ impl SessionManager {
             .spawn()
             .map_err(SessionError::Spawn)?;
 
+        let now = Instant::now();
         sessions.insert(
             id.clone(),
             Session {
                 child,
                 dir,
-                last_access: Instant::now(),
+                last_access: now,
+                created: now,
+                consumed: false,
+                key,
             },
         );
         Ok(id)
@@ -151,6 +190,7 @@ impl SessionManager {
         let mut sessions = self.inner.sessions.lock().await;
         let session = sessions.get_mut(session_id).ok_or(SessionError::NotFound)?;
         session.last_access = Instant::now();
+        session.consumed = true;
         Ok(session.dir.join(file))
     }
 
@@ -180,9 +220,13 @@ impl SessionManager {
             .iter_mut()
             .filter_map(|(id, s)| {
                 let idle = now.duration_since(s.last_access) >= IDLE_TIMEOUT;
+                // A session started but never consumed (client errored / duplicated the
+                // request) is dropped after a short grace so it can't hold a capacity slot.
+                let abandoned =
+                    !s.consumed && now.duration_since(s.created) >= UNCONSUMED_TIMEOUT;
                 // `try_wait` returns Ok(Some(_)) once the process has exited.
                 let exited = matches!(s.child.try_wait(), Ok(Some(_)));
-                (idle || exited).then(|| id.clone())
+                (idle || abandoned || exited).then(|| id.clone())
             })
             .collect();
         for id in &stale {
@@ -228,6 +272,14 @@ async fn teardown(s: &mut Session) {
     }
 }
 
+/// Fingerprint a transcode request so identical `(input, target, audio)` calls reuse one
+/// session. `TranscodeTarget` and `AudioTarget` are small, `Debug`-printable value types; a
+/// debug string is a cheap, allocation-light stable key (no hashing crate needed) — two
+/// requests match iff every decision-affecting field matches.
+fn session_key(input: &Path, target: &TranscodeTarget, audio: AudioTarget) -> String {
+    format!("{}|{:?}|{:?}", input.display(), target, audio)
+}
+
 /// A random, URL-safe session id. Not security-sensitive (LAN appliance, no auth); just
 /// needs to be unique and path-safe. Derived from a couple of entropy sources without a
 /// new crate dependency.
@@ -248,7 +300,7 @@ fn new_session_id() -> String {
 mod tests {
     use super::*;
     use crate::decision::Vendor;
-    use medi_core::VideoCodec;
+    use medi_core::{AudioCodec, VideoCodec};
 
     fn target() -> TranscodeTarget {
         TranscodeTarget {
@@ -289,37 +341,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identical_request_reuses_session() {
+        // A second identical start must return the SAME session id (not a new ffmpeg), so a
+        // duplicate request (StrictMode double-mount, reload) can't consume two slots. Use
+        // `sleep` as a fake ffmpeg that stays alive long enough to be reused.
+        std::env::set_var("FFMPEG_BIN", "cat");
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path(), 4);
+        let input = dir.path().join("in.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        let a = mgr.start(&input, &target(), AudioTarget::Copy).await.unwrap();
+        let b = mgr.start(&input, &target(), AudioTarget::Copy).await.unwrap();
+        assert_eq!(a, b, "identical request must reuse the session");
+        assert_eq!(mgr.active_count().await, 1, "only one ffmpeg for one output");
+
+        // A DIFFERENT audio target is a different output → a new session.
+        let c = mgr
+            .start(&input, &target(), AudioTarget::Transcode { codec: AudioCodec::Aac, channels: 2 })
+            .await
+            .unwrap();
+        assert_ne!(a, c, "different target must not reuse");
+        assert_eq!(mgr.active_count().await, 2);
+
+        std::env::remove_var("FFMPEG_BIN");
+    }
+
+    #[tokio::test]
     async fn capacity_cap_is_enforced() {
-        // Use `true` (the shell builtin, always present on the CI image) as a fake
-        // ffmpeg that exits 0 immediately; the session still registers before exit.
-        std::env::set_var("FFMPEG_BIN", "true");
+        // A long-lived fake ffmpeg (`sleep`) so the first session stays alive and actually
+        // holds the single slot. Two DIFFERENT inputs so session reuse never applies — this
+        // test is about the capacity cap, not dedup.
+        std::env::set_var("FFMPEG_BIN", "cat");
         let dir = tempfile::tempdir().unwrap();
         let mgr = manager(dir.path(), 1);
 
         let input = dir.path().join("in.mkv");
         std::fs::write(&input, b"x").unwrap();
+        let other = dir.path().join("other.mkv");
+        std::fs::write(&other, b"y").unwrap();
 
         let first = mgr.start(&input, &target(), AudioTarget::Copy).await;
         assert!(first.is_ok(), "first session should start: {first:?}");
 
-        // The cap is 1; the second start is rejected until the first is reaped.
-        let second = mgr.start(&input, &target(), AudioTarget::Copy).await;
+        // The cap is 1; a start for a DIFFERENT output is rejected until the first is reaped.
+        let second = mgr.start(&other, &target(), AudioTarget::Copy).await;
         assert!(matches!(second, Err(SessionError::CapacityReached(1))));
 
-        // Reaping the (already-exited `true`) process frees the slot. The child exits
-        // almost immediately, but there is a spawn→exit scheduling race: `reap_idle`
-        // only reaps once `try_wait()` observes the exit, so poll a few times rather
-        // than assume the first sweep sees it.
-        let mut reaped = 0;
-        for _ in 0..50 {
-            reaped += mgr.reap_idle().await;
-            if reaped >= 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(reaped >= 1, "the exited fake-ffmpeg session should be reaped");
+        // Tearing the first session down frees the slot deterministically (no reliance on
+        // process-exit timing), after which a new start succeeds.
+        assert_eq!(mgr.active_count().await, 1);
+        mgr.stop(&first.unwrap()).await.unwrap();
         assert_eq!(mgr.active_count().await, 0);
+        let third = mgr.start(&other, &target(), AudioTarget::Copy).await;
+        assert!(third.is_ok(), "slot freed → a new session starts: {third:?}");
 
         std::env::remove_var("FFMPEG_BIN");
     }

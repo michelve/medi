@@ -231,7 +231,33 @@ export function VideoPlayer({
         return;
       }
       diag.info('hls', `hls.js ${Hls.version} ready`, { workers: true });
-      const hls = new Hls({ enableWorker: true });
+      // The stream is transcoded ON THE FLY: when the decision starts a fresh session, the
+      // first segment (and thus index.m3u8) takes several seconds to appear — a 4K HDR→SDR
+      // first segment measured ~6s. hls.js's default manifest-load policy gives up after a
+      // couple of quick retries, so it 404s before ffmpeg has written anything. Widen the
+      // retry budget generously so it polls the playlist until the transcoder produces it.
+      const hls = new Hls({
+        enableWorker: true,
+        // v1.x load policies: retry the manifest for ~20s (many attempts, capped backoff) so
+        // an on-the-fly transcode's warm-up 404s are transient, not fatal.
+        manifestLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 20_000,
+            maxLoadTimeMs: 20_000,
+            timeoutRetry: { maxNumRetry: 4, retryDelayMs: 1000, maxRetryDelayMs: 2000 },
+            errorRetry: { maxNumRetry: 20, retryDelayMs: 1000, maxRetryDelayMs: 2000 },
+          },
+        },
+        // Segments can also lag slightly behind the playlist edge; give them room too.
+        playlistLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 20_000,
+            maxLoadTimeMs: 20_000,
+            timeoutRetry: { maxNumRetry: 4, retryDelayMs: 1000, maxRetryDelayMs: 2000 },
+            errorRetry: { maxNumRetry: 20, retryDelayMs: 1000, maxRetryDelayMs: 2000 },
+          },
+        },
+      });
       instance = hls;
       attachHlsDiagnostics(hls, Hls, diag);
       hls.loadSource(hlsUrl);

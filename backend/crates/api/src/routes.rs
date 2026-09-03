@@ -972,6 +972,15 @@ async fn hls_asset(
         .await
         .map_err(map_session_err)?;
 
+    // The *playlist* is special: on a freshly-started session ffmpeg needs a few seconds to
+    // encode the first segment before it writes `index.m3u8`. If we 404 immediately, a client
+    // that doesn't retry the manifest (native Safari HLS) dead-ends, and even hls.js reports a
+    // scary error first. So for the playlist only, briefly wait for it to appear (bounded) —
+    // segments still 404-and-retry naturally. Refreshes the idle timer via resolve_file above.
+    if file == PLAYLIST_NAME && !path.exists() {
+        wait_for_file(&path, std::time::Duration::from_secs(12)).await;
+    }
+
     // The file may not exist yet if ffmpeg hasn't written this segment — ServeFile
     // returns a natural 404 the client retries.
     let serve = ServeFile::new(&path);
@@ -980,6 +989,19 @@ async fn hls_asset(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(resp.into_response())
+}
+
+/// Wait for `path` to exist, up to `timeout`, polling briefly. Used to let a just-started
+/// transcode write its first playlist before we serve `/api/hls/<id>/index.m3u8`. Returns as
+/// soon as the file appears; on timeout the caller serves whatever's there (a natural 404).
+async fn wait_for_file(path: &std::path::Path, timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
