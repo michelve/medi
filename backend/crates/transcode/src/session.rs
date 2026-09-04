@@ -66,6 +66,12 @@ struct Session {
     /// Fingerprint of `(input, target, audio)` so an identical request reuses this session
     /// instead of spawning a second ffmpeg for the same output.
     key: String,
+    /// Latched ffmpeg exit outcome, observed once the process is seen to have exited:
+    /// `None` while still running, `Some(true)` for a clean exit (a completed encode — its
+    /// segments are on disk and the session is still reusable/seekable), `Some(false)` for a
+    /// failed encode (must NOT be reused; a fresh spawn should replace it). Latched because
+    /// `Child::try_wait` only reports the status reliably on the first observation.
+    exited: Option<bool>,
     // --- everything needed to (re)spawn ffmpeg at a seek target ---------------
     input: PathBuf,
     target: TranscodeTarget,
@@ -133,28 +139,44 @@ impl SessionManager {
     ) -> Result<String, SessionError> {
         let mut sessions = self.inner.sessions.lock().await;
 
-        // Reuse an identical, still-running session instead of spawning a second ffmpeg for
-        // the same output. This is what stops a burst of duplicate requests — a React
-        // StrictMode double-mount, a reload, a retry — from consuming multiple capacity slots
-        // (and multiple GPU pipelines) for one title. A session whose ffmpeg has already
-        // exited is not reused (a failed encode should re-run, not hand back a dead session).
+        // Reuse an identical session instead of spawning a second ffmpeg for the same output.
+        // This is what stops a burst of duplicate requests — a React StrictMode double-mount, a
+        // reload, a retry — from consuming multiple capacity slots (and multiple GPU pipelines)
+        // for one title. A session is reusable while its ffmpeg is running OR after it has
+        // *finished cleanly*: a completed VOD encode's segments stay on disk and are still
+        // seekable, so a later request (retry, re-mount, audio-menu re-open) must hand back that
+        // session, not spawn a fresh ffmpeg — otherwise sequential retries pile up dead
+        // sessions until the capacity cap trips (the 409 storm this fixes). Only a *failed*
+        // encode is not reused (it should re-run).
         let key = session_key(input, target, audio);
-        let reusable = sessions
-            .iter_mut()
-            .find_map(|(id, s)| {
-                let alive = !matches!(s.child.try_wait(), Ok(Some(_)));
-                (s.key == key && alive).then(|| {
-                    s.last_access = Instant::now();
-                    id.clone()
-                })
-            });
+        let reusable = sessions.iter_mut().find_map(|(id, s)| {
+            (s.key == key && s.poll_reusable()).then(|| {
+                s.last_access = Instant::now();
+                id.clone()
+            })
+        });
         if let Some(id) = reusable {
             tracing::info!(session = %id, input = %input.display(), "reusing transcode session");
             return Ok(id);
         }
 
         if sessions.len() >= self.inner.max_sessions {
-            return Err(SessionError::CapacityReached(self.inner.max_sessions));
+            // Before rejecting, evict a failed/dead session that is only occupying a slot: a
+            // crashed encode is not reusable (above) yet still counts against the cap, so a
+            // retry after a failure could otherwise be starved out permanently. Reclaim one
+            // such slot on demand (the periodic reaper handles idle/abandoned ones).
+            let dead: Option<String> = sessions
+                .iter_mut()
+                .find_map(|(id, s)| (!s.poll_reusable()).then(|| id.clone()));
+            match dead {
+                Some(id) => {
+                    if let Some(mut s) = sessions.remove(&id) {
+                        tracing::info!(session = %id, "evicting failed transcode session to free a slot");
+                        teardown(&mut s).await;
+                    }
+                }
+                None => return Err(SessionError::CapacityReached(self.inner.max_sessions)),
+            }
         }
 
         let id = new_session_id();
@@ -176,6 +198,7 @@ impl SessionManager {
                 created: now,
                 consumed: false,
                 key,
+                exited: None,
                 input: input.to_path_buf(),
                 target: target.clone(),
                 audio,
@@ -245,15 +268,19 @@ impl SessionManager {
             if path.exists() {
                 return Ok(path);
             }
-            // Is the current ffmpeg producing toward this segment (still alive, and the segment
-            // is at/after where it started, within a small lookahead)?
-            let alive = !matches!(s.child.try_wait(), Ok(Some(_)));
+            // Is the current ffmpeg producing toward this segment (still running, and the
+            // segment is at/after where it started, within a small lookahead)? Latch liveness
+            // first; a session that finished (cleanly or not) counts as not-running here, so a
+            // request past its produced range correctly restarts ffmpeg.
+            let _ = s.poll_reusable();
+            let running = s.exited.is_none();
             let in_window = seg_index >= s.producing_from
                 && seg_index <= s.producing_from + SEEK_LOOKAHEAD_SEGMENTS;
-            need_restart = !(alive && in_window);
+            need_restart = !(running && in_window);
 
             if need_restart {
-                // Seek: kill the current ffmpeg and restart it at the requested segment.
+                // Seek (or resume from a completed encode): kill any current ffmpeg and restart
+                // it at the requested segment.
                 let _ = s.child.start_kill();
                 let child = self.spawn_ffmpeg(
                     &s.input,
@@ -263,6 +290,7 @@ impl SessionManager {
                     seg_index,
                 )?;
                 s.child = child;
+                s.exited = None; // a fresh child is running again
                 s.producing_from = seg_index;
                 tracing::info!(session = %session_id, seg_index, "seek: restarting transcode at segment");
             }
@@ -318,11 +346,12 @@ impl SessionManager {
         let stale: Vec<String> = sessions
             .iter_mut()
             .filter_map(|(id, s)| {
-                // Reap the ffmpeg zombie of an exited process, but do NOT tear the session
-                // down just because ffmpeg finished: a completed encode's segments stay on
-                // disk and are still seekable (a seek restarts ffmpeg). Only idleness (no
-                // access) or an unconsumed start drops a session.
-                let _ = s.child.try_wait();
+                // Reap the ffmpeg zombie of an exited process (and latch its outcome into
+                // `exited` so `poll_reusable` stays correct), but do NOT tear the session down
+                // just because ffmpeg finished: a completed encode's segments stay on disk and
+                // are still seekable (a seek restarts ffmpeg). Only idleness (no access) or an
+                // unconsumed start drops a session.
+                let _ = s.poll_reusable();
                 let idle = now.duration_since(s.last_access) >= IDLE_TIMEOUT;
                 // A session started but never consumed (client errored / duplicated the
                 // request) is dropped after a short grace so it can't hold a capacity slot.
@@ -363,6 +392,25 @@ impl SessionManager {
 
 /// Kill a session's process and remove its output directory. Best-effort — logs but
 /// does not fail on a cleanup error, since the session is already being dropped.
+impl Session {
+    /// Poll ffmpeg's liveness and latch its outcome into `self.exited`. Returns the reuse
+    /// state: `true` if this session can serve a fresh identical request (still running, or a
+    /// clean-exit encode whose segments remain on disk), `false` if it must be replaced (a
+    /// failed encode). `Child::try_wait` reports the exit status reliably only the first time,
+    /// so once observed it is cached in `self.exited` and reused on later polls.
+    fn poll_reusable(&mut self) -> bool {
+        if self.exited.is_none() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exited = Some(status.success());
+            }
+        }
+        match self.exited {
+            None => true,             // still running
+            Some(ok) => ok,           // reusable iff the encode finished cleanly
+        }
+    }
+}
+
 async fn teardown(s: &mut Session) {
     if let Err(err) = s.child.start_kill() {
         tracing::debug!(error = %err, "transcoder already exited");
@@ -415,6 +463,18 @@ mod tests {
     use super::*;
     use crate::decision::Vendor;
     use medi_core::{AudioCodec, VideoCodec};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// `FFMPEG_BIN` is process-global, so tests that point it at a specific fake ffmpeg (and,
+    /// crucially, depend on that fake's *exit code*) must not run concurrently or they'd clobber
+    /// each other's binary. This lock serializes them; the returned guard sets the var for the
+    /// test's duration and clears it on drop.
+    fn ffmpeg_env(bin: &str) -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("FFMPEG_BIN", bin);
+        guard
+    }
 
     fn target() -> TranscodeTarget {
         TranscodeTarget {
@@ -458,8 +518,8 @@ mod tests {
     async fn identical_request_reuses_session() {
         // A second identical start must return the SAME session id (not a new ffmpeg), so a
         // duplicate request (StrictMode double-mount, reload) can't consume two slots. Use
-        // `sleep` as a fake ffmpeg that stays alive long enough to be reused.
-        std::env::set_var("FFMPEG_BIN", "cat");
+        // `cat` as a fake ffmpeg that stays alive long enough to be reused.
+        let _env = ffmpeg_env("cat");
         let dir = tempfile::tempdir().unwrap();
         let mgr = manager(dir.path(), 4);
         let input = dir.path().join("in.mkv");
@@ -477,13 +537,11 @@ mod tests {
             .unwrap();
         assert_ne!(a, c, "different target must not reuse");
         assert_eq!(mgr.active_count().await, 2);
-
-        std::env::remove_var("FFMPEG_BIN");
     }
 
     #[tokio::test]
     async fn vod_playlist_reflects_duration() {
-        std::env::set_var("FFMPEG_BIN", "cat");
+        let _env = ffmpeg_env("cat");
         let dir = tempfile::tempdir().unwrap();
         let mgr = manager(dir.path(), 4);
         let input = dir.path().join("in.mkv");
@@ -495,8 +553,6 @@ mod tests {
         assert!(m.contains("#EXT-X-PLAYLIST-TYPE:VOD"));
         assert!(m.contains("#EXT-X-ENDLIST"));
         assert_eq!(m.matches(".m4s").count(), 3, "12s / 4s = 3 segments: {m}");
-
-        std::env::remove_var("FFMPEG_BIN");
     }
 
     #[tokio::test]
@@ -504,7 +560,7 @@ mod tests {
         // Requesting a segment well beyond the lookahead is a seek → the session restarts
         // ffmpeg at that segment (producing_from advances) rather than waiting for the
         // original process to encode the whole way there.
-        std::env::set_var("FFMPEG_BIN", "cat");
+        let _env = ffmpeg_env("cat");
         let dir = tempfile::tempdir().unwrap();
         let mgr = manager(dir.path(), 4);
         let input = dir.path().join("in.mkv");
@@ -525,16 +581,14 @@ mod tests {
             sessions.get(&id).unwrap().producing_from
         };
         assert_eq!(from, 100, "a far-ahead segment request restarts ffmpeg at that segment");
-
-        std::env::remove_var("FFMPEG_BIN");
     }
 
     #[tokio::test]
     async fn capacity_cap_is_enforced() {
-        // A long-lived fake ffmpeg (`sleep`) so the first session stays alive and actually
-        // holds the single slot. Two DIFFERENT inputs so session reuse never applies — this
-        // test is about the capacity cap, not dedup.
-        std::env::set_var("FFMPEG_BIN", "cat");
+        // A long-lived fake ffmpeg (`cat`, blocked on stdin) so the first session stays alive
+        // and actually holds the single slot. Two DIFFERENT inputs so session reuse never
+        // applies — this test is about the capacity cap, not dedup.
+        let _env = ffmpeg_env("cat");
         let dir = tempfile::tempdir().unwrap();
         let mgr = manager(dir.path(), 1);
 
@@ -557,7 +611,69 @@ mod tests {
         assert_eq!(mgr.active_count().await, 0);
         let third = mgr.start(&other, &target(), AudioTarget::Copy { source: None }, 60_000).await;
         assert!(third.is_ok(), "slot freed → a new session starts: {third:?}");
+    }
 
-        std::env::remove_var("FFMPEG_BIN");
+    /// Wait (bounded) until the fake ffmpeg of `id` has been observed as exited, so a following
+    /// `start` sees a *completed* — not still-running — session. Avoids relying on process-exit
+    /// timing in the assertions.
+    async fn await_exit(mgr: &SessionManager, id: &str) {
+        for _ in 0..100 {
+            {
+                let mut sessions = mgr.inner.sessions.lock().await;
+                if let Some(s) = sessions.get_mut(id) {
+                    let _ = s.poll_reusable();
+                    if s.exited.is_some() {
+                        return;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("fake ffmpeg for {id} never exited");
+    }
+
+    #[tokio::test]
+    async fn completed_encode_is_reused_not_respawned() {
+        // The core fix: a session whose ffmpeg has FINISHED CLEANLY (its VOD segments are on
+        // disk, still seekable) must be reused by a later identical request — not respawned.
+        // `true` is a fake ffmpeg that ignores its argv and exits 0 immediately.
+        let _env = ffmpeg_env("true");
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path(), 4);
+        let input = dir.path().join("in.mkv");
+        std::fs::write(&input, b"x").unwrap();
+
+        let a = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 60_000).await.unwrap();
+        await_exit(&mgr, &a).await;
+
+        // Identical request AFTER the encode finished: must hand back the same session, and NOT
+        // allocate a second slot. This is what stops retries from piling up dead sessions → 409.
+        let b = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 60_000).await.unwrap();
+        assert_eq!(a, b, "a completed encode must be reused, not respawned");
+        assert_eq!(mgr.active_count().await, 1, "no extra slot consumed for the same output");
+    }
+
+    #[tokio::test]
+    async fn failed_session_is_evicted_to_free_a_slot() {
+        // A crashed encode is not reusable, yet still occupies a capacity slot. At the cap, a
+        // start for a different output must evict the dead session and succeed rather than 409
+        // forever. `false` is a fake ffmpeg that exits NONZERO immediately.
+        let _env = ffmpeg_env("false");
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = manager(dir.path(), 1);
+        let input = dir.path().join("in.mkv");
+        std::fs::write(&input, b"x").unwrap();
+        let other = dir.path().join("other.mkv");
+        std::fs::write(&other, b"y").unwrap();
+
+        let first = mgr.start(&input, &target(), AudioTarget::Copy { source: None }, 60_000).await.unwrap();
+        await_exit(&mgr, &first).await;
+
+        // Cap is 1 and the only slot holds a *failed* session → a different-output start evicts
+        // it and starts fresh instead of returning CapacityReached.
+        let second = mgr.start(&other, &target(), AudioTarget::Copy { source: None }, 60_000).await;
+        assert!(second.is_ok(), "a failed session must be evicted to free the slot: {second:?}");
+        assert_eq!(mgr.active_count().await, 1);
+        assert_ne!(first, second.unwrap(), "the failed session was replaced, not reused");
     }
 }
