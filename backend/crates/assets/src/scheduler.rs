@@ -126,6 +126,11 @@ impl Scheduler {
     pub fn trickplay_dir(&self) -> std::path::PathBuf {
         self.config.trickplay_dir()
     }
+
+    /// The output directory for per-chapter poster frames (`/config/chapter-images`).
+    pub fn chapter_images_dir(&self) -> std::path::PathBuf {
+        self.config.chapter_images_dir()
+    }
 }
 
 /// Current hour of day (0–23), UTC, from the system clock. See the module time-source

@@ -242,6 +242,9 @@ impl MediaFile {
             // Drives the QualityProfile::Capped decision (Task 70); negatives (never
             // stored) are ignored.
             bitrate: self.bitrate.and_then(|b| u64::try_from(b).ok()),
+            // Drives the HLS keyframe GOP so transcoded segments cut at every SEGMENT_SECONDS
+            // boundary (Task 101). NULL until re-probed (V13/V14).
+            frame_rate: self.frame_rate,
         })
     }
 }
@@ -344,10 +347,14 @@ pub struct Chapter {
     pub start_ms: i64,
     pub end_ms: Option<i64>,
     pub title: Option<String>,
+    /// Whether a poster frame has been generated for this chapter (`docs/.tasks/99` Part C).
+    /// Set by the off-peak asset worker; the client shows the hover image / scene card only
+    /// when true (Jellyfin's `ImageTag` gate).
+    pub has_image: bool,
 }
 
 impl Chapter {
-    /// Column order: id, media_file_id, ordinal, start_ms, end_ms, title.
+    /// Column order: id, media_file_id, ordinal, start_ms, end_ms, title, has_image.
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
             id: row.get(0)?,
@@ -356,6 +363,7 @@ impl Chapter {
             start_ms: row.get(3)?,
             end_ms: row.get(4)?,
             title: row.get(5)?,
+            has_image: row.get::<_, i64>(6)? != 0,
         })
     }
 }

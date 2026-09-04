@@ -174,6 +174,11 @@ pub struct FileChapter {
     pub end_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Whether a poster frame is available at `GET /api/chapters/:file_id/image/:ordinal`
+    /// (`docs/.tasks/99` Part C). Omitted when false to keep the payload lean; the client shows
+    /// the hover image / scene card only when this is `true`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub image: bool,
 }
 
 impl From<medi_db::models::Chapter> for FileChapter {
@@ -183,6 +188,7 @@ impl From<medi_db::models::Chapter> for FileChapter {
             start_ms: c.start_ms,
             end_ms: c.end_ms,
             title: c.title,
+            image: c.has_image,
         }
     }
 }

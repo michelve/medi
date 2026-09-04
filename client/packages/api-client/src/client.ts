@@ -433,6 +433,12 @@ export class ApiClient {
     return this.abs(`/api/trickplay/${fileId}.${ext}`);
   }
 
+  /** `GET /api/chapters/:file_id/image/:ordinal` — a chapter's poster frame (`docs/.tasks/99`
+   * Part C). Only meaningful for a chapter whose `FileChapter.image` is true; a 404 otherwise. */
+  chapterImageUrl(fileId: number, ordinal: number): string {
+    return this.abs(`/api/chapters/${fileId}/image/${ordinal}`);
+  }
+
   /** `GET /api/direct/:file_id` — direct-play byte-range source stream. */
   directUrl(fileId: number): string {
     return this.abs(`/api/direct/${fileId}`);

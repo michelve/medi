@@ -10,6 +10,7 @@
 //! - [`scheduler`] — off-peak window check + GPU-idle guard + concurrency throttle.
 //! - [`preview`] — mid-point 15s extract → 720p H.264, audio stripped, `+faststart`.
 //! - [`trickplay`] — interval frame sampling → BIF packer / tiled-JPG mosaic.
+//! - [`chapters`] — one poster frame per embedded chapter (scene-selection + hover fallback).
 //! - [`worker`] — the main loop: pick the next un-done file, generate, record, stamp.
 //!
 //! ## Boot (from the `api` binary)
@@ -32,6 +33,7 @@
 //! `<file_id>.mp4` / `<file_id>.{bif,jpg}` is served the moment it lands — no route
 //! changes are needed for Phase 3.
 
+pub mod chapters;
 pub mod preview;
 pub mod scheduler;
 pub mod trickplay;

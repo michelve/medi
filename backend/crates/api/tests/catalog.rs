@@ -382,10 +382,11 @@ fn audio_app() -> (axum::Router, tempfile::TempDir) {
              INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, language, title, immersive, is_default) \
                 VALUES (203, 1, 'ac3', 6, 'eng', 'English', 'none', 1), \
                        (203, 2, 'ac3', 2, 'fre', 'Français', 'none', 0);
-             -- Embedded chapters (`docs/.tasks/99`) so GET /api/files/:id lists them.
-             INSERT INTO chapters (media_file_id, ordinal, start_ms, end_ms, title) \
-                VALUES (203, 0, 0, 30000, 'Opening'), \
-                       (203, 1, 30000, NULL, 'Act One');",
+             -- Embedded chapters (`docs/.tasks/99`) so GET /api/files/:id lists them. Chapter 0
+             -- has a generated poster frame (has_image = 1); chapter 1 does not.
+             INSERT INTO chapters (media_file_id, ordinal, start_ms, end_ms, title, has_image) \
+                VALUES (203, 0, 0, 30000, 'Opening', 1), \
+                       (203, 1, 30000, NULL, 'Act One', 0);",
         )
         .unwrap();
     }
@@ -542,6 +543,22 @@ async fn files_endpoint_lists_audio_and_subtitle_tracks() {
     assert_eq!(chapters[0]["title"], "Opening");
     assert_eq!(chapters[1]["title"], "Act One");
     assert!(chapters[1].get("end_ms").is_none(), "NULL end_ms is omitted from JSON");
+    // Chapter poster frames (`docs/.tasks/99` Part C): a chapter WITH an image reports
+    // `image: true`; one without omits the field (skip-false) so the client shows no scene card.
+    assert_eq!(chapters[0]["image"], true, "chapter 0 has a generated frame");
+    assert!(chapters[1].get("image").is_none(), "no image ⇒ field omitted");
+}
+
+#[tokio::test]
+async fn chapter_image_404s_when_absent() {
+    // The chapter-image route serves from disk; with nothing generated it's a clean 404 the
+    // client treats as "no image" and falls back (`docs/.tasks/99` Part C).
+    let (app, _dir) = audio_app();
+    let resp = app
+        .oneshot(Request::get("/api/chapters/203/image/0").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

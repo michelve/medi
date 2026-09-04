@@ -161,6 +161,12 @@ impl AppConfig {
         self.config_dir.join("trickplay")
     }
 
+    /// Directory holding generated per-chapter poster frames (`docs/.tasks/99` Part C).
+    /// One JPEG per chapter, under `<dir>/<media_file_id>/<ordinal>.jpg`.
+    pub fn chapter_images_dir(&self) -> PathBuf {
+        self.config_dir.join("chapter-images")
+    }
+
     /// Directory holding converted/cached WebVTT subtitles (`docs/.tasks/90` §5).
     /// Text subtitles are extracted/converted here and served from the cache; sidecars
     /// under `/media` are read-only and never written.

@@ -357,7 +357,15 @@ async fn filter_changed(db: &Db, discovered: Vec<DiscoveredFile>) -> anyhow::Res
                         mtime: f.mtime,
                         size_bytes: f.size_bytes,
                     };
-                    stat != current || probed_at.is_none()
+                    // Re-probe on a changed stat / never-probed file, OR when the file's
+                    // external subtitle sidecars have drifted (`docs/.tasks/99` detection
+                    // fix): dropping a `.srt` next to an unchanged video doesn't touch the
+                    // video's mtime/size, so without this the new sidecar is never picked up.
+                    // The check is filename-only (one `read_dir`, no ffprobe), so it's cheap
+                    // enough to run for every otherwise-skipped file.
+                    stat != current
+                        || probed_at.is_none()
+                        || sidecars_drifted(&conn, &path, &f.path)
                 }
             };
             if needs {
@@ -368,6 +376,31 @@ async fn filter_changed(db: &Db, discovered: Vec<DiscoveredFile>) -> anyhow::Res
     })
     .await??;
     Ok(out)
+}
+
+/// Whether the external subtitle sidecars sitting next to `video_path` differ from the set
+/// persisted for that file (`docs/.tasks/99` detection fix). Compares the fresh, filename-only
+/// [`scanner::discover_sidecars`] scan against [`queries::external_subtitle_paths`] as sorted
+/// sets of paths. `true` forces a re-probe so a newly-added (or removed) sidecar is detected
+/// even when the video's own mtime/size are unchanged.
+///
+/// Best-effort: a DB read error here is treated as "no drift" (`false`) so a transient error
+/// never spuriously re-probes the whole library — the changed-stat / never-probed checks still
+/// cover the common cases.
+fn sidecars_drifted(conn: &rusqlite::Connection, path_str: &str, video_path: &Path) -> bool {
+    let persisted = match medi_db::queries::external_subtitle_paths(conn, path_str) {
+        Ok(mut p) => {
+            p.sort();
+            p
+        }
+        Err(_) => return false,
+    };
+    let mut discovered: Vec<String> = scanner::discover_sidecars(video_path)
+        .into_iter()
+        .filter_map(|s| s.external_path)
+        .collect();
+    discovered.sort();
+    persisted != discovered
 }
 
 /// Persist one probed file inside a single transaction: upsert the scan-state stat,
@@ -697,6 +730,40 @@ mod tests {
         }
         let changed2 = filter_changed(&db, vec![bigger]).await.unwrap();
         assert_eq!(changed2.len(), 1, "changed file is re-probed");
+    }
+
+    #[tokio::test]
+    async fn added_sidecar_forces_reprobe_of_unchanged_video() {
+        // The detection fix (`docs/.tasks/99`): an already-probed, unchanged video whose
+        // sibling folder gains a `.srt` sidecar is re-probed even though its own mtime/size
+        // are untouched — otherwise the new subtitle would never be discovered.
+        let (db, _dir) = temp_db();
+        let media = tempfile::tempdir().unwrap();
+        let video = media.path().join("Arrival (2016).mkv");
+        std::fs::write(&video, b"x").unwrap();
+
+        // Probe + persist the video (no sidecars yet).
+        let mut probed = probed_movie(video.to_str().unwrap(), "hdr10", None);
+        probed.file.mtime = 10;
+        probed.file.size_bytes = 1;
+        write_one(&db, probed).await.unwrap();
+
+        let file = DiscoveredFile {
+            path: video.clone(),
+            mtime: 10,
+            size_bytes: 1,
+            class: Classification::Movie { title: "Arrival".into(), year: Some(2016) },
+            library_id: None,
+        };
+
+        // No sidecar on disk → unchanged, already-probed file is skipped.
+        let none = filter_changed(&db, vec![file.clone()]).await.unwrap();
+        assert!(none.is_empty(), "no sidecar drift → not re-probed");
+
+        // Drop a matching sidecar next to the (still unchanged) video → drift → re-probe.
+        std::fs::write(media.path().join("Arrival (2016).en.srt"), b"1\n").unwrap();
+        let drifted = filter_changed(&db, vec![file]).await.unwrap();
+        assert_eq!(drifted.len(), 1, "added sidecar forces a re-probe of the unchanged video");
     }
 
     #[tokio::test]

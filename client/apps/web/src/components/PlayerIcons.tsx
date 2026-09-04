@@ -22,6 +22,7 @@ export type IconName =
   | 'subtitles'
   | 'nextChapter'
   | 'prevChapter'
+  | 'scenes'
   | 'check';
 
 export interface IconProps {
@@ -134,6 +135,14 @@ export function Icon({ name, size = 20 }: IconProps) {
       return (
         <svg {...common} fill="currentColor">
           <path d="M18.945 7.06c1.25-.713 2.805.19 2.805 1.63v6.62c0 1.44-1.555 2.343-2.805 1.63L15 14.688V15.31c0 1.44-1.555 2.343-2.805 1.63L6.34 13.595a1.875 1.875 0 0 1 0-3.256L12.195 7.06C13.445 6.347 15 7.25 15 8.69v.622l3.945-2.252ZM4.5 7.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5A.75.75 0 0 1 4.5 7.5Z" />
+        </svg>
+      );
+
+    // Heroicons outline `squares-2x2` (a 2×2 grid — the scene-selection affordance).
+    case 'scenes':
+      return (
+        <svg {...common} fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+          <path d="M3.75 6A2.25 2.25 0 0 1 6 3.75h2.25A2.25 2.25 0 0 1 10.5 6v2.25a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25V6ZM3.75 15.75A2.25 2.25 0 0 1 6 13.5h2.25a2.25 2.25 0 0 1 2.25 2.25V18a2.25 2.25 0 0 1-2.25 2.25H6A2.25 2.25 0 0 1 3.75 18v-2.25ZM13.5 6a2.25 2.25 0 0 1 2.25-2.25H18A2.25 2.25 0 0 1 20.25 6v2.25A2.25 2.25 0 0 1 18 10.5h-2.25a2.25 2.25 0 0 1-2.25-2.25V6ZM13.5 15.75a2.25 2.25 0 0 1 2.25-2.25H18a2.25 2.25 0 0 1 2.25 2.25V18A2.25 2.25 0 0 1 18 20.25h-2.25A2.25 2.25 0 0 1 13.5 18v-2.25Z" />
         </svg>
       );
 

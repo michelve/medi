@@ -415,6 +415,9 @@ export interface FileChapter {
   start_ms: number;
   end_ms?: number;
   title?: string;
+  /** Whether a poster frame exists at `chapterImageUrl(fileId, ordinal)` (`docs/.tasks/99`
+   * Part C). Absent/false ⇒ no scene card / no hover image for this chapter. */
+  image?: boolean;
 }
 
 /**

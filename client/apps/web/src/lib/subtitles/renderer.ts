@@ -3,9 +3,12 @@
  * `renderTracksEvents`. Keyed on the track's codec:
  *
  *   - `ass` / `ssa`            → libass-wasm (SubtitlesOctopus): full ASS styling at native res
- *   - `pgssub` / vobsub        → libbitsub (Phase 5) — for now signals `unsupported` so the
- *                                caller falls back to server burn-in
+ *   - `pgssub` (PGS)           → libbitsub from a single `.sup` (`/raw`)
+ *   - `dvdsub` / vobsub        → libbitsub from the `.idx`+`.sub` pair (`/raw` + `/raw.idx`)
  *   - plain text (srt/vtt/…)   → handled by the native `<track>` path in VideoPlayer, NOT here
+ *
+ * Any WASM init/render failure calls `onUnsupported`, so the caller (VideoPlayer) falls back to
+ * a server burn-in of that track — client render is primary, burn-in is the safety net.
  *
  * The heavy WASM libraries are dynamic-imported so they stay out of the browse bundle (like
  * hls.js). A renderer owns an overlay canvas over the `<video>`; `destroy()` tears it down.
@@ -22,8 +25,8 @@ const LIBASS_FALLBACK_FONT_URL = '/libass/default.woff2';
 const ASS_CODECS = new Set(['ass', 'ssa']);
 /** PGS image-subtitle codecs — rendered client-side by libbitsub from a single `.sup`. */
 const PGS_CODECS = new Set(['pgssub', 'hdmv_pgs_subtitle', 'pgs']);
-/** VobSub/DVD image codecs — need a `.idx`+`.sub` pair (backend raw pair not wired yet), so
- * these fall back to server burn-in for now. */
+/** VobSub/DVD image codecs — rendered client-side by libbitsub from the `.idx`+`.sub` raw pair
+ * (`/api/subtitles/:id/:index/raw` + `raw.idx`). */
 const VOBSUB_CODECS = new Set(['dvdsub', 'dvd_subtitle', 'vobsub']);
 /** All bitmap image-subtitle codecs. */
 const IMAGE_CODECS = new Set([...PGS_CODECS, ...VOBSUB_CODECS]);

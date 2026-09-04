@@ -134,3 +134,60 @@ audio/subtitle streams are written.
 - Backend: `cargo test -p medi-ingest -p medi-db -p medi-api` green — add an ffprobe parse
   test for `-show_chapters` (a fixture with chapters), a `replace_chapters`/`chapters_for`
   db test, and an api test that `GET /api/files/:id` includes chapters.
+
+## Part D — Detection fix (SHIPPED, session 2026-09-04)
+
+**The bug.** Subtitles/chapters were fully wired end-to-end, but a movie with a same-folder
+`.srt` still showed a **disabled subtitle button** and no chapters. Root cause: `discover_sidecars`
+runs only inside the ffprobe task, and `worker.rs::filter_changed` only re-probes a file whose
+own mtime/size changed or whose `probed_at IS NULL`. A sidecar dropped next to an unchanged video
+(or any file scanned before Task 90/99 gained these probe steps) never re-probed, so its
+`subtitle_streams` / `chapters` rows were never written → `GET /api/files/:id` returned empty →
+`subtitleEntries.length === 0` → the disabled "Subtitles (not available yet)" placeholder.
+
+**The fix (two parts, both shipped):**
+
+1. **Sidecar-drift re-probe trigger** — `worker.rs::sidecars_drifted` compares a fresh
+   filename-only `discover_sidecars` scan against `queries::external_subtitle_paths` (persisted
+   external rows) as sorted path sets; `filter_changed` keeps a file for re-probe when they
+   differ. Cheap (one `read_dir`, no ffprobe), so it runs for every otherwise-skipped file.
+   → Dropping a `.srt` next to an old movie is now detected on the next scan (the fs-watcher
+   already fires on the `.srt` create; the video re-probes on drift).
+2. **One-time backfill** — `V14__reprobe_for_subtitles_chapters.sql` (`UPDATE scan_state SET
+   probed_at = NULL`) forces a single full re-probe so libraries scanned before these probe
+   steps existed pick up sidecars + embedded chapters. Idempotent (refinery version record;
+   `replace_*` are delete-then-insert).
+
+## Part C — Chapter images + scene selection (SHIPPED, session 2026-09-04)
+
+Mirrors Jellyfin (`jellyfin-web`: `chaptercardbuilder.js`, video-OSD `getChapterBubbleHtml`,
+`/Items/{id}/Images/Chapter/{index}`). medi already reused **trickplay tiles** for the hover
+bubble; this adds per-chapter poster frames + a scene-selection grid, with trickplay staying the
+preferred hover source.
+
+- **Generation — a third off-peak asset kind.** `medi-assets` gains `chapters.rs`: for each
+  chapter, `ffmpeg -ss <start> -i <file> -frames:v 1 -vf scale=400:-1 -q:v 4 <dir>/<ordinal>.jpg`
+  (~400px, Jellyfin's `maxWidth`), written atomically. Wired into `worker.rs::process_one` behind
+  the existing `Scheduler` gate (off-peak + GPU-idle + throttle) as a third step after
+  preview/trickplay — no new worker. A failed per-chapter extract is skipped (a partial set still
+  lights up most scenes); a file with 0 chapters generates nothing but still stamps done.
+- **Storage + resume markers (V15).** JPGs under `config_dir/chapter-images/<media_file_id>/
+  <ordinal>.jpg` (new `AppConfig::chapter_images_dir` / `Scheduler::chapter_images_dir`).
+  `V15__chapter_images.sql` adds `chapters.has_image` (set per generated ordinal via
+  `writes::mark_chapter_image`; reset to 0 on re-probe by `replace_chapters`) and
+  `scan_state.chapter_images_done_at` (the pending-set resume marker; stamped even for chapterless
+  files). `list_pending_assets` now also selects files whose `chapter_images_done_at` is NULL.
+- **API.** `GET /api/chapters/:file_id/image/:ordinal` (traversal-safe `ServeFile` — both segments
+  are typed `i64`); 404 when absent. `FileChapter` DTO gains `image: bool` (skip-false) from
+  `Chapter.has_image`, so the client knows which chapters have a frame. Contract row added.
+- **Client — hover bubble.** `ScrubBar.tsx`: when there's no trickplay tile but the hovered chapter
+  has `image === true`, render `api.chapterImageUrl(fileId, ordinal)` in the bubble (fallback order
+  trickplay tile → chapter image → time-only).
+- **Client — scene-selection grid.** New `SceneSelector.tsx`: a control-bar "Scenes" button
+  (popover, mirroring `SubtitleMenu`) showing one card per chapter (frame + title +
+  `formatTime(start_ms)`), click → seek to `start_ms`. The button is rendered only when **some
+  chapter has an image** (`chapters.some((c) => c.image)`), Jellyfin's hide-when-no-images rule.
+  In-player only this cut (no detail-page section).
+
+**Out of scope:** secondary/dual subtitles; subfolder sidecar scanning (same-folder only); a
+detail-page "Scenes" section (in-player popover only).

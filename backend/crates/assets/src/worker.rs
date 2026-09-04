@@ -27,6 +27,7 @@ use medi_db::writes::{self, TrickplayKind};
 use medi_db::Db;
 use medi_transcode::HwCaps;
 
+use crate::chapters::{self, ChapterFrame};
 use crate::preview;
 use crate::scheduler::Scheduler;
 use crate::trickplay::{self, DEFAULT_INTERVAL_MS};
@@ -169,7 +170,35 @@ async fn process_one(
         .await?;
         record_trickplay(db, pending.media_file_id, &pending.path, &out).await?;
     }
+
+    if !pending.chapter_images_done {
+        // Read this file's chapters (`docs/.tasks/99` Part C); a file with none stamps "done"
+        // with nothing generated, so it drops out of the pending set.
+        let frames = chapter_frames(db, pending.media_file_id).await?;
+        let generated = chapters::generate(
+            &input,
+            &scheduler.chapter_images_dir(),
+            pending.media_file_id,
+            &frames,
+        )
+        .await?;
+        record_chapter_images(db, pending.media_file_id, &pending.path, &generated).await?;
+    }
     Ok(())
+}
+
+/// Read a media file's chapters as `ChapterFrame`s (ordinal + start) for frame extraction.
+async fn chapter_frames(db: &Db, media_file_id: i64) -> anyhow::Result<Vec<ChapterFrame>> {
+    let db = db.clone();
+    let frames = tokio::task::spawn_blocking(move || -> medi_db::DbResult<Vec<ChapterFrame>> {
+        let conn = db.conn()?;
+        Ok(queries::chapters_for(&conn, media_file_id)?
+            .into_iter()
+            .map(|c| ChapterFrame { ordinal: c.ordinal, start_ms: c.start_ms })
+            .collect())
+    })
+    .await??;
+    Ok(frames)
 }
 
 /// Is the media file an HDR/DV source (so its preview needs tone-mapping to SDR)?
@@ -249,6 +278,33 @@ async fn record_trickplay(
     Ok(())
 }
 
+/// Flag each generated chapter frame (`has_image = 1`) and stamp `chapter_images_done_at`, in one
+/// transaction (`docs/.tasks/99` Part C). `generated_ordinals` may be empty (no chapters, or every
+/// extract failed) — the file is still marked done so it drops out of the pending set.
+async fn record_chapter_images(
+    db: &Db,
+    media_file_id: i64,
+    scan_path: &str,
+    generated_ordinals: &[i64],
+) -> anyhow::Result<()> {
+    let db = db.clone();
+    let scan_path = scan_path.to_string();
+    let ordinals = generated_ordinals.to_vec();
+    tokio::task::spawn_blocking(move || -> medi_db::DbResult<()> {
+        let mut conn = db.conn()?;
+        let tx = conn.transaction()?;
+        let now = now_secs();
+        for ordinal in ordinals {
+            writes::mark_chapter_image(&tx, media_file_id, ordinal)?;
+        }
+        writes::mark_chapter_images_done(&tx, &scan_path, now)?;
+        tx.commit()?;
+        Ok(())
+    })
+    .await??;
+    Ok(())
+}
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -300,6 +356,7 @@ mod tests {
         assert_eq!(batch[0].path, "/media/a.mkv");
         assert!(!batch[0].preview_done);
         assert!(!batch[0].trickplay_done);
+        assert!(!batch[0].chapter_images_done);
         assert_eq!(batch[0].duration_ms, Some(600_000));
     }
 
@@ -308,7 +365,7 @@ mod tests {
         let (db, _dir) = temp_db();
         let id = seed_probed_file(&db, "/media/a.mkv", "none");
 
-        // Simulate a completed preview + trickplay by recording both.
+        // Simulate a completed preview + trickplay + chapter images by recording all three.
         record_preview(&db, id, "/media/a.mkv", Path::new("/config/previews/1.mp4"))
             .await
             .unwrap();
@@ -319,8 +376,10 @@ mod tests {
             grid: None,
         };
         record_trickplay(&db, id, "/media/a.mkv", &tp).await.unwrap();
+        // No chapters on this file → an empty generated set still stamps chapter_images_done_at.
+        record_chapter_images(&db, id, "/media/a.mkv", &[]).await.unwrap();
 
-        // Now nothing is pending (both done stamps set).
+        // Now nothing is pending (all three done stamps set).
         let batch = pending_batch(&db, 10).await.unwrap();
         assert!(batch.is_empty(), "fully-processed file drops from pending");
 
@@ -346,9 +405,48 @@ mod tests {
             .unwrap();
 
         let batch = pending_batch(&db, 10).await.unwrap();
-        assert_eq!(batch.len(), 1, "still pending: trickplay not done");
+        assert_eq!(batch.len(), 1, "still pending: trickplay + chapter images not done");
         assert!(batch[0].preview_done, "preview already done");
         assert!(!batch[0].trickplay_done);
+        assert!(!batch[0].chapter_images_done);
+    }
+
+    #[tokio::test]
+    async fn chapter_images_gate_the_pending_set_and_flag_rows() {
+        // A file stays pending until its chapter images are recorded, and recording flags each
+        // chapter's `has_image` (`docs/.tasks/99` Part C).
+        let (db, _dir) = temp_db();
+        let id = seed_probed_file(&db, "/media/c.mkv", "none");
+        {
+            let conn = db.conn().unwrap();
+            writes::replace_chapters(
+                &conn,
+                id,
+                &[
+                    writes::ChapterWrite { ordinal: 0, start_ms: 0, end_ms: Some(60_000), title: Some("Intro".into()) },
+                    writes::ChapterWrite { ordinal: 1, start_ms: 60_000, end_ms: None, title: None },
+                ],
+            )
+            .unwrap();
+            // Mark preview + trickplay done so only chapter images keep it pending.
+            let now = 100;
+            writes::mark_preview_done(&conn, "/media/c.mkv", now).unwrap();
+            writes::mark_trickplay_done(&conn, "/media/c.mkv", now).unwrap();
+        }
+
+        let batch = pending_batch(&db, 10).await.unwrap();
+        assert_eq!(batch.len(), 1, "still pending: chapter images not done");
+        assert!(batch[0].preview_done && batch[0].trickplay_done);
+        assert!(!batch[0].chapter_images_done);
+
+        // Record ordinal 0 only (simulate ordinal 1's extract failing).
+        record_chapter_images(&db, id, "/media/c.mkv", &[0]).await.unwrap();
+        assert!(pending_batch(&db, 10).await.unwrap().is_empty(), "done stamp drops it");
+
+        let conn = db.conn().unwrap();
+        let chapters = queries::chapters_for(&conn, id).unwrap();
+        assert!(chapters[0].has_image, "generated ordinal flagged");
+        assert!(!chapters[1].has_image, "failed/absent ordinal not flagged");
     }
 
     #[tokio::test]

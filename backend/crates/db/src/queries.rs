@@ -689,7 +689,7 @@ pub fn get_subtitle_streams(
 }
 
 /// Explicit `chapters` column list, in the order [`Chapter::from_row`] reads (Task 99).
-const CHAPTER_COLUMNS: &str = "id, media_file_id, ordinal, start_ms, end_ms, title";
+const CHAPTER_COLUMNS: &str = "id, media_file_id, ordinal, start_ms, end_ms, title, has_image";
 
 /// All chapter markers of a media file, ordered by `ordinal` (Task 99). Empty when the file
 /// has no chapters or was probed before Task 99. Uses `idx_chapters_file`.
@@ -700,6 +700,28 @@ pub fn chapters_for(conn: &Connection, media_file_id: i64) -> DbResult<Vec<Chapt
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt
         .query_map(params![media_file_id], Chapter::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// The persisted external subtitle sidecar paths for the media file at `video_path`,
+/// sorted (Task 99 detection fix). Joins `media_files` ↔ `subtitle_streams` on the file id,
+/// keeping only external rows (`is_external = 1`, non-NULL `external_path`).
+///
+/// The ingest worker compares this set against a fresh `discover_sidecars` scan of the
+/// video's folder: if they differ, a sidecar was added/removed next to an unchanged video
+/// and the file must be re-probed even though its own mtime/size are unchanged (otherwise
+/// dropping a `.srt` next to an already-scanned movie would never be detected). Returns an
+/// empty vec for an unknown path or a file with no external sidecars.
+pub fn external_subtitle_paths(conn: &Connection, video_path: &str) -> DbResult<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT s.external_path FROM subtitle_streams s \
+         JOIN media_files f ON f.id = s.media_file_id \
+         WHERE f.path = ?1 AND s.is_external = 1 AND s.external_path IS NOT NULL \
+         ORDER BY s.external_path",
+    )?;
+    let rows = stmt
+        .query_map(params![video_path], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -875,6 +897,9 @@ pub struct PendingAsset {
     pub preview_done: bool,
     /// True when the trickplay sprites already exist (skip trickplay generation).
     pub trickplay_done: bool,
+    /// True when per-chapter poster frames have been generated — or the file has no chapters
+    /// (nothing to do). `docs/.tasks/99` Part C.
+    pub chapter_images_done: bool,
 }
 
 /// List probed files that still need at least one generated asset, oldest-added first
@@ -894,11 +919,13 @@ pub fn list_pending_assets(conn: &Connection, limit: u32) -> DbResult<Vec<Pendin
     // index-friendly (PRIMARY KEY) and gives the "oldest first" backfill order.
     let mut stmt = conn.prepare_cached(
         "SELECT mf.id, mf.path, mf.duration_ms, \
-                ss.preview_done_at IS NOT NULL, ss.trickplay_done_at IS NOT NULL \
+                ss.preview_done_at IS NOT NULL, ss.trickplay_done_at IS NOT NULL, \
+                ss.chapter_images_done_at IS NOT NULL \
          FROM media_files mf \
          JOIN scan_state ss ON ss.path = mf.path \
          WHERE ss.probed_at IS NOT NULL \
-           AND (ss.preview_done_at IS NULL OR ss.trickplay_done_at IS NULL) \
+           AND (ss.preview_done_at IS NULL OR ss.trickplay_done_at IS NULL \
+                OR ss.chapter_images_done_at IS NULL) \
          ORDER BY mf.id \
          LIMIT ?1",
     )?;
@@ -910,6 +937,7 @@ pub fn list_pending_assets(conn: &Connection, limit: u32) -> DbResult<Vec<Pendin
                 duration_ms: r.get(2)?,
                 preview_done: r.get::<_, i64>(3)? != 0,
                 trickplay_done: r.get::<_, i64>(4)? != 0,
+                chapter_images_done: r.get::<_, i64>(5)? != 0,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

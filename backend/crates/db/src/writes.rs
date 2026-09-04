@@ -581,6 +581,28 @@ pub fn mark_trickplay_done(conn: &Connection, path: &str, done_at: i64) -> DbRes
     Ok(())
 }
 
+/// Stamp `scan_state.chapter_images_done_at` for a path, marking its per-chapter poster frames
+/// generated (`docs/.tasks/99` Part C). The worker stamps this even for a file with no chapters
+/// (nothing to generate), so a chapterless file drops out of the pending-assets set.
+pub fn mark_chapter_images_done(conn: &Connection, path: &str, done_at: i64) -> DbResult<()> {
+    conn.execute(
+        "UPDATE scan_state SET chapter_images_done_at = ?2 WHERE path = ?1",
+        params![path, done_at],
+    )?;
+    Ok(())
+}
+
+/// Flag one chapter as having a generated poster frame (`docs/.tasks/99` Part C). Keyed by
+/// `(media_file_id, ordinal)` — the UNIQUE the frame file is named by — so a re-probe that
+/// rebuilt the chapter rows (has_image reset to 0) is re-flagged when the worker regenerates.
+pub fn mark_chapter_image(conn: &Connection, media_file_id: i64, ordinal: i64) -> DbResult<()> {
+    conn.execute(
+        "UPDATE chapters SET has_image = 1 WHERE media_file_id = ?1 AND ordinal = ?2",
+        params![media_file_id, ordinal],
+    )?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Metadata enrichment (`docs/.tasks/60` Phase A) — external ids, match state,
 // descriptive fields, and credits.
@@ -1477,6 +1499,23 @@ mod tests {
         let read2 = crate::queries::chapters_for(&conn, file_id).unwrap();
         assert_eq!(read2.len(), 1, "re-probe replaces the whole set");
         assert_eq!(read2[0].title.as_deref(), Some("Only"));
+
+        // A fresh chapter has no image; flagging it round-trips (`docs/.tasks/99` Part C).
+        assert!(!read2[0].has_image, "chapter starts with no poster frame");
+        mark_chapter_image(&conn, file_id, 0).unwrap();
+        let read3 = crate::queries::chapters_for(&conn, file_id).unwrap();
+        assert!(read3[0].has_image, "mark_chapter_image sets has_image");
+        // A re-probe rebuilds the row and clears the flag (frames regenerate next asset pass).
+        replace_chapters(
+            &conn,
+            file_id,
+            &[ChapterWrite { ordinal: 0, start_ms: 0, end_ms: None, title: None }],
+        )
+        .unwrap();
+        assert!(
+            !crate::queries::chapters_for(&conn, file_id).unwrap()[0].has_image,
+            "re-probe resets has_image",
+        );
 
         // And they surface on the MediaFile read model.
         let mf = crate::queries::get_media_file(&conn, file_id).unwrap();

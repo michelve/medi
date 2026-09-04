@@ -569,6 +569,7 @@ export function PlayerPage() {
         <PlayerControls
           controls={controls}
           title={title}
+          fileId={id}
           trickplay={trickplay}
           onSeek={seekTo}
           video={videoEl}

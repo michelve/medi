@@ -27,6 +27,7 @@ import type { PlayerControls as Controls } from '@medi/player/usePlayerControls'
 import type { TrickplayMeta } from '@medi/player/trickplay';
 import type { FileAudioTrack, FileChapter } from '@medi/api-client';
 import { ScrubBar } from './ScrubBar';
+import { SceneSelector } from './SceneSelector';
 import { Icon } from './PlayerIcons';
 import { formatTime } from '../lib/format';
 import { theme } from '../theme';
@@ -45,6 +46,8 @@ const glass: React.CSSProperties = {
 export interface PlayerControlsProps {
   controls: Controls;
   title: string;
+  /** The file being played — for chapter-image URLs on the scrub bar + scene grid (`99` Part C). */
+  fileId: number;
   trickplay?: TrickplayMeta;
   /** Seek to an absolute position (ms) — from a ScrubBar click. */
   onSeek: (positionMs: number) => void;
@@ -71,6 +74,7 @@ export interface PlayerControlsProps {
 export function PlayerControls({
   controls,
   title,
+  fileId,
   trickplay,
   onSeek,
   video,
@@ -128,6 +132,7 @@ export function PlayerControls({
         }}
       >
         <ScrubBar
+          fileId={fileId}
           positionMs={displayPositionMs}
           durationMs={durationMs}
           onSeek={onSeek}
@@ -210,6 +215,11 @@ export function PlayerControls({
               <GlassButton label="Subtitles (not available yet)" onClick={() => undefined} disabled>
                 <Icon name="subtitles" />
               </GlassButton>
+            )}
+
+            {/* Scene selection (`99` Part C): shown only when a chapter has a generated frame. */}
+            {chapters && chapters.some((c) => c.image) && (
+              <SceneSelector fileId={fileId} chapters={chapters} onSeek={onSeek} />
             )}
 
             <FullscreenButton target={fullscreenTarget} />

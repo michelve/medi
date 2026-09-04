@@ -4,8 +4,9 @@
  * A progress bar the user clicks/drags to seek. On hover it computes the hovered position
  * and, when trickplay geometry is available, crops the covering cell out of the tiled-JPG
  * mosaic (`tileForPosition` + `client.trickplayUrl(fileId, 'jpg')`) into a floating preview.
- * With no meta (BIF-only / not generated — the meta endpoint 404s), it's just a plain bar;
- * no error is surfaced.
+ * With no trickplay meta it falls back to the hovered chapter's poster frame (`docs/.tasks/99`
+ * Part C), and with neither it's just a plain bar; no error is surfaced. This trickplay →
+ * chapter-image → time-only order mirrors jellyfin's seek-bubble fallback.
  *
  * Geometry math is reused from `@medi/player/trickplay` — the same module the TV player
  * uses — so the two clients stay in lockstep.
@@ -15,9 +16,17 @@ import { useRef, useState } from 'react';
 import { tileForPosition, type TrickplayMeta } from '@medi/player/trickplay';
 import type { FileChapter } from '@medi/api-client';
 import { chapterAt } from '@medi/player/chapters';
+import { useApi } from '../api';
 import { theme } from '../theme';
 
+/** Chapter-image fallback thumbnail width (px); matches the ~400px frames the backend writes,
+ * shown at a scrub-preview size. Height follows the video aspect (16:9 assumed for the box). */
+const CHAPTER_THUMB_W = 220;
+const CHAPTER_THUMB_H = Math.round((CHAPTER_THUMB_W * 9) / 16);
+
 export interface ScrubBarProps {
+  /** The file being scrubbed — for building chapter-image URLs (`docs/.tasks/99` Part C). */
+  fileId: number;
   positionMs: number;
   durationMs: number;
   /** Seek to an absolute position (ms) — commit on click. */
@@ -28,7 +37,8 @@ export interface ScrubBarProps {
   chapters?: FileChapter[];
 }
 
-export function ScrubBar({ positionMs, durationMs, onSeek, trickplay, chapters }: ScrubBarProps) {
+export function ScrubBar({ fileId, positionMs, durationMs, onSeek, trickplay, chapters }: ScrubBarProps) {
+  const api = useApi();
   const trackRef = useRef<HTMLDivElement | null>(null);
   // Hover position in ms (for the thumbnail), and its x within the track (for placement).
   const [hover, setHover] = useState<{ ms: number; x: number } | null>(null);
@@ -48,6 +58,11 @@ export function ScrubBar({ positionMs, durationMs, onSeek, trickplay, chapters }
   // there's no trickplay sheet). Only meaningful when the title actually has chapters.
   const hoverChapter =
     hover && chapters && chapters.length > 0 ? chapterAt(chapters, hover.ms) : null;
+  // Chapter-image fallback: only when there's no trickplay tile AND the hovered chapter has a
+  // generated frame (`image === true`). Trickplay stays the preferred hover preview.
+  const chapterThumb = !tile && hoverChapter?.image ? hoverChapter : null;
+  // The height the name label clears — whichever thumbnail is showing, if any.
+  const thumbH = tile ? tile.height : chapterThumb ? CHAPTER_THUMB_H : 0;
 
   return (
     <div style={{ position: 'relative', width: '100%' }}>
@@ -71,13 +86,32 @@ export function ScrubBar({ positionMs, durationMs, onSeek, trickplay, chapters }
           }}
         />
       )}
+      {/* Chapter-image fallback thumbnail (no trickplay sheet, but the chapter has a frame). */}
+      {chapterThumb && hover && (
+        <img
+          src={api.chapterImageUrl(fileId, chapterThumb.ordinal)}
+          alt=""
+          style={{
+            position: 'absolute',
+            bottom: 20,
+            left: Math.max(0, hover.x - CHAPTER_THUMB_W / 2),
+            width: CHAPTER_THUMB_W,
+            height: CHAPTER_THUMB_H,
+            objectFit: 'cover',
+            borderRadius: 4,
+            border: `1px solid ${theme.colors.surface}`,
+            boxShadow: '0 4px 16px rgba(0,0,0,0.6)',
+            pointerEvents: 'none',
+          }}
+        />
+      )}
       {/* Chapter name above the hovered point — sits over the thumbnail when there is one, or
           just above the bar otherwise. `textContent` via a child string is XSS-safe in React. */}
       {hoverChapter?.title && hover && (
         <div
           style={{
             position: 'absolute',
-            bottom: tile ? 20 + tile.height + 6 : 20,
+            bottom: thumbH ? 20 + thumbH + 6 : 20,
             left: hover.x,
             transform: 'translateX(-50%)',
             maxWidth: 240,
