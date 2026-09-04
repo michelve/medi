@@ -483,6 +483,8 @@ mod tests {
             tone_map: false,
             dv_tone_map: false,
             video_codec: VideoCodec::H264,
+            source_bit_depth: 8,
+            gop_frames: 96,
             audio_transcode_to: None,
             max_bitrate: None,
             subtitle_burn_in: None,

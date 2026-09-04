@@ -125,6 +125,11 @@ pub fn build_argv(
     for arg in hw.quality_args(target) {
         a.push(arg);
     }
+    // Keyframe/GOP discipline so segments cut on a keyframe at every SEGMENT_SECONDS boundary
+    // (`docs/.tasks/101`); pairs with the `-force_key_frames` expression emitted above.
+    for arg in hw.gop_args(target) {
+        a.push(arg);
+    }
     // QualityProfile::Capped ceiling (`docs/.tasks/70`): bound the output bitrate with a
     // VBV so the stream stays under the client's `MaxStreamingBitrate`. `-bufsize` is a
     // conventional 2× the ceiling.
@@ -283,9 +288,26 @@ impl HwPlan {
     /// transcode of an SDR source).
     fn filter_graph(&self, t: &TranscodeTarget) -> Option<String> {
         if !t.tone_map {
-            // No tone-map. HW paths still need the frame on the right device for the
-            // encoder; ffmpeg handles that implicitly for same-device decode→encode, so
-            // no filter is required.
+            // No tone-map. A 10-bit source targeting the 8-bit-only H.264 encoder still needs
+            // a pixel-format down-convert to nv12/yuv420p, or the HW encoder rejects the frames
+            // ("10 bit encode not supported") and ffmpeg writes nothing (task 100). Otherwise no
+            // filter is required — ffmpeg handles same-device decode→encode implicitly.
+            if t.video_codec == VideoCodec::H264 && t.source_bit_depth >= 10 {
+                return Some(
+                    match self {
+                        // Frames are already CUDA — down-convert on-GPU (no CPU roundtrip).
+                        HwPlan::Nvidia => "scale_cuda=format=nv12",
+                        // Mirrors the VPP tone-map arm minus the tonemap.
+                        HwPlan::Intel { .. } => "vpp_qsv=format=nv12",
+                        HwPlan::Amd { .. } => "scale_vaapi=format=nv12",
+                        // CPU frames: force libx264 to 8-bit (High), broadly browser-decodable.
+                        HwPlan::Software => "format=yuv420p",
+                    }
+                    .to_string(),
+                );
+            }
+            // HW paths still need the frame on the right device for the encoder; ffmpeg
+            // handles that implicitly for same-device decode→encode, so no filter is required.
             return None;
         }
 
@@ -334,6 +356,43 @@ impl HwPlan {
             (HwPlan::Nvidia, _) => "hevc_nvenc",
             (HwPlan::Amd { .. }, VideoCodec::H264) => "h264_vaapi",
             (HwPlan::Amd { .. }, _) => "hevc_vaapi",
+        }
+    }
+
+    /// Keyframe / GOP arguments that make the encoder honor the `-force_key_frames` boundary,
+    /// so the fMP4 HLS muxer cuts a keyframe-aligned segment every `SEGMENT_SECONDS`
+    /// (`docs/.tasks/101`). `-force_key_frames expr:gte(t,n_forced*SEGMENT_SECONDS)` (emitted in
+    /// `build_argv`) drives the *exact* boundary; these cap the encoder's max GOP to `gop_frames`
+    /// so it can't drift a native ~10s GOP past a boundary.
+    ///
+    /// The critical one is NVENC's `-forced-idr 1`: with the default IDR mode (-1) `h264_nvenc`
+    /// **silently ignores** `-force_key_frames`, emits keyframes only at its native GOP, and
+    /// segments come out ~10s long → hls.js `fragParsingError` ("Found no media in msn N").
+    fn gop_args(&self, t: &TranscodeTarget) -> Vec<String> {
+        let g = t.gop_frames.to_string();
+        let p = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        match self {
+            // Closed GOP, no scene-cut drift — the canonical libx264/x265 HLS recipe.
+            HwPlan::Software => {
+                let mut v = p(&["-g", &g, "-keyint_min", &g]);
+                v.extend(p(&["-sc_threshold", "0"]));
+                v
+            }
+            // NVENC: `-forced-idr 1` is the actual fix (propagate forced keyframes to the
+            // encoder); `-g` + `-no-scenecut 1` pin the grid.
+            HwPlan::Nvidia => {
+                let mut v = p(&["-forced-idr", "1"]);
+                v.extend(p(&["-g", &g, "-no-scenecut", "1"]));
+                v
+            }
+            // QSV honors `force_key_frames` with a pinned GOP + forced IDR at boundaries.
+            HwPlan::Intel { .. } => {
+                let mut v = p(&["-g", &g]);
+                v.extend(p(&["-forced_idr", "1"]));
+                v
+            }
+            // VA-API honors `force_key_frames` with a capped GOP.
+            HwPlan::Amd { .. } => p(&["-g", &g]),
         }
     }
 
@@ -480,6 +539,8 @@ mod tests {
             tone_map,
             dv_tone_map: dv,
             video_codec: VideoCodec::H264,
+            source_bit_depth: 8,
+            gop_frames: 96, // 24fps × 4s
             audio_transcode_to: None,
             max_bitrate: None,
             subtitle_burn_in: None,
@@ -602,9 +663,108 @@ mod tests {
 
     #[test]
     fn sdr_transcode_has_no_filter() {
+        // An 8-bit source → H.264 with no tone-map: still no `-vf` (task 100 must not regress).
         let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy { source: None });
         let s = joined(&a);
-        assert!(!s.contains("-vf"), "plain SDR transcode needs no filter: {s}");
+        assert!(!s.contains("-vf"), "plain 8-bit SDR transcode needs no filter: {s}");
+    }
+
+    /// A no-tone-map H.264 target whose source is 10-bit (task 100).
+    fn target_10bit(vendor: Option<Vendor>, sw: bool) -> TranscodeTarget {
+        let mut t = target(vendor, false, false, sw);
+        t.source_bit_depth = 10;
+        t
+    }
+
+    #[test]
+    fn ten_bit_sdr_hevc_to_h264_nvidia_scales_to_nv12() {
+        // 10-bit SDR HEVC → H.264 on NVENC: without an explicit nv12 down-convert the CUDA p010
+        // frames hit the 8-bit-only h264_nvenc and ffmpeg writes nothing (task 100).
+        let a = argv(&target_10bit(Some(Vendor::Nvidia), false), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-vf scale_cuda=format=nv12"), "10-bit→H.264 on Nvidia needs scale_cuda=format=nv12: {s}");
+        assert!(s.contains("h264_nvenc"));
+    }
+
+    #[test]
+    fn ten_bit_sdr_to_h264_intel_uses_vpp_nv12() {
+        let a = argv(&target_10bit(Some(Vendor::Intel), false), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-vf vpp_qsv=format=nv12"), "10-bit→H.264 on Intel needs vpp_qsv=format=nv12: {s}");
+        assert!(s.contains("h264_qsv"));
+        assert!(!s.contains("vpp_qsv=tonemap"), "no tone-map, just a format convert: {s}");
+    }
+
+    #[test]
+    fn ten_bit_sdr_to_h264_amd_uses_scale_vaapi_nv12() {
+        let a = argv(&target_10bit(Some(Vendor::Amd), false), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-vf scale_vaapi=format=nv12"), "10-bit→H.264 on AMD needs scale_vaapi=format=nv12: {s}");
+        assert!(s.contains("h264_vaapi"));
+    }
+
+    #[test]
+    fn ten_bit_sdr_to_h264_software_uses_yuv420p() {
+        // Software decode (CPU frames): force libx264 to 8-bit High via format=yuv420p.
+        let a = argv(&target_10bit(None, true), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-vf format=yuv420p"), "10-bit→H.264 software needs format=yuv420p: {s}");
+        assert!(s.contains("libx264"));
+    }
+
+    // --- keyframe/GOP alignment so segments cut every SEGMENT_SECONDS (task 101) ----------
+
+    #[test]
+    fn every_plan_forces_keyframes_at_segment_boundaries() {
+        // The `-force_key_frames` expression drives the exact 4s boundary on every path.
+        for v in [Some(Vendor::Nvidia), Some(Vendor::Intel), Some(Vendor::Amd), None] {
+            let sw = v.is_none();
+            let a = argv(&target(v, false, false, sw), AudioTarget::Copy { source: None });
+            let s = joined(&a);
+            assert!(
+                s.contains(&format!("-force_key_frames expr:gte(t,n_forced*{SEGMENT_SECONDS})")),
+                "{v:?} must force keyframes at segment boundaries: {s}"
+            );
+            assert!(s.contains("-g 96"), "{v:?} must cap GOP to gop_frames (96): {s}");
+        }
+    }
+
+    #[test]
+    fn nvidia_forces_idr_so_nvenc_honors_keyframes() {
+        // The core task-101 fix: without `-forced-idr 1`, h264_nvenc silently ignores
+        // `-force_key_frames` and produces ~10s segments → hls.js fragParsingError.
+        let a = argv(&target(Some(Vendor::Nvidia), false, false, false), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-forced-idr 1"), "NVENC must force IDR to honor forced keyframes: {s}");
+        assert!(s.contains("-g 96"));
+        assert!(s.contains("-no-scenecut 1"), "pin the GOP grid: {s}");
+        assert!(s.contains("h264_nvenc"));
+    }
+
+    #[test]
+    fn intel_qsv_pins_gop_and_forces_idr() {
+        let a = argv(&target(Some(Vendor::Intel), false, false, false), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-g 96"));
+        assert!(s.contains("-forced_idr 1"), "QSV forces IDR at boundaries: {s}");
+    }
+
+    #[test]
+    fn software_libx264_uses_closed_gop_no_scenecut() {
+        let a = argv(&target(None, false, false, true), AudioTarget::Copy { source: None });
+        let s = joined(&a);
+        assert!(s.contains("-g 96") && s.contains("-keyint_min 96"), "closed GOP: {s}");
+        assert!(s.contains("-sc_threshold 0"), "no scene-cut drift: {s}");
+        assert!(s.contains("libx264"));
+    }
+
+    #[test]
+    fn gop_frames_flows_into_g_flag() {
+        // A different gop_frames (e.g. 100 for a 25fps source) is what `-g` carries.
+        let mut t = target(Some(Vendor::Nvidia), false, false, false);
+        t.gop_frames = 100;
+        let a = argv(&t, AudioTarget::Copy { source: None });
+        assert!(joined(&a).contains("-g 100"), "gop_frames drives -g");
     }
 
     #[test]

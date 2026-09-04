@@ -296,6 +296,16 @@ pub struct TranscodeTarget {
     pub dv_tone_map: bool,
     /// Target video codec (`h264`/`hevc`), chosen for broad client compatibility.
     pub video_codec: VideoCodec,
+    /// Source luma bit depth (8 or 10). When 10 and the (8-bit-only) H.264 encoder is used
+    /// without a tone-map, the filter graph must down-convert to nv12/yuv420p or the HW encoder
+    /// rejects the frames ("10 bit encode not supported").
+    pub source_bit_depth: u8,
+    /// Keyframe interval in frames (`≈ fps × SEGMENT_SECONDS`) the encoder must not exceed, so
+    /// the fMP4 HLS muxer can cut a keyframe-aligned segment at every `SEGMENT_SECONDS` boundary
+    /// (`docs/.tasks/101`). `command.rs` emits it as `-g` (plus `-forced-idr`/`-keyint_min`/
+    /// `-sc_threshold` per encoder). Without it the encoder keeps its native ~10s GOP, segments
+    /// come out too long, and hls.js fails with `fragParsingError` ("Found no media in msn N").
+    pub gop_frames: u32,
     /// Target audio: `Some(codec)` to transcode audio, `None` to copy it through.
     pub audio_transcode_to: Option<AudioCodec>,
     /// `QualityProfile::Capped` bitrate ceiling (bits/sec) applied to video via
@@ -567,6 +577,25 @@ fn profile_bitrate(profile: &MediaProfile) -> Option<u64> {
     profile.bitrate
 }
 
+/// The keyframe interval, in frames, an encoder must cap its GOP at so a keyframe lands on
+/// every `SEGMENT_SECONDS` HLS boundary (`docs/.tasks/101`). `fps × SEGMENT_SECONDS`, rounded.
+///
+/// A missing/absurd probed frame rate falls back to a safe default (24 fps) and the result is
+/// clamped to a sane range: too small a GOP wastes bitrate on needless keyframes; too large a
+/// one lets a low-fps source's keyframes drift past a segment boundary. `-force_key_frames`
+/// still forces the *exact* cut — this only bounds the encoder's maximum spacing.
+fn gop_frames(frame_rate: Option<f64>) -> u32 {
+    const DEFAULT_FPS: f64 = 24.0;
+    // A high-fps ceiling (120) keeps 60fps content correct; the floor (`SEGMENT_SECONDS`) keeps
+    // at least one keyframe per segment even for pathological low frame rates.
+    let fps = match frame_rate {
+        Some(f) if f.is_finite() && f > 0.0 => f.clamp(1.0, 120.0),
+        _ => DEFAULT_FPS,
+    };
+    let n = (fps * crate::command::SEGMENT_SECONDS as f64).round() as u32;
+    n.clamp(crate::command::SEGMENT_SECONDS, 480)
+}
+
 /// Does this source need tone-mapping for the client's display? True when the source
 /// is HDR/DV **and** the display cannot present that format.
 fn needs_tonemap(profile: &MediaProfile, client: &ClientProfile) -> bool {
@@ -689,6 +718,8 @@ fn transcode_target(
         tone_map,
         dv_tone_map,
         video_codec,
+        source_bit_depth: profile.bit_depth,
+        gop_frames: gop_frames(profile.frame_rate),
         // Audio target is decided by the caller against the client via `audio_plan`.
         audio_transcode_to: None,
         max_bitrate,
@@ -722,6 +753,7 @@ mod tests {
             dv,
             hw_decode_unsupported: false,
             bitrate: None,
+            frame_rate: Some(24.0),
         }
     }
 
@@ -785,6 +817,70 @@ mod tests {
         assert_eq!(base.mode(), "hls");
         let forced = base.clone().force_transcode(&p, &web, q(), &hw_intel());
         assert_eq!(forced, base, "no-op on an existing transcode");
+    }
+
+    #[test]
+    fn transcode_target_carries_source_bit_depth() {
+        // A 10-bit HEVC SDR source transcoded to H.264 for the web must thread its bit depth
+        // into the target so command.rs can down-convert to nv12/yuv420p (task 100).
+        let p = prof(VideoCodec::Hevc, 10, HdrType::None, None);
+        let d = decide(&p, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel());
+        match d {
+            Decision::Transcode { target, .. } => {
+                assert_eq!(target.video_codec, VideoCodec::H264);
+                assert_eq!(target.source_bit_depth, 10, "10-bit source threads through");
+                assert!(!target.tone_map, "SDR source needs no tone-map");
+            }
+            _ => panic!("expected transcode"),
+        }
+        // An 8-bit source carries 8.
+        let p8 = prof(VideoCodec::Hevc, 8, HdrType::None, None);
+        if let Decision::Transcode { target, .. } =
+            decide(&p8, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel())
+        {
+            assert_eq!(target.source_bit_depth, 8);
+        } else {
+            panic!("expected transcode");
+        }
+    }
+
+    #[test]
+    fn gop_frames_computed_from_source_fps() {
+        // 23.976fps × 4s ≈ 96 frames — the GOP the encoder is capped at (task 101).
+        let mut p = prof(VideoCodec::Hevc, 10, HdrType::None, None);
+        p.frame_rate = Some(23.976);
+        if let Decision::Transcode { target, .. } =
+            decide(&p, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel())
+        {
+            assert_eq!(target.gop_frames, 96, "23.976fps × 4s → 96");
+        } else {
+            panic!("expected transcode");
+        }
+        // 60fps × 4s = 240.
+        p.frame_rate = Some(60.0);
+        if let Decision::Transcode { target, .. } =
+            decide(&p, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel())
+        {
+            assert_eq!(target.gop_frames, 240);
+        } else {
+            panic!("expected transcode");
+        }
+    }
+
+    #[test]
+    fn gop_frames_falls_back_when_fps_unknown_or_absurd() {
+        // Unprobed (None) → default 24fps → 96. NaN/absurd values also fall back safely.
+        for fr in [None, Some(f64::NAN), Some(-5.0), Some(0.0)] {
+            let mut p = prof(VideoCodec::Hevc, 10, HdrType::None, None);
+            p.frame_rate = fr;
+            if let Decision::Transcode { target, .. } =
+                decide(&p, aac(), "mp4", &ClientProfile::web(), q(), &hw_intel())
+            {
+                assert_eq!(target.gop_frames, 96, "fallback for {fr:?}");
+            } else {
+                panic!("expected transcode for {fr:?}");
+            }
+        }
     }
 
     #[test]

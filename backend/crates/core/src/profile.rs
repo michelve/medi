@@ -222,7 +222,10 @@ pub struct ClientCapabilities {
 ///
 /// This is the in-memory shape shared across crates; the persisted form is the
 /// `media_files` row (`docs/.tasks/01-db-schema.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Not `Eq`: `frame_rate` is an `f64`. Nothing compares `MediaProfile` for equality or uses it
+// as a hash key, so `PartialEq` alone is sufficient (the decision output `TranscodeTarget` stays
+// `Eq` — it carries the integer `gop_frames`, not the float).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaProfile {
     pub codec: VideoCodec,
     pub width: u32,
@@ -238,4 +241,9 @@ pub struct MediaProfile {
     /// `QualityProfile::Capped` decision (`docs/.tasks/70`). `None` when unprobed.
     #[serde(default)]
     pub bitrate: Option<u64>,
+    /// Source video frame rate (e.g. 23.976), if probed (`media_files.frame_rate`, V13). Drives
+    /// the HLS keyframe GOP so segments cut at every `SEGMENT_SECONDS` boundary (`docs/.tasks/101`).
+    /// `None` when unprobed → the decision falls back to a safe default fps.
+    #[serde(default)]
+    pub frame_rate: Option<f64>,
 }

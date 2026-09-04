@@ -95,6 +95,17 @@ ffmpeg -init_hw_device cuda=cu -filter_hw_device cu -hwaccel cuda \
 > Exact filter names/flags depend on the jellyfin-ffmpeg build; validate against the
 > installed binary during implementation. The **rule** is fixed: DV tone mapping must go
 > through OpenCL/CUDA, not plain VPP.
+>
+> **10-bit → 8-bit H.264 (task 100):** a **10-bit** source targeting the 8-bit-only H.264
+> encoder with **no tone-map** gets an nv12/yuv420p down-convert in `filter_graph`
+> (`scale_cuda=format=nv12` NVENC, `vpp_qsv=format=nv12` QSV, `scale_vaapi=format=nv12`
+> VA-API, `format=yuv420p` libx264) — else the HW encoder rejects the frames ("10 bit encode
+> not supported") and writes nothing.
+>
+> **Keyframe/segment alignment (task 101):** the encoder pins its GOP to `≈ fps × SEGMENT_SECONDS`
+> (`-g`, plus `-forced-idr 1` on NVENC — which otherwise ignores `-force_key_frames`) so the fMP4
+> HLS muxer cuts a keyframe-aligned segment at every `SEGMENT_SECONDS` boundary; without it segments
+> come out at the source's native ~10 s GOP and hls.js fails with `fragParsingError`.
 
 ## Sub-tasks
 
