@@ -32,6 +32,12 @@ export function PosterGrid({ items, hasMore, onReachEnd }: PosterGridProps) {
   const onReachEndRef = useRef(onReachEnd);
   onReachEndRef.current = onReachEnd;
 
+  // Re-run whenever a page is appended (`items.length`) so the observer re-evaluates the
+  // sentinel each time. An IntersectionObserver only fires on an intersection *transition*, so
+  // once the 1px sentinel sits inside the 600px rootMargin it stops re-firing on its own — after
+  // a page loads, the sentinel often stays within the margin and the grid would stall short of
+  // the full catalog. Re-observing on each append forces a fresh check; a still-intersecting
+  // sentinel then keeps requesting the next page until `hasMore` is false (the whole list loads).
   useEffect(() => {
     const node = sentinelRef.current;
     if (!node || !hasMore) return;
@@ -44,7 +50,7 @@ export function PosterGrid({ items, hasMore, onReachEnd }: PosterGridProps) {
     );
     observer.observe(node);
     return () => observer.disconnect();
-  }, [hasMore]);
+  }, [hasMore, items.length]);
 
   return (
     <div>

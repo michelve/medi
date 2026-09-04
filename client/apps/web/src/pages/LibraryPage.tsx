@@ -2,13 +2,13 @@
  * `LibraryPage` (Task 81 + 91) — the `/` landing view.
  *
  * Two modes:
- *  - **Browse rows** (Task 91): with no search query and the default sort, the page shows
- *    the curated `CategoryRow`s from `GET /api/library/rows` ("Recently Added" + top
- *    genres), each a horizontal poster strip. This is the Netflix-style landing.
- *  - **Flat grid** (Task 81): as soon as the user types a search or picks a non-default
- *    sort, the page falls back to the paginated `PosterGrid` over `GET /api/library` (the
- *    rows are a fixed teaser, not a searchable/sortable surface). Sort re-fetches from page
- *    one via the hook; the search box filters the loaded items client-side.
+ *  - **Landing** (default, no search): the curated `CategoryRow`s from `GET /api/library/rows`
+ *    ("Recently Added" + top genres) as a Netflix-style teaser, **followed by the full
+ *    paginated `PosterGrid` of the whole catalog** so every title is browsable in one place
+ *    (the rows alone are capped teasers — without the grid a large library looks truncated).
+ *  - **Flat grid** (Task 81): a search query (or a non-default sort) drops the rows and shows
+ *    just the paginated `PosterGrid` over `GET /api/library`. Sort re-fetches from page one via
+ *    the hook; the search box filters the loaded items client-side.
  */
 
 import { useMemo } from 'react';
@@ -74,14 +74,47 @@ function SortToggle() {
 
 export function LibraryPage() {
   const { query, sort } = useBrowseState();
-  // The landing rows are the default view: no active search and the default ordering.
-  const showRows = query.trim() === '' && sort === DEFAULT_SORT;
+  // The landing view (curated rows + a full grid below) shows only when there's no active
+  // search and the default ordering; a search or a non-default sort collapses to the flat grid.
+  const showLanding = query.trim() === '' && sort === DEFAULT_SORT;
 
   return (
     <div>
       <SortToggle />
-      {showRows ? <BrowseRows /> : <FlatGrid />}
+      {showLanding ? (
+        <>
+          <BrowseRows />
+          {/* The full catalog below the teaser rows, so every title is browsable here and a
+              large library never looks truncated to the capped rows. Heading separates it from
+              the rows above. */}
+          <AllTitlesGrid />
+        </>
+      ) : (
+        <FlatGrid />
+      )}
     </div>
+  );
+}
+
+/** The full paginated catalog grid shown beneath the landing rows (all titles, A–Z). */
+function AllTitlesGrid() {
+  const { items, initialLoading, hasMore, error, loadMore } = useLibraryPaging(DEFAULT_SORT);
+
+  // A heading anchors the grid under the horizontal rows; hidden until the first page lands so
+  // it doesn't flash above an empty grid.
+  return (
+    <section style={{ marginTop: 8 }}>
+      <h2 style={{ fontSize: 18, margin: '0 0 16px', color: theme.colors.text }}>All titles</h2>
+      {initialLoading && items.length === 0 ? (
+        <Loading label="Loading titles…" />
+      ) : error && items.length === 0 ? (
+        <ErrorState message={error} />
+      ) : items.length === 0 ? (
+        <EmptyState>No titles yet.</EmptyState>
+      ) : (
+        <PosterGrid items={items} hasMore={hasMore} onReachEnd={loadMore} />
+      )}
+    </section>
   );
 }
 
