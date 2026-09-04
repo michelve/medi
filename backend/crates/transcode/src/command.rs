@@ -236,10 +236,14 @@ impl HwPlan {
                 if *opencl {
                     // DV path: VA-API device + an OpenCL device derived from it, so the
                     // OpenCL tone-map and the QSV encode share the same frames.
+                    // Derivation syntax is `<type>=<name>@<source>` — the new device's name
+                    // comes BEFORE the `@`, the source device after (ffmpeg rejects the
+                    // reversed `opencl@va=ocl` as "invalid source device name", so the encode
+                    // exits immediately and writes no init.mp4 → hls.js fragLoadTimeOut).
                     p(a, "-init_hw_device");
                     a.push(format!("vaapi=va:{node}"));
                     p(a, "-init_hw_device");
-                    p(a, "opencl@va=ocl");
+                    p(a, "opencl=ocl@va");
                     p(a, "-filter_hw_device");
                     p(a, "ocl");
                 } else {
@@ -268,8 +272,10 @@ impl HwPlan {
                 p(a, "-init_hw_device");
                 a.push(format!("vaapi=va:{node}"));
                 if *opencl {
+                    // Derivation syntax `<type>=<name>@<source>`: new name before `@`, source
+                    // after (see the Intel arm — the reversed form fails to parse).
                     p(a, "-init_hw_device");
-                    p(a, "opencl@va=ocl");
+                    p(a, "opencl=ocl@va");
                     p(a, "-filter_hw_device");
                     p(a, "ocl");
                 } else {
@@ -633,8 +639,11 @@ mod tests {
         let s = joined(&a);
         assert!(s.contains("tonemap_opencl"), "DV must use OpenCL, not VPP: {s}");
         assert!(!s.contains("vpp_qsv=tonemap"));
-        // The OpenCL device is chained off the VA-API device.
-        assert!(s.contains("opencl@va=ocl"));
+        // The OpenCL device is chained off the VA-API device. Derivation syntax is
+        // `opencl=<name>@<source>` — the reversed `opencl@va=ocl` is rejected by ffmpeg
+        // ("invalid source device name") and the encode writes nothing.
+        assert!(s.contains("-init_hw_device opencl=ocl@va"), "correct derivation syntax: {s}");
+        assert!(!s.contains("opencl@va=ocl"), "must not use the reversed (invalid) form: {s}");
         assert!(s.contains("-filter_hw_device ocl"));
     }
 

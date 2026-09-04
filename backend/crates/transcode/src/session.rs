@@ -17,9 +17,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Stdio;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::AsyncReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
@@ -80,6 +82,44 @@ struct Session {
     producing_from: u32,
     /// Total media duration (drives the synthesized playlist + the last segment index).
     duration_ms: u64,
+    /// The tail of the current ffmpeg process's stderr, drained by a background task into a
+    /// bounded buffer. Logged at ERROR when the process is observed to have exited non-zero,
+    /// so a failed encode says *why* in the server log instead of failing silently (the client
+    /// would otherwise only see `init.mp4` never appear → hls.js fragLoadTimeOut).
+    stderr: SharedStderr,
+    /// The argv of the current ffmpeg process, logged alongside its stderr on a failed exit so
+    /// the exact failing command is reproducible from the log.
+    argv: Vec<String>,
+}
+
+/// A bounded, shared buffer holding the tail of an ffmpeg process's stderr. A `std::sync::Mutex`
+/// (not tokio's) because it's only ever locked for a quick push/read, never across an `.await`.
+type SharedStderr = Arc<StdMutex<StderrTail>>;
+
+/// Keep only the last [`StderrTail::CAP`] bytes of stderr — ffmpeg on `-loglevel warning` is
+/// usually quiet, but a broken filter graph can spew, and the *tail* is what carries the fatal
+/// error. Cheap and allocation-stable.
+#[derive(Default)]
+struct StderrTail {
+    buf: Vec<u8>,
+}
+
+impl StderrTail {
+    /// Cap the retained tail at 16 KiB — enough for ffmpeg's error context, small enough to
+    /// hold per session without concern.
+    const CAP: usize = 16 * 1024;
+
+    fn push(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+        if self.buf.len() > Self::CAP {
+            let drop = self.buf.len() - Self::CAP;
+            self.buf.drain(..drop);
+        }
+    }
+
+    fn as_string(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
 }
 
 /// How far ahead of the current production point a requested segment may be while we simply
@@ -185,7 +225,7 @@ impl SessionManager {
 
         // Start the transcode from segment 0. A seek later restarts ffmpeg at the target
         // segment via `ensure_segment` (no re-decode of the whole file up to the seek point).
-        let child = self.spawn_ffmpeg(input, target, audio, &dir, 0)?;
+        let (child, argv, stderr) = self.spawn_ffmpeg(input, target, audio, &dir, 0)?;
         tracing::info!(session = %id, input = %input.display(), "starting transcode session");
 
         let now = Instant::now();
@@ -204,12 +244,16 @@ impl SessionManager {
                 audio,
                 producing_from: 0,
                 duration_ms,
+                stderr,
+                argv,
             },
         );
         Ok(id)
     }
 
-    /// Spawn one ffmpeg producing segments from `start_segment` onward into `dir`.
+    /// Spawn one ffmpeg producing segments from `start_segment` onward into `dir`. Returns the
+    /// child, its argv, and a shared buffer into which a background task drains the process's
+    /// stderr tail (logged on a failed exit).
     fn spawn_ffmpeg(
         &self,
         input: &Path,
@@ -217,7 +261,7 @@ impl SessionManager {
         audio: AudioTarget,
         dir: &Path,
         start_segment: u32,
-    ) -> Result<Child, SessionError> {
+    ) -> Result<(Child, Vec<String>, SharedStderr), SessionError> {
         let argv = command::build_argv(
             target,
             audio,
@@ -227,11 +271,36 @@ impl SessionManager {
             start_segment,
         );
         tracing::debug!(start_segment, argv = ?argv, "ffmpeg argv");
-        Command::new(ffmpeg_bin())
+        let mut child = Command::new(ffmpeg_bin())
             .args(&argv)
+            // Pipe stderr so a failed encode's error is captured (drained below) rather than
+            // discarded — otherwise ffmpeg dies silently and the only symptom is a client
+            // fragLoadTimeOut on an init.mp4 that never appears.
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(SessionError::Spawn)
+            .map_err(SessionError::Spawn)?;
+
+        // Drain stderr in the background into a bounded shared tail. Taking the pipe here means
+        // the child no longer owns it; the task ends on its own when ffmpeg closes stderr (exit).
+        let stderr: SharedStderr = Arc::new(StdMutex::new(StderrTail::default()));
+        if let Some(mut pipe) = child.stderr.take() {
+            let sink = Arc::clone(&stderr);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match pipe.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if let Ok(mut tail) = sink.lock() {
+                                tail.push(&buf[..n]);
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Ok((child, argv, stderr))
     }
 
     /// The synthesized VOD playlist for a session (full runtime, all segments, seekable).
@@ -282,7 +351,7 @@ impl SessionManager {
                 // Seek (or resume from a completed encode): kill any current ffmpeg and restart
                 // it at the requested segment.
                 let _ = s.child.start_kill();
-                let child = self.spawn_ffmpeg(
+                let (child, argv, stderr) = self.spawn_ffmpeg(
                     &s.input,
                     &s.target,
                     s.audio,
@@ -290,6 +359,8 @@ impl SessionManager {
                     seg_index,
                 )?;
                 s.child = child;
+                s.argv = argv;
+                s.stderr = stderr;
                 s.exited = None; // a fresh child is running again
                 s.producing_from = seg_index;
                 tracing::info!(session = %session_id, seg_index, "seek: restarting transcode at segment");
@@ -401,7 +472,26 @@ impl Session {
     fn poll_reusable(&mut self) -> bool {
         if self.exited.is_none() {
             if let Ok(Some(status)) = self.child.try_wait() {
-                self.exited = Some(status.success());
+                let ok = status.success();
+                self.exited = Some(ok);
+                // On the FIRST observation of a *failed* exit, surface why: dump the captured
+                // stderr tail + the exact argv at ERROR. Without this a broken command (e.g. a
+                // bad hw-device spec) dies producing no init.mp4 and the only visible symptom is
+                // the client retrying forever on a fragLoadTimeOut. Logged once (guarded by the
+                // `is_none` transition above).
+                if !ok {
+                    let tail = self
+                        .stderr
+                        .lock()
+                        .map(|t| t.as_string())
+                        .unwrap_or_default();
+                    tracing::error!(
+                        status = %status,
+                        argv = ?self.argv,
+                        stderr = %tail.trim(),
+                        "ffmpeg transcode failed"
+                    );
+                }
             }
         }
         match self.exited {
@@ -677,5 +767,31 @@ mod tests {
         assert!(second.is_ok(), "a failed session must be evicted to free the slot: {second:?}");
         assert_eq!(mgr.active_count().await, 1);
         assert_ne!(first, second.unwrap(), "the failed session was replaced, not reused");
+    }
+
+    #[test]
+    fn stderr_tail_keeps_only_the_last_cap_bytes() {
+        // The captured stderr is bounded: a flood keeps only the tail (the part carrying
+        // ffmpeg's fatal error), never grows unbounded.
+        let mut t = StderrTail::default();
+        // Push well past the cap; the retained buffer must be exactly CAP and end with the
+        // most-recent bytes.
+        let flood = vec![b'x'; StderrTail::CAP * 3];
+        t.push(&flood);
+        t.push(b"FATAL: the real error\n");
+        assert_eq!(t.buf.len(), StderrTail::CAP, "tail is bounded to CAP");
+        assert!(
+            t.as_string().ends_with("FATAL: the real error\n"),
+            "the most-recent (fatal) line is retained"
+        );
+    }
+
+    #[test]
+    fn stderr_tail_accumulates_small_writes() {
+        // Below the cap, everything is kept in order (a short error is preserved whole).
+        let mut t = StderrTail::default();
+        t.push(b"Invalid device specification ");
+        t.push(b"\"opencl@va=ocl\"");
+        assert_eq!(t.as_string(), "Invalid device specification \"opencl@va=ocl\"");
     }
 }
