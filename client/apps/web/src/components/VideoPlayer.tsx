@@ -67,6 +67,14 @@ export interface VideoPlayerProps {
   /** Fires with `true` while an audio-track switch is re-resolving + re-attaching. */
   onSwitchingAudio?: (switching: boolean) => void;
   /**
+   * Resume position in ms (`docs/.tasks/98`): seek here once the first source is ready, so a
+   * reopened title picks up where it left off. Seeded on mount into the same resume-seek path
+   * an audio-track switch uses (the VOD playlist makes any offset immediately seekable).
+   * `undefined`/`0` starts from the beginning. Only the initial value is read — later changes
+   * are ignored (a running player isn't re-seeked out from under the viewer).
+   */
+  initialResumeMs?: number;
+  /**
    * WebVTT text subtitles to attach as `<track>` children (`docs/.tasks/90`). Text tracks
    * ride alongside a direct-played or transcoded stream with no extra work; image tracks
    * are burned in server-side (via the stream decision) and never appear here.
@@ -138,6 +146,7 @@ export function VideoPlayer({
   audioTrack,
   forceTranscodeForAudio = false,
   onSwitchingAudio,
+  initialResumeMs,
   textTracks,
   diagnostics = true,
   diagnosticsOpen = false,
@@ -148,6 +157,12 @@ export function VideoPlayer({
   // The playback position (ms) to restore once a freshly-attached source is ready — set when
   // an audio-track switch tears the current stream down, so the new track resumes in place.
   const resumeToRef = useRef<number | null>(null);
+  // One-shot initial resume (`docs/.tasks/98`): the saved position to seek to on the FIRST
+  // attach. Kept separate from `resumeToRef` so it does NOT trip the "Switching audio…" toast
+  // (the resolve effect keys that off `resumeToRef`). Consumed once in the attach effect.
+  const initialResumeRef = useRef<number | null>(
+    initialResumeMs != null && initialResumeMs > 0 ? Math.round(initialResumeMs) : null,
+  );
   // Remember the previous audioTrack so a *change* (a real switch) captures the current
   // position, while the first mount does not.
   const prevAudioTrackRef = useRef<number | undefined>(audioTrack);
@@ -228,9 +243,18 @@ export function VideoPlayer({
     // regardless of direct/HLS and are the ground truth for "why is it a black screen".
     const detachVideoEvents = attachVideoDiagnostics(video, diag);
 
-    // Audio-track switch resume (`docs/.tasks/97` Part C): if a switch captured a position,
-    // seek there once the new source is ready. The VOD playlist makes any offset immediately
-    // seekable. One-shot: it fires on the first `loadedmetadata`, then clears.
+    // On the very first attach with no pending audio-switch resume, seed the saved resume
+    // position (`docs/.tasks/98`) so the title picks up where it left off. Consumed once, and
+    // only when nothing else is already queued (an audio switch mid-mount takes precedence).
+    if (resumeToRef.current === null && initialResumeRef.current !== null) {
+      resumeToRef.current = initialResumeRef.current;
+      initialResumeRef.current = null;
+      diag.info('player', 'resuming from saved position', { ms: resumeToRef.current });
+    }
+
+    // Resume seek (`docs/.tasks/97` Part C audio switch + `98` initial resume): if a position is
+    // queued, seek there once the new source is ready. The VOD playlist makes any offset
+    // immediately seekable. One-shot: it fires on the first `loadedmetadata`, then clears.
     const detachResume = attachResumeSeek(video, resumeToRef, diag, () => onSwitchingAudio?.(false));
 
     if (decision.mode === 'direct') {

@@ -32,9 +32,9 @@ use medi_transcode::{
 
 use crate::cursor;
 use crate::dto::{
-    BackfillResponse, CategoryRow, FileTracks, GenreListItem, LibraryItem, LibraryPage,
-    LibraryRows, MatchCandidate, MatchRequest, MatchesResponse, PersonPage, RefreshResponse,
-    StreamDecision, TrickplayMeta,
+    BackfillResponse, CategoryRow, ContinueWatchingItem, FileTracks, GenreListItem, LibraryItem,
+    LibraryPage, LibraryRows, MatchCandidate, MatchRequest, MatchesResponse, PersonPage,
+    ProgressResponse, ProgressWrite, RefreshResponse, StreamDecision, TrickplayMeta,
 };
 use crate::error::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -96,6 +96,14 @@ pub fn router(state: AppState) -> Router {
         // Per-file tracks (`docs/.tasks/97` Part C): audio + subtitle tracks for a deep link
         // to populate the player's menus. Shared with `99` (adds chapters).
         .route("/api/files/:file_id", get(file_tracks))
+        // Playback progress + Continue Watching (`docs/.tasks/98`). Not ETag-cached (progress
+        // is live). `PUT` is the throttled in-play write; `POST` accepts the same body so the
+        // unload/tab-hide flush can go out via `navigator.sendBeacon` (which only sends POST).
+        .route(
+            "/api/progress/:file_id",
+            get(get_progress).put(put_progress).post(put_progress),
+        )
+        .route("/api/continue-watching", get(continue_watching))
         // Playback — Phase 2 (transcode crate).
         .route("/api/stream/:file_id", get(stream_decision))
         .route("/api/direct/:file_id", get(direct_play))
@@ -929,6 +937,90 @@ async fn file_tracks(
         audio: file.audio_streams.into_iter().map(Into::into).collect(),
         subtitles: file.subtitle_streams.into_iter().map(Into::into).collect(),
     };
+    Ok(Json(body).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Playback progress + Continue Watching (`docs/.tasks/98`)
+// ---------------------------------------------------------------------------
+
+/// Current unix time in seconds — the epoch `playback_progress.updated_at` is stamped with,
+/// matching `probe_failures.last_attempt_at` and the other epoch columns.
+fn now_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `GET /api/progress/:file_id` — the saved playback position of a file (`docs/.tasks/98`).
+///
+/// Returns `{ position_ms, duration_ms, updated_at, finished }` when the file has progress,
+/// or `204 No Content` (empty body) when it has never been played — so the player resumes
+/// only when there is something to resume. Not moka-cached: progress is live.
+async fn get_progress(
+    State(state): State<AppState>,
+    Path(file_id): Path<i64>,
+) -> ApiResult<Response> {
+    let db = state.db.clone();
+    let progress = run_blocking(&db, move |conn| queries::get_progress(conn, file_id)).await?;
+    match progress {
+        Some(p) => Ok(Json(ProgressResponse::from(p)).into_response()),
+        None => Ok(axum::http::StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+/// `PUT` (and `POST`) `/api/progress/:file_id` — persist the playback position of a file
+/// (`docs/.tasks/98`).
+///
+/// The throttled write the player sends as it plays, and once more on pause / tab-hide /
+/// unmount. The in-play writes use `PUT`; the unload/hide flush goes out via
+/// `navigator.sendBeacon`, which only sends `POST`, so this handler backs both verbs.
+/// Upserts the single per-file row (single-user), deriving
+/// `finished` past ~95%. Returns `204 No Content`. A negative position is clamped to 0 (a
+/// beacon can occasionally report a bogus value); an unknown `file_id` still writes a row only
+/// if the FK holds — the upsert's `REFERENCES media_files(id)` rejects a phantom file with a
+/// constraint error, surfaced as a `500` (a real client never sends one).
+async fn put_progress(
+    State(state): State<AppState>,
+    Path(file_id): Path<i64>,
+    Json(body): Json<ProgressWrite>,
+) -> ApiResult<Response> {
+    let position_ms = body.position_ms.max(0);
+    let duration_ms = body.duration_ms.max(0);
+    let now = now_secs();
+    let db = state.db.clone();
+    run_blocking(&db, move |conn| {
+        medi_db::writes::upsert_progress(conn, file_id, position_ms, duration_ms, now)
+    })
+    .await?;
+    Ok(axum::http::StatusCode::NO_CONTENT.into_response())
+}
+
+/// Query params for `GET /api/continue-watching`.
+#[derive(Debug, Deserialize)]
+pub struct ContinueQuery {
+    /// Max rows to return; clamped by the DB layer. Absent → a sensible default.
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+/// Default number of Continue-Watching cards when the client sends no `limit`.
+const CONTINUE_DEFAULT_LIMIT: u32 = 20;
+
+/// `GET /api/continue-watching?limit=` — the "Continue Watching" row (`docs/.tasks/98`):
+/// in-progress titles newest-first, each with its poster/title and the position to resume from.
+/// Finished (past ~95%) and just-started (< 30 s) titles are excluded by the query. Not
+/// moka-cached: it changes on every `PUT /api/progress`.
+async fn continue_watching(
+    State(state): State<AppState>,
+    Query(q): Query<ContinueQuery>,
+) -> ApiResult<Response> {
+    let limit = q.limit.unwrap_or(CONTINUE_DEFAULT_LIMIT);
+    let db = state.db.clone();
+    let items = run_blocking(&db, move |conn| queries::list_continue_watching(conn, limit)).await?;
+    let body: Vec<ContinueWatchingItem> = items.into_iter().map(Into::into).collect();
     Ok(Json(body).into_response())
 }
 

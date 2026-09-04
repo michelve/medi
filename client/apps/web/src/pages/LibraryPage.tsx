@@ -19,6 +19,7 @@ import { useDetail } from '../lib/useDetail';
 import { useLibraryPaging } from '../lib/useLibraryPaging';
 import { PosterGrid } from '../components/PosterGrid';
 import { CategoryRow } from '../components/CategoryRow';
+import { ContinueWatchingRow } from '../components/ContinueWatchingRow';
 import { Loading, ErrorState, EmptyState } from '../components/Status';
 import { theme } from '../theme';
 
@@ -97,6 +98,9 @@ function BrowseRows() {
 
   return (
     <section>
+      {/* Real "Continue Watching" (Task 98) at the very top — renders nothing when there's
+          nothing in progress, so it only appears when it's real data. */}
+      <ContinueWatchingRow />
       {state.data.rows.map((row) => (
         <CategoryRow key={row.key} row={row} />
       ))}

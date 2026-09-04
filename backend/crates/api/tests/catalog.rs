@@ -1188,6 +1188,123 @@ async fn trickplay_sprite_static_route_still_served() {
 }
 
 // ---------------------------------------------------------------------------
+// Playback progress + Continue Watching (`docs/.tasks/98`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn progress_put_then_get_and_continue_watching() {
+    // seeded_app: movie files 88 (Blade Runner) + 89 (Arrival), episode file 90 (Severance).
+    let (app, _dir) = seeded_app();
+
+    // No progress yet → GET is 204 (no body).
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/progress/88").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // PUT ~5 min into Blade Runner (file 88) → 204.
+    let put = app
+        .clone()
+        .oneshot(
+            Request::put("/api/progress/88")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"position_ms":300000,"duration_ms":6000000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+    // The beacon flush path (POST, same body) is accepted too — sendBeacon only sends POST.
+    let post = app
+        .clone()
+        .oneshot(
+            Request::post("/api/progress/88")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"position_ms":300000,"duration_ms":6000000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(post.status(), StatusCode::NO_CONTENT, "POST (sendBeacon) is accepted");
+
+    // GET now returns the saved position, not finished (5 min of 100 min).
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/progress/88").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["position_ms"], 300000);
+    assert_eq!(json["duration_ms"], 6000000);
+    assert_eq!(json["finished"], false);
+
+    // PUT the episode file (90) too, a bit later, so ordering is deterministic.
+    let put = app
+        .clone()
+        .oneshot(
+            Request::put("/api/progress/90")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"position_ms":600000,"duration_ms":2400000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+    // Continue Watching lists both, newest write first (episode 90 before movie 88).
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/continue-watching").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let items = body_json(resp).await;
+    let arr = items.as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    // The episode file resolves to its series (kind "episode", title "Severance").
+    assert_eq!(arr[0]["file_id"], 90);
+    assert_eq!(arr[0]["kind"], "episode");
+    assert_eq!(arr[0]["title"], "Severance");
+    assert_eq!(arr[0]["position_ms"], 600000);
+    // The movie file carries kind "movie" + its own title.
+    assert_eq!(arr[1]["file_id"], 88);
+    assert_eq!(arr[1]["kind"], "movie");
+    assert_eq!(arr[1]["title"], "Blade Runner 2049");
+
+    // A title watched past ~95% is marked finished and drops off the row.
+    let put = app
+        .clone()
+        .oneshot(
+            Request::put("/api/progress/88")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"position_ms":5900000,"duration_ms":6000000}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/progress/88").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["finished"], true);
+
+    let resp = app
+        .oneshot(Request::get("/api/continue-watching").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let arr = body_json(resp).await;
+    let ids: Vec<i64> = arr.as_array().unwrap().iter().map(|i| i["file_id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![90], "finished title drops from Continue Watching");
+}
+
+// ---------------------------------------------------------------------------
 // Web SPA fallback (Task 80) — same-origin serving of the browser client at `/`.
 // ---------------------------------------------------------------------------
 

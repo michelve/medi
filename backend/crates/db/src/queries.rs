@@ -744,6 +744,80 @@ pub fn get_media_file(conn: &Connection, id: i64) -> DbResult<MediaFile> {
     Ok(file)
 }
 
+// ---------------------------------------------------------------------------
+// Playback progress (`docs/.tasks/98`) — resume position + "Continue Watching"
+// ---------------------------------------------------------------------------
+
+/// Read the saved playback position of a file, or `None` when it has never been played
+/// (Task 98). Backs `GET /api/progress/:file_id`.
+pub fn get_progress(conn: &Connection, media_file_id: i64) -> DbResult<Option<crate::models::Progress>> {
+    conn.prepare_cached(
+        "SELECT media_file_id, position_ms, duration_ms, updated_at, finished \
+         FROM playback_progress WHERE media_file_id = ?1",
+    )?
+    .query_row(params![media_file_id], crate::models::Progress::from_row)
+    .optional()
+    .map_err(Into::into)
+}
+
+/// List the "Continue Watching" titles newest-first (Task 98), each joined to its owning
+/// movie/episode so a card can render a poster + title and link to `/play/:file_id`.
+///
+/// A row qualifies when it is **not** `finished` AND is meaningfully into the film — past
+/// `MIN_RESUME_MS` (so a title barely started isn't surfaced) and below the finished
+/// threshold (a belt-and-braces guard alongside `finished=0`). Ordered by `updated_at DESC`
+/// via `idx_playback_progress_updated`; `limit` bounds the row count.
+///
+/// The movie side reads the movie's poster/title directly; the episode side climbs
+/// episode → season → series for the series' poster/title (episodes carry no art of their
+/// own). `kind_tag` is 0 for a movie, 1 for an episode, matching [`ContinueItem::from_row`].
+pub fn list_continue_watching(conn: &Connection, limit: u32) -> DbResult<Vec<crate::models::ContinueItem>> {
+    let limit = clamp_limit(limit);
+    // Both sides project the same 8-column shape; a UNION ALL joins the movie- and
+    // episode-owned files, then the outer query orders + limits across both.
+    let sql = format!(
+        "SELECT file_id, kind_tag, title_id, title, poster_path, position_ms, duration_ms, updated_at \
+         FROM ( \
+             SELECT mf.id AS file_id, 0 AS kind_tag, m.id AS title_id, m.title AS title, \
+                    m.poster_path AS poster_path, \
+                    p.position_ms AS position_ms, p.duration_ms AS duration_ms, \
+                    p.updated_at AS updated_at \
+             FROM playback_progress p \
+             JOIN media_files mf ON mf.id = p.media_file_id \
+             JOIN movies m ON m.id = mf.movie_id \
+             WHERE p.finished = 0 AND p.position_ms > ?1 \
+               AND (p.duration_ms <= 0 OR p.position_ms < CAST(?2 * p.duration_ms AS INTEGER)) \
+             UNION ALL \
+             SELECT mf.id AS file_id, 1 AS kind_tag, sr.id AS title_id, sr.title AS title, \
+                    sr.poster_path AS poster_path, \
+                    p.position_ms AS position_ms, p.duration_ms AS duration_ms, \
+                    p.updated_at AS updated_at \
+             FROM playback_progress p \
+             JOIN media_files mf ON mf.id = p.media_file_id \
+             JOIN episodes e ON e.id = mf.episode_id \
+             JOIN seasons se ON se.id = e.season_id \
+             JOIN series sr ON sr.id = se.series_id \
+             WHERE p.finished = 0 AND p.position_ms > ?1 \
+               AND (p.duration_ms <= 0 OR p.position_ms < CAST(?2 * p.duration_ms AS INTEGER)) \
+         ) \
+         ORDER BY updated_at DESC, file_id DESC \
+         LIMIT ?3"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(
+            params![MIN_RESUME_MS, crate::writes::FINISHED_FRACTION, limit],
+            crate::models::ContinueItem::from_row,
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Below this many ms into a title, progress is treated as "just started" and is neither
+/// offered as a resume nor listed in Continue Watching (`docs/.tasks/98`). Shared between the
+/// Continue-Watching query and the resume check on the client (mirrored there).
+pub const MIN_RESUME_MS: i64 = 30_000;
+
 /// Explicit `trickplay_assets` column list, in the order [`TrickplayAsset::from_row`]
 /// reads. Kept adjacent to the read so the positions stay aligned.
 const TRICKPLAY_COLUMNS: &str =

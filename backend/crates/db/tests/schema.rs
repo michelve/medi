@@ -4,6 +4,7 @@
 
 use medi_core::{DvProfile, HdrType, VideoCodec};
 use medi_db::queries;
+use medi_db::writes;
 
 /// A fresh boot creates the db with 64 KB pages and WAL journaling.
 #[test]
@@ -192,4 +193,76 @@ fn fanart_worklist_lists_matched_movies_missing_logo_or_wallpaper() {
     let m1 = queries::get_movie(&conn, 1).unwrap();
     assert!(m1.logo_path.is_none());
     assert!(m1.wallpaper_path.is_none());
+}
+
+/// "Continue Watching" (`docs/.tasks/98`) lists in-progress titles newest-first, joins each
+/// file to its owning movie (poster + title) or episode → series, and excludes finished /
+/// just-started rows. Also drives `ON DELETE CASCADE` (removing a file drops its progress).
+#[test]
+fn continue_watching_orders_joins_and_excludes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.db");
+    let db = medi_db::open(&path, 2).unwrap();
+    let conn = db.conn().unwrap();
+
+    conn.execute_batch(
+        "INSERT INTO movies (id, title, sort_title, added_at, poster_path) VALUES \
+            (10, 'Arrival', 'arrival', 100, 'movies/10/poster.jpg'), \
+            (11, 'Dune', 'dune', 200, NULL), \
+            (12, 'Barely Started', 'barely started', 300, NULL), \
+            (13, 'Finished Film', 'finished film', 400, NULL);
+         -- A series with one episode (episode-owned file resolves the series poster).
+         INSERT INTO series (id, title, sort_title, added_at, poster_path) \
+            VALUES (20, 'Severance', 'severance', 500, 'series/20/poster.jpg');
+         INSERT INTO seasons (id, series_id, season_number) VALUES (30, 20, 1);
+         INSERT INTO episodes (id, season_id, episode_number, title) VALUES (40, 30, 1, 'Pilot');
+         INSERT INTO media_files (id, movie_id, path, container) VALUES \
+            (100, 10, '/media/arrival.mkv', 'mkv'), \
+            (101, 11, '/media/dune.mkv', 'mkv'), \
+            (102, 12, '/media/barely.mkv', 'mkv'), \
+            (103, 13, '/media/finished.mkv', 'mkv');
+         INSERT INTO media_files (id, episode_id, path, container) VALUES \
+            (104, 40, '/media/sev-s01e01.mkv', 'mkv');",
+    )
+    .unwrap();
+
+    // Arrival: 5 min in (oldest update). Dune: 10 min in (newest movie update). Episode: middle.
+    writes::upsert_progress(&conn, 100, 300_000, 6_000_000, 1000).unwrap();
+    writes::upsert_progress(&conn, 104, 600_000, 2_400_000, 1500).unwrap();
+    writes::upsert_progress(&conn, 101, 600_000, 8_000_000, 2000).unwrap();
+    // Barely started (< MIN_RESUME_MS) → excluded.
+    writes::upsert_progress(&conn, 102, 5_000, 6_000_000, 3000).unwrap();
+    // Finished (past 95%) → excluded.
+    writes::upsert_progress(&conn, 103, 5_900_000, 6_000_000, 3500).unwrap();
+
+    let items = queries::list_continue_watching(&conn, 50).unwrap();
+    // Only the three qualifying rows, newest updated_at first: Dune (2000), episode (1500), Arrival (1000).
+    let ids: Vec<i64> = items.iter().map(|i| i.file_id).collect();
+    assert_eq!(ids, vec![101, 104, 100], "newest-first, finished + just-started excluded");
+
+    // The movie-owned row carries the movie's poster/title and kind "movie".
+    let dune = &items[0];
+    assert_eq!(dune.kind, "movie");
+    assert_eq!(dune.title, "Dune");
+    assert_eq!(dune.title_id, 11);
+    assert_eq!(dune.position_ms, 600_000);
+
+    // The episode-owned row resolves its SERIES poster/title and kind "episode".
+    let ep = &items[1];
+    assert_eq!(ep.kind, "episode");
+    assert_eq!(ep.title, "Severance");
+    assert_eq!(ep.title_id, 20, "links to the series detail page");
+    assert_eq!(ep.poster_path.as_deref(), Some("series/20/poster.jpg"));
+
+    // The Arrival row surfaces its own poster.
+    assert_eq!(items[2].poster_path.as_deref(), Some("movies/10/poster.jpg"));
+
+    // `limit` bounds the list.
+    assert_eq!(queries::list_continue_watching(&conn, 1).unwrap().len(), 1);
+
+    // ON DELETE CASCADE: deleting Dune's file drops its progress, so it leaves the list.
+    conn.execute("DELETE FROM media_files WHERE id = 101", []).unwrap();
+    assert!(queries::get_progress(&conn, 101).unwrap().is_none(), "progress cascaded with the file");
+    let after: Vec<i64> = queries::list_continue_watching(&conn, 50).unwrap().iter().map(|i| i.file_id).collect();
+    assert_eq!(after, vec![104, 100]);
 }

@@ -16,6 +16,7 @@ import { ApiError } from './errors';
 import type {
   ApiErrorBody,
   BackfillResponse,
+  ContinueWatchingItem,
   CreateLibraryRequest,
   FileTracks,
   GenreCount,
@@ -28,6 +29,8 @@ import type {
   PatchLibraryRequest,
   PersonPage,
   ProbeFailuresPage,
+  Progress,
+  ProgressWrite,
   RefreshResponse,
   SeriesDetail,
   StreamDecision,
@@ -211,6 +214,75 @@ export class ApiClient {
    */
   trickplayMeta(fileId: number, opts: RequestOptions = {}): Promise<TrickplayMetaResponse> {
     return this.getJson<TrickplayMetaResponse>(`/api/trickplay/${fileId}/meta`, opts, false);
+  }
+
+  // -- Playback progress + Continue Watching (`docs/.tasks/98`) ------------
+
+  /**
+   * `GET /api/progress/:file_id` — the saved playback position of a file (`docs/.tasks/98`).
+   * Resolves to `null` when the file has never been played (the backend returns `204`), so the
+   * player resumes only when there is something to resume. Not ETag-cached (progress is live).
+   */
+  async progress(fileId: number, opts: RequestOptions = {}): Promise<Progress | null> {
+    const res = await this.doFetch(this.abs(`/api/progress/${fileId}`), {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: opts.signal,
+    });
+    if (res.status === 204) return null;
+    if (!res.ok) throw await ApiError.fromResponse(res);
+    return (await res.json()) as Progress;
+  }
+
+  /**
+   * `PUT /api/progress/:file_id` — persist the playback position (`docs/.tasks/98`). The
+   * throttled write the player sends every ~10–15 s and on pause. Resolves once the `204`
+   * lands. `keepalive` lets an unmount flush ride out the navigation (the fetch survives the
+   * page transition) as a fallback when `sendBeacon` isn't used.
+   */
+  async putProgress(
+    fileId: number,
+    body: ProgressWrite,
+    opts: RequestOptions & { keepalive?: boolean } = {},
+  ): Promise<void> {
+    const res = await this.doFetch(this.abs(`/api/progress/${fileId}`), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+      keepalive: opts.keepalive,
+    });
+    if (!res.ok) throw await ApiError.fromResponse(res);
+  }
+
+  /**
+   * Flush a progress write during page-hide / unload using `navigator.sendBeacon` when it's
+   * available (`docs/.tasks/98`) — the browser guarantees the small POST is delivered even as
+   * the tab closes, where a normal `fetch` would be cancelled. Falls back to a `keepalive`
+   * `PUT` when the Beacon API is missing. Fire-and-forget: returns whether the beacon was
+   * queued. NOTE: `sendBeacon` sends a POST; the backend accepts progress on `POST` too so this
+   * path works (a plain `PUT` is used for the throttled in-play writes).
+   */
+  beaconProgress(fileId: number, body: ProgressWrite): boolean {
+    const url = this.abs(`/api/progress/${fileId}`);
+    const nav = typeof navigator !== 'undefined' ? navigator : undefined;
+    if (nav && typeof nav.sendBeacon === 'function') {
+      const blob = new Blob([JSON.stringify(body)], { type: 'application/json' });
+      return nav.sendBeacon(url, blob);
+    }
+    // No Beacon API — best-effort keepalive PUT (ignore the promise/errors).
+    void this.putProgress(fileId, body, { keepalive: true }).catch(() => undefined);
+    return false;
+  }
+
+  /**
+   * `GET /api/continue-watching?limit=` — the "Continue Watching" row (`docs/.tasks/98`):
+   * in-progress titles newest-first, each with a poster and the position to resume from.
+   * Finished / just-started titles are already filtered server-side. Not ETag-cached.
+   */
+  continueWatching(limit?: number, opts: RequestOptions = {}): Promise<ContinueWatchingItem[]> {
+    const qs = limit != null ? `?limit=${limit}` : '';
+    return this.getJson<ContinueWatchingItem[]>(`/api/continue-watching${qs}`, opts, false);
   }
 
   // -- Metadata enrichment (Phase A, `docs/.tasks/60`) ---------------------

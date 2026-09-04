@@ -469,6 +469,48 @@ export interface StreamHints {
 }
 
 // ---------------------------------------------------------------------------
+// Playback progress + Continue Watching (`docs/.tasks/98`)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /api/progress/:file_id` — the saved playback position of one file (`docs/.tasks/98`).
+ * The player reads this on mount to resume. A file never played returns `204` (no body), which
+ * `ApiClient.progress()` surfaces as `null` rather than this shape. `duration_ms` is the runtime
+ * snapshot taken when the position was written (for the `%` calc); `finished` is set past ~95%.
+ */
+export interface Progress {
+  position_ms: number;
+  duration_ms: number;
+  updated_at: number;
+  finished: boolean;
+}
+
+/** `PUT /api/progress/:file_id` body — the throttled position write (`docs/.tasks/98`). */
+export interface ProgressWrite {
+  position_ms: number;
+  duration_ms: number;
+}
+
+/**
+ * One card in `GET /api/continue-watching` (`docs/.tasks/98`) — an in-progress title with the
+ * position to resume from. The whole card links to `/play/:file_id` (which resumes); `title_id`
+ * + `kind` is the detail page it belongs to. `poster` is a ready-to-fetch `/api/images/...` URL,
+ * omitted when the owning movie/series has no art.
+ */
+export interface ContinueWatchingItem {
+  file_id: number;
+  /** `"movie"` | `"episode"`. */
+  kind: 'movie' | 'episode';
+  /** The movie id, or the episode's series id — the detail page the poster belongs to. */
+  title_id: number;
+  title: string;
+  poster?: string;
+  position_ms: number;
+  duration_ms: number;
+  updated_at: number;
+}
+
+// ---------------------------------------------------------------------------
 // Metadata enrichment (Phase A, `docs/.tasks/60`)
 // ---------------------------------------------------------------------------
 

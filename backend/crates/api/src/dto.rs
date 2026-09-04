@@ -172,6 +172,74 @@ pub struct FileTracks {
 }
 
 // ---------------------------------------------------------------------------
+// Playback progress (`docs/.tasks/98`) — resume + "Continue Watching"
+// ---------------------------------------------------------------------------
+
+/// `GET /api/progress/:file_id` — the saved playback position of one file (`docs/.tasks/98`).
+/// The player reads this on mount to resume; a file never played returns `204` (no body), not
+/// this shape.
+#[derive(Debug, Serialize)]
+pub struct ProgressResponse {
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub updated_at: i64,
+    pub finished: bool,
+}
+
+impl From<medi_db::models::Progress> for ProgressResponse {
+    fn from(p: medi_db::models::Progress) -> Self {
+        Self {
+            position_ms: p.position_ms,
+            duration_ms: p.duration_ms,
+            updated_at: p.updated_at,
+            finished: p.finished,
+        }
+    }
+}
+
+/// `PUT /api/progress/:file_id` body (`docs/.tasks/98`) — the throttled write the player sends
+/// as it plays (and once more on pause / tab-hide / unmount). `duration_ms` is snapshotted with
+/// the position so the resume/Continue-Watching `%` needs no second read.
+#[derive(Debug, Deserialize)]
+pub struct ProgressWrite {
+    pub position_ms: i64,
+    pub duration_ms: i64,
+}
+
+/// One card in `GET /api/continue-watching` (`docs/.tasks/98`) — an in-progress title with the
+/// position to resume from. `kind` is `"movie"` | `"episode"`; `title_id` is the movie/series id
+/// the poster links its detail page to, while the whole card links to `/play/:file_id`. `poster`
+/// is a ready-to-fetch `/api/images/...` URL (the owning movie's, or the episode's series'), like
+/// a [`LibraryItem`].
+#[derive(Debug, Serialize)]
+pub struct ContinueWatchingItem {
+    pub file_id: i64,
+    pub kind: String,
+    pub title_id: i64,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poster: Option<String>,
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub updated_at: i64,
+}
+
+impl From<medi_db::models::ContinueItem> for ContinueWatchingItem {
+    fn from(c: medi_db::models::ContinueItem) -> Self {
+        Self {
+            file_id: c.file_id,
+            kind: c.kind,
+            title_id: c.title_id,
+            title: c.title,
+            poster: c.poster_path.map(image_url),
+            position_ms: c.position_ms,
+            duration_ms: c.duration_ms,
+            updated_at: c.updated_at,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Genres & discovery (`docs/.tasks/91` Phase A)
 // ---------------------------------------------------------------------------
 

@@ -1,15 +1,23 @@
 # 98 — Resume Playback & Continue Watching
 
-> **Status: SPEC (not started).** New web-player phase. Depends on `01-db-schema.md`
-> (`media_files`), `02-api-contract.md`, and `97-web-player-shell-and-controls.md` (the player
-> that will read/write progress). Single-user, no auth (LAN appliance) — progress is global,
-> keyed by `media_file_id`, not per-user.
+> **Status: BUILT (session 2026-09-04).** Parts A–D shipped. Backend `cargo test -p medi-db
+> -p medi-api` green (new `upsert_progress` finished-threshold + `list_continue_watching`
+> ordering/exclusion/cascade db tests, and a `catalog.rs` test over all three routes incl. the
+> `POST` sendBeacon path); web + api-client typecheck and web `vite build` green (hls.js still
+> code-split). Single-user, no auth (LAN appliance) — progress is global, keyed by
+> `media_file_id`, not per-user.
 >
-> **Gap this closes.** There is **no playback-progress persistence anywhere**: no table, no
-> route, nothing. The player starts at 0 every time; closing the tab loses your place. The TV
+> **Chosen resume UX:** auto-seek after `loadedmetadata` (seeded via a new `VideoPlayer`
+> `initialResumeMs` prop that reuses the audio-switch resume-seek path) **plus** a small
+> non-blocking `ResumeChip` ("Resuming from mm:ss / Start over") that auto-dismisses after ~8s;
+> ignoring it just keeps the resumed playback. **Web only** — the TV app's demo "Continue
+> Watching" label was left as-is (the optional TV swap is deferred).
+>
+> **Gap this closed.** There was **no playback-progress persistence anywhere**: no table, no
+> route, nothing. The player started at 0 every time; closing the tab lost your place. The TV
 > app's "Continue Watching" row is a **hardcoded label** over a slice of `/api/library`, not
-> real resume data. This task makes the player remember where you left off and surfaces a real
-> Continue-Watching row.
+> real resume data. This task makes the web player remember where you left off and surfaces a
+> real Continue-Watching row on the web landing page.
 
 ## Goal
 

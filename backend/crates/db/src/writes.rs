@@ -1055,6 +1055,45 @@ pub fn clear_probe_failure(conn: &Connection, path: &str) -> DbResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Playback progress (`docs/.tasks/98`) — resume position + "Continue Watching"
+// ---------------------------------------------------------------------------
+
+/// Fraction of a title's runtime past which it counts as "finished" — it drops out of
+/// Continue Watching and offers no resume (`docs/.tasks/98`). Shared with the read side.
+pub const FINISHED_FRACTION: f64 = 0.95;
+
+/// Upsert the playback position of `media_file_id` (Task 98). Keyed on the file's primary
+/// key (one row per file, single-user), so a later write overwrites `position_ms` /
+/// `duration_ms` / `updated_at` in place. `finished` is derived here: set when
+/// `position_ms >= FINISHED_FRACTION * duration_ms` (and `duration_ms > 0`), else cleared — so
+/// a title watched to the end drops from Continue Watching, and rewatching it from the start
+/// (a fresh position below the threshold) clears the flag again.
+///
+/// `now` is unix seconds (the epoch the caller stamps), matching `upsert_probe_failure`.
+pub fn upsert_progress(
+    conn: &Connection,
+    media_file_id: i64,
+    position_ms: i64,
+    duration_ms: i64,
+    now: i64,
+) -> DbResult<()> {
+    let finished = duration_ms > 0
+        && (position_ms as f64) >= FINISHED_FRACTION * (duration_ms as f64);
+    conn.execute(
+        "INSERT INTO playback_progress \
+             (media_file_id, position_ms, duration_ms, updated_at, finished) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(media_file_id) DO UPDATE SET \
+             position_ms = excluded.position_ms, \
+             duration_ms = excluded.duration_ms, \
+             updated_at  = excluded.updated_at, \
+             finished    = excluded.finished",
+        params![media_file_id, position_ms, duration_ms, now, finished as i64],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1650,6 +1689,51 @@ mod tests {
         // A successful re-probe clears it.
         clear_probe_failure(&conn, p).unwrap();
         assert!(crate::queries::list_probe_failures(&conn, None, 10).unwrap().is_empty());
+    }
+
+    // --- Playback progress (`docs/.tasks/98`) --------------------------------
+
+    #[test]
+    fn progress_upsert_overwrites_and_sets_finished_threshold() {
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "Arrival", "arrival", Some(2016), 0).unwrap();
+        let data = MediaFileWrite { container: Some("mkv".into()), ..Default::default() };
+        let file_id = upsert_media_file(&conn, "/media/arrival.mkv", FileOwner::Movie(movie), &data).unwrap();
+
+        // A first write ~10% in: not finished, round-trips its fields.
+        upsert_progress(&conn, file_id, 120_000, 1_200_000, 1000).unwrap();
+        let p = crate::queries::get_progress(&conn, file_id).unwrap().expect("progress exists");
+        assert_eq!(p.position_ms, 120_000);
+        assert_eq!(p.duration_ms, 1_200_000);
+        assert_eq!(p.updated_at, 1000);
+        assert!(!p.finished, "10% in is not finished");
+
+        // A later write overwrites in place (one row) and bumps updated_at.
+        upsert_progress(&conn, file_id, 300_000, 1_200_000, 2000).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM playback_progress WHERE media_file_id = ?1", params![file_id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "upsert overwrites, never duplicates");
+        let p2 = crate::queries::get_progress(&conn, file_id).unwrap().unwrap();
+        assert_eq!(p2.position_ms, 300_000);
+        assert_eq!(p2.updated_at, 2000);
+
+        // Past ~95% → finished is set.
+        upsert_progress(&conn, file_id, 1_150_000, 1_200_000, 3000).unwrap();
+        assert!(crate::queries::get_progress(&conn, file_id).unwrap().unwrap().finished, "past 95% is finished");
+
+        // Rewatching from the start clears the flag again.
+        upsert_progress(&conn, file_id, 5_000, 1_200_000, 4000).unwrap();
+        assert!(!crate::queries::get_progress(&conn, file_id).unwrap().unwrap().finished, "restart clears finished");
+
+        // A zero/unknown duration never marks finished (avoids a divide/false-positive).
+        upsert_progress(&conn, file_id, 999_999, 0, 5000).unwrap();
+        assert!(!crate::queries::get_progress(&conn, file_id).unwrap().unwrap().finished);
+
+        // No row for a never-played file.
+        let other = upsert_media_file(&conn, "/media/other.mkv", FileOwner::Movie(movie), &data).unwrap();
+        assert!(crate::queries::get_progress(&conn, other).unwrap().is_none());
     }
 
     #[test]

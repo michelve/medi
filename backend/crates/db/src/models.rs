@@ -497,6 +497,75 @@ impl Credit {
     }
 }
 
+/// A row of `playback_progress` (Task 98) — where playback of one file was left off.
+///
+/// Single-user, so keyed by `media_file_id` (one row per file). `duration_ms` is a snapshot
+/// taken at write time so the resume/Continue-Watching `%` can be computed without a second
+/// read of `media_files`. `finished` is set once playback passes ~95% (drops the title from
+/// Continue Watching). `updated_at` is unix seconds, like the other epoch columns.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Progress {
+    pub media_file_id: i64,
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub updated_at: i64,
+    pub finished: bool,
+}
+
+impl Progress {
+    /// Column order: media_file_id, position_ms, duration_ms, updated_at, finished.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            media_file_id: row.get(0)?,
+            position_ms: row.get(1)?,
+            duration_ms: row.get(2)?,
+            updated_at: row.get(3)?,
+            // stored as 0/1
+            finished: row.get::<_, i64>(4)? != 0,
+        })
+    }
+}
+
+/// One row of the "Continue Watching" list (Task 98) — an in-progress title's playback
+/// position joined to the owning movie/episode so a card can render a poster + title and link
+/// straight to `/play/:file_id`. `kind` is `"movie"` | `"episode"`; `poster_path` is relative
+/// to `images_dir()` (the owning movie's, or the episode's series' poster), mapped by the API
+/// layer to a `/api/images/...` URL like a [`LibraryCard`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContinueItem {
+    pub file_id: i64,
+    /// `"movie"` | `"episode"`.
+    pub kind: String,
+    /// The movie id, or the episode's series id — what a poster tile links its detail page to.
+    pub title_id: i64,
+    pub title: String,
+    pub poster_path: Option<String>,
+    pub position_ms: i64,
+    pub duration_ms: i64,
+    pub updated_at: i64,
+}
+
+impl ContinueItem {
+    /// Column order: file_id, kind_tag (0=movie,1=episode), title_id, title, poster_path,
+    /// position_ms, duration_ms, updated_at.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        let kind = match row.get::<_, i64>(1)? {
+            1 => "episode",
+            _ => "movie",
+        };
+        Ok(Self {
+            file_id: row.get(0)?,
+            kind: kind.to_string(),
+            title_id: row.get(2)?,
+            title: row.get(3)?,
+            poster_path: row.get(4)?,
+            position_ms: row.get(5)?,
+            duration_ms: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    }
+}
+
 /// A row of `preview_clips`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreviewClip {

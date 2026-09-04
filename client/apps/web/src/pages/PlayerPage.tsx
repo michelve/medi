@@ -22,6 +22,8 @@ import { usePlayerControls } from '@medi/player/usePlayerControls';
 import type { TrickplayMeta } from '@medi/player/trickplay';
 import { ApiError, type FileAudioTrack, type StreamDecision, type SubtitleStream } from '@medi/api-client';
 import { useApi } from '../api';
+import { ResumeChip } from '../components/ResumeChip';
+import { usePlaybackProgress } from '../lib/usePlaybackProgress';
 import { VideoPlayer, type WebTextTrack } from '../components/VideoPlayer';
 import { PlayerEventLog } from '../components/PlayerEventLog';
 import type { PlayerDiagnostics } from '../lib/playerDiagnostics';
@@ -124,6 +126,11 @@ export function PlayerPage() {
     onPause: () => videoElRef.current?.pause(),
   });
   const { handleRemote, reportProgress, reportDuration, setPlaying, showOverlay } = controls;
+
+  // Resume + throttled progress persistence (`docs/.tasks/98`): reads the saved position on
+  // mount (→ `resumeMs` seeds the player's initial seek), shows a non-blocking chip, and
+  // persists the position as it plays + on pause / tab-hide / unmount.
+  const progress = usePlaybackProgress(api, id, videoEl);
 
   // Best-effort trickplay geometry → map the api-client wire shape to the player's.
   useEffect(() => {
@@ -251,6 +258,7 @@ export function PlayerPage() {
           // anyway). Unknown base (fetch still racing) → force, the safe default.
           forceTranscodeForAudio={baseMode !== 'hls'}
           onSwitchingAudio={setSwitchingAudio}
+          initialResumeMs={progress.resumeMs}
           onDecision={(d) => {
             // Remember the *base* (default-track) decision mode so a non-default audio pick on
             // a direct file forces a transcode. Ignore decisions made while a switch is active.
@@ -324,6 +332,17 @@ export function PlayerPage() {
         >
           Switching audio…
         </div>
+      )}
+
+      {/* Resume chip (`docs/.tasks/98`): a non-blocking "Resuming from mm:ss / Start over" that
+          auto-dismisses. Playback already resumes via `initialResumeMs`; the chip just offers
+          the start-over escape hatch. */}
+      {progress.showChip && (
+        <ResumeChip
+          label={progress.resumeLabel}
+          onStartOver={progress.startOver}
+          onDismiss={progress.dismissChip}
+        />
       )}
 
       {/* Controls overlay: its buttons/scrub bar must not bubble a click up to the video-area
