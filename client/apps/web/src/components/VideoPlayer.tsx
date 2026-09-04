@@ -469,6 +469,22 @@ function VideoPlayerInner({
             errorRetry: { maxNumRetry: 20, retryDelayMs: 1000, maxRetryDelayMs: 2000 },
           },
         },
+        // The init segment (`init.mp4`) and the FIRST media segment load under this policy, and
+        // that first fetch is what BLOCKS on the server while ffmpeg transcodes the opening
+        // segment on the fly. A cold 4K HDR/DV→SDR start can take well over hls.js's DEFAULT 10s
+        // fragment timeout — the server itself waits up to 15s (`ensure_segment`) for the segment
+        // to appear. Without widening this, the first fragment aborts at 10s with
+        // `fragLoadTimeOut` (reported as httpStatus:undefined — a client-side timeout, NOT a
+        // server error) and the player loops forever even though the transcode is producing
+        // output. Match the manifest/playlist budget so the first segment is polled, not dropped.
+        fragLoadPolicy: {
+          default: {
+            maxTimeToFirstByteMs: 20_000,
+            maxLoadTimeMs: 30_000,
+            timeoutRetry: { maxNumRetry: 6, retryDelayMs: 1000, maxRetryDelayMs: 3000 },
+            errorRetry: { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 3000 },
+          },
+        },
       });
       instance = hls;
       attachHlsDiagnostics(hls, Hls, diag);
