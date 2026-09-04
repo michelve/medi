@@ -33,7 +33,11 @@ export function MovieDetailPage() {
   const { id } = useParams<{ id: string }>();
   const api = useApi();
   const navigate = useNavigate();
-  const movieId = Number(id);
+  // The URL param: a TMDB id for a matched movie (`/movie/98641`) or the internal id for an
+  // unmatched one. It's fine to fetch `api.movie(param)` with either — the backend resolves
+  // tmdb→internal. The metadata match flow, however, must use the *internal* id (from the
+  // loaded detail's `movie.id`), since `/api/movies/:id/match*` are keyed by the internal id.
+  const movieParam = Number(id);
 
   // Bump to force a re-fetch after a metadata match/refresh.
   const [nonce, setNonce] = useState(0);
@@ -45,11 +49,11 @@ export function MovieDetailPage() {
   const trailersRef = useRef<HTMLDivElement>(null);
 
   const state = useDetail<MovieDetail>(
-    (signal) => api.movie(movieId, { signal }),
-    [movieId, nonce],
+    (signal) => api.movie(movieParam, { signal }),
+    [movieParam, nonce],
   );
 
-  if (!Number.isFinite(movieId)) return <NotFound message="That isn't a valid movie id." />;
+  if (!Number.isFinite(movieParam)) return <NotFound message="That isn't a valid movie id." />;
   if (state.status === 'loading') return <Loading label="Loading movie…" />;
   if (state.status === 'not_found') return <NotFound message="We couldn't find that movie." />;
   if (state.status === 'error') return <ErrorState message={state.message} />;
@@ -209,7 +213,7 @@ export function MovieDetailPage() {
 
       {matchOpen && (
         <MatchDialog
-          movieId={movieId}
+          movieId={movie.id}
           initialQuery={movie.title}
           onClose={() => setMatchOpen(false)}
           onMatched={() => setNonce((n) => n + 1)}

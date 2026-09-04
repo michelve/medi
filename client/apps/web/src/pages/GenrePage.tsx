@@ -1,16 +1,16 @@
 /**
- * `GenrePage` (Task 91) — `/genre/:id`.
+ * `GenrePage` (Task 91) — `/genre/:slug`.
  *
- * One genre's keyset grid: `useLibraryPaging` pointed at `GET /api/genres/:id` (same
+ * One genre's keyset grid: `useLibraryPaging` pointed at `GET /api/genres/:slug` (same
  * `LibraryPage` shape as the main library, so the hook is reused verbatim) feeding the
- * existing `PosterGrid` with infinite scroll. The header shows the genre's name, resolved
- * from the cached `GET /api/genres` list (no dedicated name endpoint). An unknown/invalid
- * id renders the shared `NotFound`.
+ * existing `PosterGrid` with infinite scroll. `:slug` is the genre-name slug (`adventure`);
+ * the header name is resolved from the cached `GET /api/genres` list by slugging each genre's
+ * name (no dedicated name endpoint). An unknown slug renders the shared `NotFound`.
  */
 
 import { useMemo } from 'react';
 import { useParams } from 'react-router-dom';
-import type { GenreCount } from '@medi/api-client';
+import { genreSlug, type GenreCount } from '@medi/api-client';
 import { useApi } from '../api';
 import { useDetail } from '../lib/useDetail';
 import { useLibraryPaging } from '../lib/useLibraryPaging';
@@ -19,22 +19,25 @@ import { Loading, ErrorState, EmptyState, NotFound } from '../components/Status'
 import { theme } from '../theme';
 
 export function GenrePage() {
-  const { id } = useParams<{ id: string }>();
+  const { slug = '' } = useParams<{ slug: string }>();
   const api = useApi();
-  const genreId = Number(id);
 
   // The genre name comes from the (cached) genres list — there's no per-genre name route.
-  const genresState = useDetail<GenreCount[]>((signal) => api.genres({ signal }), [genreId]);
+  // Match by slugging each genre's name so the URL slug (`science-fiction`) maps to its genre.
+  const genresState = useDetail<GenreCount[]>((signal) => api.genres({ signal }), [slug]);
   const genre = useMemo(
-    () => (genresState.status === 'ready' ? genresState.data.find((g) => g.id === genreId) : undefined),
-    [genresState, genreId],
+    () =>
+      genresState.status === 'ready'
+        ? genresState.data.find((g) => genreSlug(g.name) === slug.toLowerCase())
+        : undefined,
+    [genresState, slug],
   );
 
   // Default sort for a genre view is alphabetical (matches the library default).
-  const paging = useLibraryPaging('sort_title', { kind: 'genre', id: genreId });
+  const paging = useLibraryPaging('sort_title', { kind: 'genre', slug });
 
-  if (!Number.isFinite(genreId)) return <NotFound message="That isn't a valid genre." />;
-  // A genre with no titles isn't listed by /api/genres, so an id absent from a loaded list
+  if (!slug) return <NotFound message="That isn't a valid genre." />;
+  // A genre with no titles isn't listed by /api/genres, so a slug absent from a loaded list
   // is a real 404 (the grid would be empty anyway).
   if (genresState.status === 'ready' && !genre) {
     return <NotFound message="We couldn't find that genre." />;

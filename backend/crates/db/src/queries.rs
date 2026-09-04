@@ -208,7 +208,7 @@ pub fn collection_movies(conn: &Connection, collection_id: i64, exclude_movie_id
     // Reuse the movies side of the library card select, filtered to the collection.
     let select = library_select(0, "movies", "mf.movie_id = t.id");
     let sql = format!(
-        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr \
+        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr, tmdb_id \
          FROM ( {select} WHERE t.collection_id = ?1 AND t.id != ?2 ) \
          ORDER BY added_at DESC, id DESC"
     );
@@ -267,7 +267,8 @@ fn library_select(kind_tag: i64, table: &str, join_col: &str) -> String {
                 ( SELECT CASE MAX( {rank} ) \
                     WHEN 4 THEN 'dolbyvision' WHEN 3 THEN 'hdr10plus' \
                     WHEN 2 THEN 'hdr10' WHEN 1 THEN 'hlg' ELSE NULL END \
-                  FROM media_files mf WHERE {join_col} ) AS hdr \
+                  FROM media_files mf WHERE {join_col} ) AS hdr, \
+                t.tmdb_id AS tmdb_id \
          FROM {table} t"
     )
 }
@@ -317,7 +318,7 @@ pub fn list_library(
     };
 
     let sql = format!(
-        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr \
+        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr, tmdb_id \
          FROM ( {union} ) \
          WHERE {predicate} \
          ORDER BY {order} \
@@ -371,6 +372,76 @@ pub fn genre_name(conn: &Connection, genre_id: i64) -> DbResult<String> {
         .ok_or(DbError::NotFound)
 }
 
+/// URL-safe slug for a genre name, e.g. `"Science Fiction"` → `"science-fiction"`,
+/// `"Action & Adventure"` → `"action-adventure"`. Lowercase ASCII; every run of
+/// non-alphanumeric characters (spaces, `&`, punctuation) collapses to a single `-`, and
+/// leading/trailing dashes are trimmed. Genres carry no stored slug column — the slug is
+/// derived from the name on both ends (this fn server-side, the identical `genreSlug` on the
+/// client) so a name change can't leave a stale slug behind. Pretty URLs, task: URL names.
+pub fn genre_slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    // Trim a trailing dash left by punctuation at the end of the name.
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+/// Resolve a genre URL slug (`adventure`, `science-fiction`) to its `(id, name)`, or
+/// [`DbError::NotFound`] when no genre's name slugifies to it. A purely-numeric slug is also
+/// accepted as the genre id directly, so old `/genre/12` links keep resolving. On the rare
+/// chance two names collide to the same slug, the count-ordered first match wins (TMDB's genre
+/// set has no such collision).
+pub fn genre_by_slug(conn: &Connection, slug: &str) -> DbResult<(i64, String)> {
+    // Numeric slug → treat as the genre id (back-compat with the old numeric URLs).
+    if let Ok(id) = slug.parse::<i64>() {
+        if let Some(name) = conn
+            .prepare_cached("SELECT name FROM genres WHERE id = ?1")?
+            .query_row(params![id], |r| r.get::<_, String>(0))
+            .optional()?
+        {
+            return Ok((id, name));
+        }
+    }
+    let want = slug.to_ascii_lowercase();
+    let mut stmt = conn.prepare_cached("SELECT id, name FROM genres ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .find(|(_, name)| genre_slug(name) == want)
+        .ok_or(DbError::NotFound)
+}
+
+/// Map a provider `tmdb_id` to the internal `movies.id`, or `None` when no movie carries it
+/// (an unmatched movie has no `tmdb_id`). Backs the `/movie/:tmdbId` pretty-URL resolution:
+/// the api layer tries this first, then falls back to treating the path param as an internal id.
+pub fn movie_id_by_tmdb(conn: &Connection, tmdb_id: i64) -> DbResult<Option<i64>> {
+    conn.prepare_cached("SELECT id FROM movies WHERE tmdb_id = ?1")?
+        .query_row(params![tmdb_id], |r| r.get::<_, i64>(0))
+        .optional()
+        .map_err(Into::into)
+}
+
+/// Map a provider `tmdb_id` to the internal `series.id`, or `None`. Sibling of
+/// [`movie_id_by_tmdb`] for `/series/:tmdbId`.
+pub fn series_id_by_tmdb(conn: &Connection, tmdb_id: i64) -> DbResult<Option<i64>> {
+    conn.prepare_cached("SELECT id FROM series WHERE tmdb_id = ?1")?
+        .query_row(params![tmdb_id], |r| r.get::<_, i64>(0))
+        .optional()
+        .map_err(Into::into)
+}
+
 /// List the titles carrying one genre, ordered per `sort`, resuming after `cursor`
 /// (`docs/.tasks/91`). **Identical page shape to [`list_library`]** — same `LibraryCard`,
 /// same [`LibraryCursor`] codec — so the API reuses `LibraryPage`/`LibraryItem` and the
@@ -400,7 +471,7 @@ pub fn list_by_genre(
     // `?1` is the genre id (used by both sides of the union's EXISTS filter); the cursor
     // params shift to `?2..?4` and the limit to `?5`.
     let sql = format!(
-        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr \
+        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr, tmdb_id \
          FROM ( {union} ) \
          WHERE {predicate} \
          ORDER BY {order} \
@@ -1230,7 +1301,7 @@ pub fn person_filmography(conn: &Connection, person_id: i64) -> DbResult<Vec<Lib
         )
     );
     let sql = format!(
-        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr \
+        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr, tmdb_id \
          FROM ( {movies} UNION ALL {series} ) \
          ORDER BY added_at DESC, kind_tag DESC, id DESC"
     );
@@ -1370,4 +1441,27 @@ pub fn credits_for_series(conn: &Connection, series_id: i64) -> DbResult<Vec<Cre
         .query_map(params![series_id], Credit::from_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::genre_slug;
+
+    #[test]
+    fn genre_slug_matches_tmdb_names() {
+        // The real TMDB genre set (`SELECT name FROM genres`) → the URL slugs the client links.
+        assert_eq!(genre_slug("Adventure"), "adventure");
+        assert_eq!(genre_slug("Science Fiction"), "science-fiction");
+        assert_eq!(genre_slug("Action & Adventure"), "action-adventure");
+        assert_eq!(genre_slug("Sci-Fi & Fantasy"), "sci-fi-fantasy");
+        assert_eq!(genre_slug("TV Movie"), "tv-movie");
+    }
+
+    #[test]
+    fn genre_slug_trims_and_collapses() {
+        // Leading/trailing punctuation and runs of separators collapse to single dashes.
+        assert_eq!(genre_slug("  Drama  "), "drama");
+        assert_eq!(genre_slug("A -- B"), "a-b");
+        assert_eq!(genre_slug("!!!"), "");
+    }
 }

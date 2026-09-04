@@ -67,7 +67,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/series/:id", get(series_detail))
         // Genres & discovery (`docs/.tasks/91` Phase A) — cached + ETag'd.
         .route("/api/genres", get(genres_list))
-        .route("/api/genres/:id", get(genre_titles))
+        .route("/api/genres/:slug", get(genre_titles))
         // Person pages (`docs/.tasks/91` Phase B) — cached + ETag'd.
         .route("/api/people/:id", get(person_page))
         // Kick a one-shot genre/person backfill over already-matched titles. Reuses the
@@ -298,13 +298,16 @@ async fn genres_list(State(state): State<AppState>, headers: HeaderMap) -> ApiRe
         .await
 }
 
-/// `GET /api/genres/:id?cursor=&limit=&sort=` — keyset-paginated grid of the titles in one
-/// genre. **Identical page shape to `/api/library`** (same `LibraryPage`/`LibraryItem` +
-/// cursor codec) so the client reuses its paging hook verbatim. Cached + ETag'd.
+/// `GET /api/genres/:slug?cursor=&limit=&sort=` — keyset-paginated grid of the titles in one
+/// genre. `:slug` is the genre-name slug (`adventure`, `science-fiction`); a purely-numeric
+/// slug is still accepted as the genre id so old `/genre/12` links keep working
+/// (`queries::genre_by_slug`). **Identical page shape to `/api/library`** (same
+/// `LibraryPage`/`LibraryItem` + cursor codec) so the client reuses its paging hook verbatim.
+/// Cached + ETag'd.
 async fn genre_titles(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(genre_id): Path<i64>,
+    Path(slug): Path<String>,
     Query(q): Query<LibraryQuery>,
 ) -> ApiResult<Response> {
     let sort = parse_sort(q.sort.as_deref())?;
@@ -314,8 +317,16 @@ async fn genre_titles(
         _ => None,
     };
 
+    // Resolve the name slug → genre id once; a slug that matches no genre is a 404.
+    let db_resolve = state.db.clone();
+    let slug_for_key = slug.clone();
+    let (genre_id, _genre_name) =
+        run_blocking(&db_resolve, move |conn| queries::genre_by_slug(conn, &slug))
+            .await
+            .map_err(|_| ApiError::not_found("no such genre"))?;
+
     let cache_key = format!(
-        "genre/{genre_id}?sort={}&limit={}&cursor={}",
+        "genre/{slug_for_key}?sort={}&limit={}&cursor={}",
         sort_label(sort),
         limit,
         q.cursor.as_deref().unwrap_or("")
@@ -507,11 +518,23 @@ pub fn spawn_backfill(
 // ---------------------------------------------------------------------------
 
 /// Movie detail: movie + media_files + credits. Cached with ETag.
+///
+/// `:id` is the TMDB movie id for a matched title (the pretty URL, e.g. `/movie/98641`); an
+/// unmatched movie has no `tmdb_id`, so the param falls back to the internal `movies.id`. The
+/// resolution runs first (mapping tmdb → internal), then the detail load + cache key key off
+/// the internal id, so both URL forms share one cache entry.
 async fn movie_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    Path(param): Path<i64>,
 ) -> ApiResult<Response> {
+    // Prefer a TMDB-id match; fall back to treating the param as the internal id.
+    let db_resolve = state.db.clone();
+    let id = run_blocking(&db_resolve, move |conn| {
+        Ok::<i64, medi_db::DbError>(queries::movie_id_by_tmdb(conn, param)?.unwrap_or(param))
+    })
+    .await?;
+
     let key = format!("movie/{id}");
     let db = state.db.clone();
     state
@@ -541,11 +564,20 @@ async fn movie_detail(
 }
 
 /// Series detail: series + seasons + episodes + credits. Cached with ETag.
+///
+/// `:id` is the TMDB series id for a matched title, falling back to the internal `series.id`
+/// for an unmatched one — same tmdb-first resolution as [`movie_detail`].
 async fn series_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    Path(param): Path<i64>,
 ) -> ApiResult<Response> {
+    let db_resolve = state.db.clone();
+    let id = run_blocking(&db_resolve, move |conn| {
+        Ok::<i64, medi_db::DbError>(queries::series_id_by_tmdb(conn, param)?.unwrap_or(param))
+    })
+    .await?;
+
     let key = format!("series/{id}");
     let db = state.db.clone();
     state

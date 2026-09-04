@@ -8,7 +8,7 @@
  */
 
 import { Link } from 'react-router-dom';
-import type { CategoryRow as CategoryRowData } from '@medi/api-client';
+import { genrePath, type CategoryRow as CategoryRowData } from '@medi/api-client';
 import { useApi } from '../api';
 import { theme, detail } from '../theme';
 import { PosterCard } from './PosterCard';
@@ -28,8 +28,9 @@ export function CategoryRow({ row, captionless = false }: CategoryRowProps) {
   const api = useApi();
   if (row.items.length === 0) return null;
 
-  // Only genre rows have a "See all →" destination; "Recently Added" has none.
-  const seeAll = row.genre_id != null ? `/genre/${row.genre_id}` : undefined;
+  // Only genre rows have a "See all →" destination; "Recently Added" has none. A genre row's
+  // `title` is the genre name, so the pretty `/genre/:slug` URL is derived from it.
+  const seeAll = row.genre_id != null ? genrePath(row.title) : undefined;
 
   // The detail-page rows (captionless) follow the Figma comp — 216px tiles, 32px apart,
   // under a 24px-gap 24px heading. The landing-page rows keep their original, denser tiles.

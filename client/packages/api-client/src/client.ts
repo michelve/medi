@@ -117,11 +117,13 @@ export class ApiClient {
   }
 
   /**
-   * `GET /api/genres/:id` — one genre's keyset-paginated grid. **Same page shape as
-   * `library()`** (`LibraryPage`), so a paging hook can point at either endpoint.
+   * `GET /api/genres/:slug` — one genre's keyset-paginated grid. `slug` is the genre-name
+   * slug (`adventure`, `science-fiction`); a numeric slug also resolves as the genre id
+   * server-side (back-compat). **Same page shape as `library()`** (`LibraryPage`), so a paging
+   * hook can point at either endpoint.
    */
   genreTitles(
-    genreId: number,
+    slug: string,
     query: LibraryQuery = {},
     opts: RequestOptions = {},
   ): Promise<LibraryPage> {
@@ -130,7 +132,10 @@ export class ApiClient {
     if (query.limit != null) params.set('limit', String(query.limit));
     if (query.sort) params.set('sort', query.sort);
     const qs = params.toString();
-    return this.getJson<LibraryPage>(`/api/genres/${genreId}${qs ? `?${qs}` : ''}`, opts);
+    return this.getJson<LibraryPage>(
+      `/api/genres/${encodeURIComponent(slug)}${qs ? `?${qs}` : ''}`,
+      opts,
+    );
   }
 
   /** `GET /api/movies/:id` — full movie detail. */

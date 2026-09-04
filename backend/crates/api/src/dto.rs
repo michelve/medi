@@ -34,6 +34,10 @@ pub struct LibraryItem {
     /// omitted for SDR / unprobed titles.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hdr: Option<String>,
+    /// Provider TMDB id, when the title is matched. The client links the tile to the pretty
+    /// `/movie/:tmdbId` (or `/series/:tmdbId`) URL, falling back to `id` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tmdb_id: Option<i64>,
 }
 
 impl LibraryItem {
@@ -51,6 +55,7 @@ impl LibraryItem {
             year: card.year,
             poster: card.poster_path.map(image_url),
             hdr: card.hdr,
+            tmdb_id: card.tmdb_id,
         }
     }
 }

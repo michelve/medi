@@ -849,6 +849,93 @@ async fn genre_titles_returns_library_page_shape() {
 }
 
 #[tokio::test]
+async fn genre_titles_resolves_name_slug() {
+    // Pretty URL: `/api/genres/science-fiction` resolves the same genre as the numeric id 878.
+    let (app, _dir) = genre_app();
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get("/api/genres/science-fiction?limit=50")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["items"].as_array().unwrap().len(), 3, "same 3 Sci-Fi titles as /878");
+
+    // Case-insensitive; a slug matching no genre is a 404.
+    let ok = app
+        .clone()
+        .oneshot(Request::get("/api/genres/Science-Fiction").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    let missing = app
+        .oneshot(Request::get("/api/genres/no-such-genre").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn library_item_carries_tmdb_id_and_movie_resolves_by_it() {
+    // A poster tile exposes `tmdb_id` (matched titles), and `/api/movies/:tmdbId` loads the
+    // same movie as `/api/movies/:internalId` — the pretty-URL resolution (tmdb → internal).
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO movies (id, tmdb_id, title, sort_title, year, added_at, metadata_state) \
+                VALUES (7, 98641, 'Matched Movie', 'matched movie', 2020, 100, 'matched'), \
+                       (8, NULL, 'Unmatched Movie', 'unmatched movie', 2021, 200, 'pending');",
+        )
+        .unwrap();
+    }
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 2, caps.clone());
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    let app = router(state);
+
+    // The library tile carries tmdb_id for the matched movie, and omits it for the unmatched.
+    let resp = app
+        .clone()
+        .oneshot(Request::get("/api/library?limit=50").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let items = json["items"].as_array().unwrap();
+    let matched = items.iter().find(|i| i["id"] == 7).expect("matched movie tile");
+    assert_eq!(matched["tmdb_id"], 98641);
+    let unmatched = items.iter().find(|i| i["id"] == 8).expect("unmatched movie tile");
+    assert!(unmatched.get("tmdb_id").is_none(), "unmatched tile omits tmdb_id");
+
+    // Detail resolves by the TMDB id (pretty URL)…
+    let by_tmdb = app
+        .clone()
+        .oneshot(Request::get("/api/movies/98641").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(by_tmdb.status(), StatusCode::OK);
+    let d = body_json(by_tmdb).await;
+    assert_eq!(d["id"], 7, "tmdb 98641 → internal movie 7");
+    assert_eq!(d["title"], "Matched Movie");
+
+    // …and still resolves by the internal id (back-compat / unmatched fallback).
+    let by_internal = app
+        .oneshot(Request::get("/api/movies/8").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(by_internal.status(), StatusCode::OK);
+    let d2 = body_json(by_internal).await;
+    assert_eq!(d2["title"], "Unmatched Movie");
+}
+
+#[tokio::test]
 async fn genre_titles_paginates_with_shared_cursor_codec() {
     let (app, _dir) = genre_app();
     // Page size 2 over Sci-Fi's 3 titles → first page carries a cursor.

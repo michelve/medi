@@ -39,6 +39,12 @@ export interface LibraryItem {
   poster?: string;
   /** Highest HDR tier across the title's files; omitted for SDR / unprobed. */
   hdr?: HdrTier;
+  /**
+   * Provider TMDB id, present once the title is matched. The tile links to the pretty
+   * `/movie/:tmdbId` (or `/series/:tmdbId`) URL via {@link titlePath}, falling back to the
+   * internal `id` for an unmatched title (which has no `tmdb_id`).
+   */
+  tmdb_id?: number;
 }
 
 /** One page of the unified catalog (`GET /api/library`). */

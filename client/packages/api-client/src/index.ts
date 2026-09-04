@@ -4,6 +4,7 @@
  */
 
 export * from './types';
+export { genreSlug, genrePath, titlePath } from './urls';
 export { ApiClient } from './client';
 export type {
   ApiClientOptions,

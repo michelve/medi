@@ -40,8 +40,9 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
 | Method & Path | Purpose | Notes |
 |---|---|---|
 | `GET /api/library?cursor=&limit=&sort=` | Paginated unified catalog (movies + series cards) | Keyset cursor; `sort=sort_title\|added_at`. Cached. |
-| `GET /api/movies/:id` | Movie detail + media_files + credits | Cached; ETag. |
-| `GET /api/series/:id` | Series detail + seasons + episodes + credits | Cached; ETag. |
+| `GET /api/movies/:id` | Movie detail + media_files + credits | `:id` is the TMDB id for a matched movie (the pretty `/movie/98641` URL), resolved to the internal id server-side; an unmatched movie has no `tmdb_id` so `:id` falls back to the internal `movies.id`. Cached; ETag. |
+| `GET /api/series/:id` | Series detail + seasons + episodes + credits | `:id` is the TMDB id (matched) or the internal `series.id` (fallback), same resolution as `/api/movies/:id`. Cached; ETag. |
+| `GET /api/genres/:slug?cursor=&limit=&sort=` | Titles in one genre (same `LibraryPage` shape as `/api/library`) | `:slug` is the genre-name slug (`adventure`, `science-fiction`); a numeric slug resolves as the genre id (back-compat with `/genre/12`). `404` for an unknown slug. Keyset cursor; cached; ETag. (`91-genres-and-people-discovery.md`) |
 | `GET /api/files/:file_id` | A file's audio + subtitle tracks + chapters | `{ file_id, audio: [{ stream_index, codec?, channels?, channel_layout?, language?, title?, is_default }], subtitles: [{ id, stream_index?, external, codec?, format, language?, title?, is_default, is_forced }], chapters: [{ ordinal, start_ms, end_ms?, title? }], video_fps? }`. Lets a deep link to `/play/:id` (no router state) populate the player's audio/caption menus and scrub-bar chapter ticks; `video_fps` feeds the player's libass `targetFps` (`97-web-player-shell-and-controls.md` Part C; chapters + subtitle `codec` + `video_fps` added by `99-subtitles-and-chapters.md`). |
 | `GET /api/progress/:file_id` | Saved playback position of a file | `{ position_ms, duration_ms, updated_at, finished }`, or `204` when never played. Not cached (live). (`98-resume-playback.md`) |
 | `PUT`/`POST` `/api/progress/:file_id` | Persist the playback position | Body `{ position_ms, duration_ms }` → `204`. `PUT` is the throttled in-play write; `POST` backs the `navigator.sendBeacon` unload/hide flush. Upserts one row per file (single-user); sets `finished` past ~95%. (`98`) |
@@ -77,9 +78,9 @@ appliance). Responses are cached in a moka LRU and carry `ETag` for client-side 
 {
   "items": [
     { "kind": "movie",  "id": 12, "title": "Blade Runner 2049", "year": 2017,
-      "poster": "/api/images/movies/12/poster.jpg", "hdr": "dolbyvision" },
+      "poster": "/api/images/movies/12/poster.jpg", "hdr": "dolbyvision", "tmdb_id": 335984 },
     { "kind": "series", "id": 3,  "title": "Severance", "year": 2022,
-      "poster": "/api/images/series/3/poster.jpg", "hdr": "hdr10" }
+      "poster": "/api/images/series/3/poster.jpg", "hdr": "hdr10", "tmdb_id": 95396 }
   ],
   "next_cursor": "eyJzb3J0X3RpdGxlIjoiQ..."   // null when exhausted
 }

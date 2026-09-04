@@ -8,7 +8,7 @@
  * fetches are abortable and cancelled on unmount / re-run.
  *
  * `source` (Task 91) selects the paged endpoint: the default `{ kind: 'library' }` pages
- * `GET /api/library`; `{ kind: 'genre', id }` pages `GET /api/genres/:id`, whose response
+ * `GET /api/library`; `{ kind: 'genre', slug }` pages `GET /api/genres/:slug`, whose response
  * has the identical `LibraryPage` shape — so a `GenrePage` reuses this hook verbatim.
  *
  * Kept as a hook (not inline in the page) so the paging contract is isolated and the page
@@ -29,7 +29,7 @@ const PAGE_SIZE = 60;
 /** Which paged `LibraryPage` endpoint the hook draws from (`docs/.tasks/91`). */
 export type LibraryPagingSource =
   | { kind: 'library' }
-  | { kind: 'genre'; id: number };
+  | { kind: 'genre'; slug: string };
 
 export interface LibraryPagingState {
   items: LibraryItem[];
@@ -51,7 +51,7 @@ export function useLibraryPaging(
   const api = useApi();
   // A stable identity for the source so the fetch callback (and its restart effect) only
   // re-run when the endpoint actually changes, not on every render's fresh object literal.
-  const sourceKey = source.kind === 'genre' ? `genre:${source.id}` : 'library';
+  const sourceKey = source.kind === 'genre' ? `genre:${source.slug}` : 'library';
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
@@ -84,7 +84,7 @@ export function useLibraryPaging(
         const reqOpts = { signal: controller?.signal };
         const page: LibraryPage =
           source.kind === 'genre'
-            ? await api.genreTitles(source.id, query, reqOpts)
+            ? await api.genreTitles(source.slug, query, reqOpts)
             : await api.library(query, reqOpts);
         // Superseded by a newer generation while awaiting — drop the result.
         if (controller?.signal.aborted) return;

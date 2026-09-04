@@ -9,7 +9,7 @@
  */
 
 import { Link } from 'react-router-dom';
-import type { LibraryItem } from '@medi/api-client';
+import { titlePath, type LibraryItem } from '@medi/api-client';
 import { theme } from '../theme';
 import { HdrBadge } from './HdrBadge';
 
@@ -26,7 +26,9 @@ export interface PosterCardProps {
 }
 
 export function PosterCard({ item, posterUrl, showCaption = true }: PosterCardProps) {
-  const to = `/${item.kind}/${item.id}`;
+  // Pretty URL: /movie/:tmdbId (or /series/:tmdbId), falling back to the internal id for an
+  // unmatched title. The backend resolves either form.
+  const to = titlePath(item);
 
   return (
     <Link to={to} style={{ textDecoration: 'none', color: 'inherit', display: 'block' }}>

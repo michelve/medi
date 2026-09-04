@@ -775,11 +775,14 @@ pub struct LibraryCard {
     pub added_at: i64,
     pub poster_path: Option<String>,
     pub hdr: Option<String>,
+    /// Provider `tmdb_id` (movies/series), `None` for an unmatched title. Lets a poster tile
+    /// link to the pretty `/movie/:tmdbId` / `/series/:tmdbId` URL (falling back to `id`).
+    pub tmdb_id: Option<i64>,
 }
 
 impl LibraryCard {
     /// Column order: kind_tag (0=movie,1=series), id, title, sort_title, year,
-    /// added_at, poster_path, hdr.
+    /// added_at, poster_path, hdr, tmdb_id.
     pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
         let kind = match row.get::<_, i64>(0)? {
             1 => LibraryKind::Series,
@@ -794,6 +797,7 @@ impl LibraryCard {
             added_at: row.get(5)?,
             poster_path: row.get(6)?,
             hdr: row.get(7)?,
+            tmdb_id: row.get(8)?,
         })
     }
 }
