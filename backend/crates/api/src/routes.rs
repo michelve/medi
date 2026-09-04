@@ -112,6 +112,17 @@ pub fn router(state: AppState) -> Router {
         // + convert, cached under /config/subs; external .vtt → served directly). Image
         // tracks are not served here — the client requests a burn-in via /api/stream.
         .route("/api/subtitles/:file_id/:index", get(subtitle_vtt))
+        // Raw subtitle bytes (`docs/.tasks/99`): the ORIGINAL track, unconverted, for
+        // client-side rendering (ASS/SSA → libass, PGS/VobSub → libbitsub). Embedded tracks
+        // are extracted with `-c:s copy` and cached; external sidecars served straight.
+        // Supports Range (libbitsub streams bitmap subs with range requests).
+        .route("/api/subtitles/:file_id/:index/raw", get(subtitle_raw))
+        // VobSub `.idx` companion for the `.sub` that `/raw` serves (libbitsub needs both).
+        .route("/api/subtitles/:file_id/:index/raw.idx", get(subtitle_raw_idx))
+        // Embedded font attachments (`docs/.tasks/99`) so libass renders ASS with the file's
+        // real fonts. `/fonts` lists them (JSON); `/fonts/:name` serves one.
+        .route("/api/files/:file_id/fonts", get(file_fonts))
+        .route("/api/files/:file_id/fonts/:name", get(file_font))
         // Generated assets — Phase 3 (assets crate). Served as static files; a
         // missing file is a natural 404 from ServeDir.
         .nest_service("/api/preview", previews)
@@ -934,8 +945,10 @@ async fn file_tracks(
     let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
     let body = FileTracks {
         file_id,
+        video_fps: file.frame_rate,
         audio: file.audio_streams.into_iter().map(Into::into).collect(),
         subtitles: file.subtitle_streams.into_iter().map(Into::into).collect(),
+        chapters: file.chapters.into_iter().map(Into::into).collect(),
     };
     Ok(Json(body).into_response())
 }
@@ -1231,26 +1244,8 @@ async fn subtitle_vtt(
     let db = state.db.clone();
     let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
 
-    // Resolve the selected subtitle row: `ext<id>` addresses an external sidecar by row id;
-    // a bare number is an embedded track's ffprobe `stream_index`.
-    let sub = if let Some(rest) = index.strip_prefix("ext") {
-        let row_id: i64 = rest
-            .parse()
-            .map_err(|_| ApiError::bad_request("malformed external subtitle index"))?;
-        file.subtitle_streams
-            .iter()
-            .find(|s| s.is_external && s.id == row_id)
-            .cloned()
-    } else {
-        let stream_index: i64 = index
-            .parse()
-            .map_err(|_| ApiError::bad_request("malformed subtitle index"))?;
-        file.subtitle_streams
-            .iter()
-            .find(|s| !s.is_external && s.stream_index == Some(stream_index))
-            .cloned()
-    };
-    let sub = sub.ok_or_else(|| ApiError::not_found("no such subtitle track"))?;
+    // Resolve the selected subtitle row (`ext<id>` sidecar id / bare embedded `stream_index`).
+    let sub = resolve_subtitle_row(&file, &index)?;
 
     // Image subtitles can't become text — the client must request a burn-in instead.
     if sub.format == "image" {
@@ -1351,6 +1346,270 @@ fn embedded_subtitle_relative_index(
         .iter()
         .position(|s| s.id == target.id)
         .map(|p| p as i64)
+}
+
+/// Resolve a subtitle row of `file` from the `:index` path fragment: `ext<id>` addresses an
+/// external sidecar by row id; a bare number is an embedded track's ffprobe `stream_index`.
+/// Shared by the WebVTT and raw subtitle handlers.
+fn resolve_subtitle_row(
+    file: &medi_db::models::MediaFile,
+    index: &str,
+) -> ApiResult<medi_db::models::SubtitleStream> {
+    let sub = if let Some(rest) = index.strip_prefix("ext") {
+        let row_id: i64 = rest
+            .parse()
+            .map_err(|_| ApiError::bad_request("malformed external subtitle index"))?;
+        file.subtitle_streams
+            .iter()
+            .find(|s| s.is_external && s.id == row_id)
+            .cloned()
+    } else {
+        let stream_index: i64 = index
+            .parse()
+            .map_err(|_| ApiError::bad_request("malformed subtitle index"))?;
+        file.subtitle_streams
+            .iter()
+            .find(|s| !s.is_external && s.stream_index == Some(stream_index))
+            .cloned()
+    };
+    sub.ok_or_else(|| ApiError::not_found("no such subtitle track"))
+}
+
+/// Map a subtitle codec to the ffmpeg output format + file extension + content type used when
+/// extracting the RAW track for client-side rendering (`docs/.tasks/99`). Returns `None` for a
+/// codec we don't extract raw (the client falls back to WebVTT / burn-in).
+fn raw_subtitle_kind(codec: &str) -> Option<(&'static str, &'static str, &'static str)> {
+    // (ffmpeg -f format, extension, Content-Type)
+    match codec.to_ascii_lowercase().as_str() {
+        "ass" | "ssa" => Some(("ass", "ass", "text/x-ssa; charset=utf-8")),
+        "subrip" | "srt" => Some(("srt", "srt", "application/x-subrip; charset=utf-8")),
+        "webvtt" => Some(("webvtt", "vtt", "text/vtt; charset=utf-8")),
+        "hdmv_pgs_subtitle" | "pgssub" | "pgs" => Some(("sup", "sup", "application/octet-stream")),
+        // VobSub is a `.idx`(text index) + `.sub`(bitmap) pair. `/raw` serves the `.sub`; the
+        // sibling `.idx` is served by `subtitle_raw_idx`. ffmpeg writes both when the output
+        // extension is `.idx`, so extraction targets that.
+        "dvd_subtitle" | "dvdsub" | "vobsub" => Some(("vobsub", "sub", "application/octet-stream")),
+        _ => None,
+    }
+}
+
+/// Whether a codec is VobSub-family (a `.idx`+`.sub` pair).
+fn is_vobsub_codec(codec: &str) -> bool {
+    matches!(codec.to_ascii_lowercase().as_str(), "dvd_subtitle" | "dvdsub" | "vobsub")
+}
+
+/// `GET /api/subtitles/:file_id/:index/raw` — the subtitle track in its ORIGINAL format, for
+/// client-side rendering (`docs/.tasks/99`): ASS/SSA → libass, PGS → libbitsub. An external
+/// sidecar is served straight from disk; an embedded track is extracted with `-c:s copy` and
+/// cached under `subs_raw_dir()`. `ServeFile` handles `Range` (libbitsub streams with ranges).
+async fn subtitle_raw(
+    State(state): State<AppState>,
+    Path((file_id, index)): Path<(i64, String)>,
+    req: Request,
+) -> ApiResult<Response> {
+    let db = state.db.clone();
+    let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
+    let sub = resolve_subtitle_row(&file, &index)?;
+
+    // External sidecar: serve the original file verbatim (VobSub `.sub`, ASS, etc. — read-only).
+    if sub.is_external {
+        if let Some(path) = &sub.external_path {
+            return serve_static_file(std::path::Path::new(path), req, None).await;
+        }
+        return Err(ApiError::not_found("external subtitle missing path"));
+    }
+
+    let codec = sub.codec.as_deref().unwrap_or("");
+    raw_subtitle_kind(codec)
+        .ok_or_else(|| ApiError::unsupported_media_type("subtitle codec not available raw"))?;
+
+    // Serve the `.sub` (VobSub) or the single extract file, extracting the pair/file on demand.
+    let (path, content_type) = ensure_raw_extract(&state, &file, &sub, &index).await?;
+    serve_static_file(&path, req, content_type).await
+}
+
+/// `GET /api/subtitles/:file_id/:index/raw.idx` — the VobSub `.idx` companion for the `.sub`
+/// that `/raw` serves (`docs/.tasks/99`). libbitsub needs both. Only valid for VobSub codecs.
+async fn subtitle_raw_idx(
+    State(state): State<AppState>,
+    Path((file_id, index)): Path<(i64, String)>,
+    req: Request,
+) -> ApiResult<Response> {
+    let db = state.db.clone();
+    let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
+    let sub = resolve_subtitle_row(&file, &index)?;
+    if sub.is_external {
+        return Err(ApiError::bad_request("external VobSub is served as a sidecar, not /raw.idx"));
+    }
+    if !is_vobsub_codec(sub.codec.as_deref().unwrap_or("")) {
+        return Err(ApiError::unsupported_media_type("no .idx for a non-VobSub subtitle"));
+    }
+    // Extraction (triggered by `/raw` or here) writes the pair; return the `.idx` sibling.
+    let (sub_path, _) = ensure_raw_extract(&state, &file, &sub, &index).await?;
+    let idx_path = sub_path.with_extension("idx");
+    serve_static_file(&idx_path, req, Some("text/plain; charset=utf-8")).await
+}
+
+/// Ensure the raw extract for an embedded track exists in the cache, returning the primary file
+/// path (the `.sub` for VobSub) + its content type. Extraction is a `-c:s copy` stream copy —
+/// CPU-trivial, no GPU transcode session. For VobSub, ffmpeg writes the `.idx`+`.sub` pair.
+async fn ensure_raw_extract(
+    state: &AppState,
+    file: &medi_db::models::MediaFile,
+    sub: &medi_db::models::SubtitleStream,
+    index: &str,
+) -> ApiResult<(std::path::PathBuf, Option<&'static str>)> {
+    let codec = sub.codec.as_deref().unwrap_or("");
+    let (fmt, ext, content_type) = raw_subtitle_kind(codec)
+        .ok_or_else(|| ApiError::unsupported_media_type("subtitle codec not available raw"))?;
+    let base = state
+        .config
+        .subs_raw_dir()
+        .join(format!("{}.{}", file.id, cache_key_for(index)));
+    let primary = base.with_extension(ext);
+    if !primary.exists() {
+        let rel = embedded_subtitle_relative_index(&file.subtitle_streams, sub)
+            .ok_or_else(|| ApiError::internal("subtitle track not found for extraction"))?;
+        if let Some(parent) = primary.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| ApiError::internal(format!("subs-raw dir: {e}")))?;
+        }
+        let map = format!("0:s:{rel}");
+        let mut cmd = tokio::process::Command::new(medi_transcode::caps::ffmpeg_bin());
+        cmd.args(["-hide_banner", "-loglevel", "warning", "-nostdin", "-y", "-i"])
+            .arg(&file.path)
+            .args(["-map", &map, "-c:s", "copy"]);
+        // VobSub: no `-f` — ffmpeg picks the muxer from the `.idx` output and writes both files.
+        // Everything else: force the format and write the single file.
+        let out = if is_vobsub_codec(codec) {
+            base.with_extension("idx")
+        } else {
+            cmd.args(["-f", fmt]);
+            primary.clone()
+        };
+        let status = cmd
+            .arg(&out)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await
+            .map_err(|e| ApiError::internal(format!("ffmpeg spawn: {e}")))?;
+        if !status.success() {
+            let _ = tokio::fs::remove_file(&out).await;
+            if is_vobsub_codec(codec) {
+                let _ = tokio::fs::remove_file(base.with_extension("sub")).await;
+            }
+            return Err(ApiError::internal("subtitle extraction failed"));
+        }
+    }
+    Ok((primary, Some(content_type)))
+}
+
+/// Serve a file via `ServeFile` (handles `Range`), optionally forcing a content type.
+async fn serve_static_file(
+    path: &std::path::Path,
+    req: Request,
+    content_type: Option<&'static str>,
+) -> ApiResult<Response> {
+    let serve = ServeFile::new(path);
+    let mut resp = serve
+        .oneshot(req)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?
+        .into_response();
+    if let Some(ct) = content_type {
+        resp.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static(ct),
+        );
+    }
+    Ok(resp)
+}
+
+/// The per-file directory holding this media file's dumped font attachments.
+fn fonts_cache_dir(state: &AppState, file_id: i64) -> std::path::PathBuf {
+    state.config.subs_raw_dir().join(format!("fonts-{file_id}"))
+}
+
+/// Font file extensions libass consumes; used to filter dumped attachments (a matroska file can
+/// also carry cover-art image attachments, which we skip).
+fn is_font_file(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".ttf", ".otf", ".ttc", ".woff", ".woff2", ".pfb", ".pfa"]
+        .iter()
+        .any(|ext| lower.ends_with(ext))
+}
+
+/// Dump all attachments of `file` into `dir` (idempotent — skipped if `dir` already exists).
+/// Uses jellyfin-ffmpeg `-dump_attachment:t ""`, run with `dir` as the working directory so each
+/// attachment lands under its `filename` tag there.
+async fn ensure_fonts_dumped(file_path: &std::path::Path, dir: &std::path::Path) -> ApiResult<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| ApiError::internal(format!("fonts dir: {e}")))?;
+    // `-dump_attachment:t ""` writes every attachment to its tagged filename in the cwd; the
+    // trailing `-f null -` gives ffmpeg a (discarded) output so it runs. A file with no
+    // attachments exits cleanly and leaves the dir empty.
+    let _ = tokio::process::Command::new(medi_transcode::caps::ffmpeg_bin())
+        .current_dir(dir)
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-dump_attachment:t", ""])
+        .arg("-i")
+        .arg(file_path)
+        .args(["-f", "null", "-"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .map_err(|e| ApiError::internal(format!("ffmpeg spawn: {e}")))?;
+    Ok(())
+}
+
+/// `GET /api/files/:file_id/fonts` — list the file's embedded font attachments (`docs/.tasks/99`)
+/// so the web player can hand their URLs to libass. Returns `{ fonts: ["Arial.ttf", ...] }`.
+async fn file_fonts(
+    State(state): State<AppState>,
+    Path(file_id): Path<i64>,
+) -> ApiResult<Response> {
+    let db = state.db.clone();
+    let file = run_blocking(&db, move |conn| queries::get_media_file(conn, file_id)).await?;
+    let dir = fonts_cache_dir(&state, file_id);
+    ensure_fonts_dumped(std::path::Path::new(&file.path), &dir).await?;
+
+    let mut fonts = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if let Some(name) = entry.file_name().to_str() {
+                if is_font_file(name) {
+                    fonts.push(name.to_string());
+                }
+            }
+        }
+    }
+    fonts.sort();
+    Ok(Json(serde_json::json!({ "fonts": fonts })).into_response())
+}
+
+/// `GET /api/files/:file_id/fonts/:name` — serve one dumped font attachment by filename
+/// (`docs/.tasks/99`). Rejects path traversal; only serves recognized font files.
+async fn file_font(
+    State(state): State<AppState>,
+    Path((file_id, name)): Path<(i64, String)>,
+    req: Request,
+) -> ApiResult<Response> {
+    // Reject any name that isn't a plain filename (no separators / traversal).
+    if name.contains('/') || name.contains('\\') || name.contains("..") || !is_font_file(&name) {
+        return Err(ApiError::bad_request("invalid font name"));
+    }
+    let dir = fonts_cache_dir(&state, file_id);
+    let path = dir.join(&name);
+    if !path.exists() {
+        return Err(ApiError::not_found("no such font"));
+    }
+    serve_static_file(&path, req, Some("application/octet-stream")).await
 }
 
 /// Serve a WebVTT file with the correct content type, via `ServeFile` (handles `Range`).
@@ -1476,4 +1735,34 @@ where
     })
     .await?; // JoinError → 500
     Ok(result?) // DbError → mapped status
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_subtitle_kind_maps_known_codecs() {
+        // Text codecs extract to their native container; PGS to .sup; unknowns fall through.
+        assert_eq!(raw_subtitle_kind("ass").map(|k| k.1), Some("ass"));
+        assert_eq!(raw_subtitle_kind("SSA").map(|k| k.1), Some("ass"));
+        assert_eq!(raw_subtitle_kind("subrip").map(|k| k.1), Some("srt"));
+        assert_eq!(raw_subtitle_kind("webvtt").map(|k| k.1), Some("vtt"));
+        assert_eq!(raw_subtitle_kind("hdmv_pgs_subtitle").map(|k| k.1), Some("sup"));
+        // VobSub extracts as a `.idx`+`.sub` pair; `/raw` serves the `.sub`.
+        assert_eq!(raw_subtitle_kind("dvd_subtitle").map(|k| k.1), Some("sub"));
+        assert!(is_vobsub_codec("dvd_subtitle"));
+        assert!(!is_vobsub_codec("hdmv_pgs_subtitle"));
+        // A codec we don't extract raw falls through (client uses WebVTT / burn-in).
+        assert!(raw_subtitle_kind("mov_text").is_none());
+    }
+
+    #[test]
+    fn is_font_file_accepts_fonts_rejects_others() {
+        assert!(is_font_file("Arial.ttf"));
+        assert!(is_font_file("Deja Vu.OTF"));
+        assert!(is_font_file("x.woff2"));
+        assert!(!is_font_file("cover.jpg"));
+        assert!(!is_font_file("notes.txt"));
+    }
 }

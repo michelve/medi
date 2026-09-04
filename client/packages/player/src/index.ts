@@ -41,3 +41,10 @@ export {
   tileCount,
 } from './trickplay';
 export type { TrickplayMeta, TrickplayTile } from './trickplay';
+
+export {
+  chapterAt,
+  nextChapterMs,
+  previousChapterMs,
+  PREVIOUS_CHAPTER_GRACE_MS,
+} from './chapters';

@@ -450,6 +450,32 @@ export class ApiClient {
   }
 
   /**
+   * `GET /api/subtitles/:file_id/:index/raw` — the subtitle track in its ORIGINAL format
+   * (`docs/.tasks/99`), for client-side rendering: ASS/SSA → libass, PGS → libbitsub.
+   * `index` is the embedded `stream_index` or `ext<id>` for a sidecar.
+   */
+  rawSubtitleUrl(fileId: number, index: number | string): string {
+    return this.abs(`/api/subtitles/${fileId}/${index}/raw`);
+  }
+
+  /** `GET /api/subtitles/:file_id/:index/raw.idx` — the VobSub `.idx` companion to the `.sub`
+   * that {@link rawSubtitleUrl} serves (`docs/.tasks/99`); libbitsub needs both. */
+  rawSubtitleIdxUrl(fileId: number, index: number | string): string {
+    return this.abs(`/api/subtitles/${fileId}/${index}/raw.idx`);
+  }
+
+  /** `GET /api/files/:file_id/fonts` — the file's embedded font attachment names (`docs/.tasks/99`),
+   * for libass. Returns `{ fonts: string[] }`. */
+  fonts(fileId: number, opts: RequestOptions = {}): Promise<{ fonts: string[] }> {
+    return this.getJson<{ fonts: string[] }>(`/api/files/${fileId}/fonts`, opts, false);
+  }
+
+  /** Absolute URL of one embedded font attachment (`docs/.tasks/99`), to hand to libass. */
+  fontUrl(fileId: number, name: string): string {
+    return this.abs(`/api/files/${fileId}/fonts/${encodeURIComponent(name)}`);
+  }
+
+  /**
    * Resolve an HLS/`index.m3u8` URL from a `StreamDecision`. The backend returns
    * a root-relative `url`; make it absolute for the native player.
    */

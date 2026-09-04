@@ -25,7 +25,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { PlayerControls as Controls } from '@medi/player/usePlayerControls';
 import type { TrickplayMeta } from '@medi/player/trickplay';
-import type { FileAudioTrack } from '@medi/api-client';
+import type { FileAudioTrack, FileChapter } from '@medi/api-client';
 import { ScrubBar } from './ScrubBar';
 import { Icon } from './PlayerIcons';
 import { formatTime } from '../lib/format';
@@ -60,6 +60,12 @@ export interface PlayerControlsProps {
   onSelectAudio?: (streamIndex: number) => void;
   /** A subtitles-menu slot (`docs/.tasks/99`); rendered as a disabled placeholder when absent. */
   subtitlesMenu?: React.ReactNode;
+  /** Embedded chapters (`docs/.tasks/99`): ticks on the scrub bar + prev/next buttons. */
+  chapters?: FileChapter[];
+  /** Seek to the next chapter (button + PageUp). Shown only when there are >1 chapters. */
+  onNextChapter?: () => void;
+  /** Seek to the previous chapter (button + PageDown), with a grace window. */
+  onPrevChapter?: () => void;
 }
 
 export function PlayerControls({
@@ -73,6 +79,9 @@ export function PlayerControls({
   activeAudioTrack,
   onSelectAudio,
   subtitlesMenu,
+  chapters,
+  onNextChapter,
+  onPrevChapter,
 }: PlayerControlsProps) {
   const { overlayVisible, isPlaying, displayPositionMs, durationMs, handleRemote } = controls;
 
@@ -123,9 +132,16 @@ export function PlayerControls({
           durationMs={durationMs}
           onSeek={onSeek}
           trickplay={trickplay}
+          chapters={chapters}
         />
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+          {chapters && chapters.length > 1 && onPrevChapter && (
+            <GlassButton label="Previous chapter" onClick={onPrevChapter}>
+              <Icon name="prevChapter" />
+            </GlassButton>
+          )}
+
           <GlassButton label="Skip back 10 seconds" onClick={() => handleRemote('left')}>
             <Icon name="back10" />
           </GlassButton>
@@ -154,6 +170,12 @@ export function PlayerControls({
           <GlassButton label="Skip forward 10 seconds" onClick={() => handleRemote('right')}>
             <Icon name="forward10" />
           </GlassButton>
+
+          {chapters && chapters.length > 1 && onNextChapter && (
+            <GlassButton label="Next chapter" onClick={onNextChapter}>
+              <Icon name="nextChapter" />
+            </GlassButton>
+          )}
 
           <span
             style={{
@@ -434,6 +456,124 @@ function AudioMenu({
               />
             );
           })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A caption-menu entry: a stable id, a display label, and whether it's an image track (which
+ * currently requires a burn-in and so is shown but not togglable via `<track>`). */
+export interface SubtitleMenuEntry {
+  id: string;
+  label: string;
+  /** `true` for PGS/VobSub image subs — client-side render / burn-in lands in a later phase. */
+  image?: boolean;
+}
+
+/**
+ * The caption menu (`docs/.tasks/99` A2) — clones {@link AudioMenu}. Lists **Off** plus every
+ * subtitle track; the active one is checked. `active` is the selected entry id, or `null`/
+ * `undefined` for Off. Selecting calls `onSelect(id)` (or `onSelect(null)` for Off).
+ */
+export function SubtitleMenu({
+  entries,
+  active,
+  onSelect,
+  onOpenSettings,
+}: {
+  entries: SubtitleMenuEntry[];
+  active: string | null;
+  onSelect: (id: string | null) => void;
+  /** Opens the subtitle appearance panel (`docs/.tasks/99` C4). */
+  onOpenSettings?: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        setOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey, true);
+    };
+  }, [open]);
+
+  return (
+    <div ref={ref} style={{ position: 'relative' }}>
+      <GlassButton label="Subtitles" onClick={() => setOpen((v) => !v)} active={open}>
+        <Icon name="subtitles" />
+      </GlassButton>
+      {open && (
+        <div
+          role="menu"
+          style={{
+            ...glass,
+            position: 'absolute',
+            bottom: 50,
+            right: 0,
+            minWidth: 220,
+            maxHeight: 280,
+            overflowY: 'auto',
+            borderRadius: 14,
+            padding: 8,
+            boxShadow: '0 12px 40px rgba(0,0,0,0.5)',
+          }}
+        >
+          <div
+            style={{
+              padding: '4px 12px 8px',
+              color: 'rgba(255,255,255,0.55)',
+              fontSize: 11,
+              textTransform: 'uppercase',
+              letterSpacing: 0.6,
+            }}
+          >
+            Subtitles
+          </div>
+          <MenuItem
+            active={active == null}
+            onClick={() => {
+              onSelect(null);
+              setOpen(false);
+            }}
+            label="Off"
+          />
+          {entries.map((e) => (
+            <MenuItem
+              key={e.id}
+              active={e.id === active}
+              onClick={() => {
+                onSelect(e.id);
+                setOpen(false);
+              }}
+              label={e.label}
+            />
+          ))}
+          {onOpenSettings && (
+            <>
+              <div style={{ height: 1, background: 'rgba(255,255,255,0.12)', margin: '6px 8px' }} />
+              <MenuItem
+                active={false}
+                onClick={() => {
+                  onOpenSettings();
+                  setOpen(false);
+                }}
+                label="Appearance…"
+              />
+            </>
+          )}
         </div>
       )}
     </div>

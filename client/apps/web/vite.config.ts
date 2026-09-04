@@ -39,6 +39,9 @@ export default defineConfig(({ mode }) => {
       '@medi/player/trickplay': fileURLToPath(
         new URL('../../packages/player/src/trickplay', import.meta.url),
       ),
+      '@medi/player/chapters': fileURLToPath(
+        new URL('../../packages/player/src/chapters', import.meta.url),
+      ),
     },
   },
   server: {

@@ -30,7 +30,7 @@ use serde::Deserialize;
 use tokio::process::Command;
 
 use medi_core::SubtitleFormat;
-use medi_db::writes::{AudioStreamWrite, MediaFileWrite, SubtitleStreamWrite};
+use medi_db::writes::{AudioStreamWrite, ChapterWrite, MediaFileWrite, SubtitleStreamWrite};
 
 /// The ffprobe binary. `jellyfin-ffmpeg` ships it as `ffprobe` on `PATH` inside the
 /// container image (`docs/.tasks/50-phase5`); overridable via `FFPROBE_BIN` for tests
@@ -55,10 +55,16 @@ pub enum ProbeError {
     NoVideoStream(String),
 }
 
-/// The parsed result of one ffprobe pass: the `media_files` row plus its child audio and
-/// subtitle track lists. The worker persists all three in one file transaction via
-/// `upsert_media_file` + `replace_audio_streams` + `replace_subtitle_streams`.
-pub type Probed = (MediaFileWrite, Vec<AudioStreamWrite>, Vec<SubtitleStreamWrite>);
+/// The parsed result of one ffprobe pass: the `media_files` row plus its child audio,
+/// subtitle, and chapter lists. The worker persists all four in one file transaction via
+/// `upsert_media_file` + `replace_audio_streams` + `replace_subtitle_streams` +
+/// `replace_chapters`.
+pub type Probed = (
+    MediaFileWrite,
+    Vec<AudioStreamWrite>,
+    Vec<SubtitleStreamWrite>,
+    Vec<ChapterWrite>,
+);
 
 /// Run `ffprobe` on `path` and parse its output into the persistable `media_files` row
 /// plus every audio and subtitle track (`docs/.tasks/70` / `90`). One invocation already
@@ -75,6 +81,7 @@ pub async fn probe(path: &Path) -> Result<Probed, ProbeError> {
             "json",
             "-show_format",
             "-show_streams",
+            "-show_chapters",
             "-show_frames",
             "-read_intervals",
             "%+#1",
@@ -144,6 +151,7 @@ pub(crate) fn map_output(out: &FfprobeOutput) -> Option<Probed> {
 
     let transfer_characteristics = video.color_transfer.clone();
     let color_space = video.color_space.clone();
+    let frame_rate = parse_rational_fps(video.avg_frame_rate.as_deref());
 
     let dovi = find_dovi(video);
     let hdr_type = classify_hdr(video, &dovi, has_hdr10plus(out));
@@ -200,6 +208,30 @@ pub(crate) fn map_output(out: &FfprobeOutput) -> Option<Probed> {
         })
         .collect();
 
+    // Collect embedded chapters (`docs/.tasks/99`). `ordinal` is the 0-based order; times are
+    // fractional seconds → ms (like `duration_ms`). `end_ms` is best-effort (some files omit
+    // it — the player then bounds a chapter by the next chapter's start).
+    let chapters: Vec<ChapterWrite> = out
+        .chapters
+        .iter()
+        .enumerate()
+        .map(|(idx, c)| ChapterWrite {
+            ordinal: idx as i64,
+            start_ms: c
+                .start_time
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|secs| (secs * 1000.0).round() as i64)
+                .unwrap_or(0),
+            end_ms: c
+                .end_time
+                .as_deref()
+                .and_then(|s| s.parse::<f64>().ok())
+                .map(|secs| (secs * 1000.0).round() as i64),
+            title: c.tags.as_ref().and_then(|t| t.title.clone()),
+        })
+        .collect();
+
     let media = MediaFileWrite {
         container,
         size_bytes,
@@ -217,9 +249,24 @@ pub(crate) fn map_output(out: &FfprobeOutput) -> Option<Probed> {
         dv_bl_compatible_id: dovi.as_ref().map(|d| d.bl_compatible_id as i64),
         dv_level: dovi.as_ref().and_then(|d| d.dv_level.map(|l| l as i64)),
         hw_decode_unsupported,
+        frame_rate,
     };
 
-    Some((media, audio_streams, subtitle_streams))
+    Some((media, audio_streams, subtitle_streams, chapters))
+}
+
+/// Parse ffprobe's rational frame-rate string ("24000/1001", "25/1", "0/0") to fps. Returns
+/// `None` for a missing / zero / malformed value (Task 99).
+fn parse_rational_fps(s: Option<&str>) -> Option<f64> {
+    let s = s?;
+    let (num, den) = s.split_once('/')?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
+    if den == 0.0 || num == 0.0 {
+        return None;
+    }
+    let fps = num / den;
+    fps.is_finite().then_some(fps)
 }
 
 /// Normalize the ffprobe `codec_name` (+ `profile`, which disambiguates DTS) to the
@@ -432,7 +479,22 @@ pub(crate) struct FfprobeOutput {
     pub streams: Vec<Stream>,
     #[serde(default)]
     pub frames: Vec<Frame>,
+    /// Embedded chapter markers (`-show_chapters`, Task 99). Absent for files without
+    /// chapters; `#[serde(default)]` yields an empty list so re-probing an old file just
+    /// writes no chapter rows.
+    #[serde(default)]
+    pub chapters: Vec<Chapter>,
     pub format: Option<Format>,
+}
+
+/// One embedded chapter (`-show_chapters`). ffprobe emits `start_time`/`end_time` as
+/// fractional-second strings (like `format.duration`); `tags.title` is the chapter name and
+/// may be absent.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Chapter {
+    pub start_time: Option<String>,
+    pub end_time: Option<String>,
+    pub tags: Option<Tags>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -447,6 +509,8 @@ pub(crate) struct Stream {
     pub bits_per_raw_sample: Option<String>,
     pub color_transfer: Option<String>,
     pub color_space: Option<String>,
+    /// ffprobe emits frame rate as a rational string ("24000/1001", "25/1").
+    pub avg_frame_rate: Option<String>,
     /// ffprobe emits bit rates as strings ("8000000").
     pub bit_rate: Option<String>,
     // --- audio fields (Task 70) ---
@@ -521,6 +585,11 @@ mod tests {
     fn parse_subs(json: &str) -> Vec<SubtitleStreamWrite> {
         let out: FfprobeOutput = serde_json::from_str(json).unwrap();
         map_output(&out).expect("has a video stream").2
+    }
+
+    fn parse_chapters(json: &str) -> Vec<ChapterWrite> {
+        let out: FfprobeOutput = serde_json::from_str(json).unwrap();
+        map_output(&out).expect("has a video stream").3
     }
 
     #[test]
@@ -859,5 +928,53 @@ mod tests {
             }"#,
         );
         assert!(subs.is_empty());
+    }
+
+    #[test]
+    fn chapters_parsed_with_ordinal_ms_and_title() {
+        let chapters = parse_chapters(
+            r#"{
+              "streams": [{ "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080 }],
+              "chapters": [
+                { "id": 0, "start_time": "0.000000", "end_time": "60.500000", "tags": { "title": "Intro" } },
+                { "id": 1, "start_time": "60.500000", "end_time": "125.000000", "tags": { "title": "Chapter 2" } },
+                { "id": 2, "start_time": "125.000000", "end_time": "300.000000" }
+              ],
+              "format": {}
+            }"#,
+        );
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(chapters[0], ChapterWrite { ordinal: 0, start_ms: 0, end_ms: Some(60_500), title: Some("Intro".into()) });
+        assert_eq!(chapters[1], ChapterWrite { ordinal: 1, start_ms: 60_500, end_ms: Some(125_000), title: Some("Chapter 2".into()) });
+        // Missing title → None; end_time present.
+        assert_eq!(chapters[2], ChapterWrite { ordinal: 2, start_ms: 125_000, end_ms: Some(300_000), title: None });
+    }
+
+    #[test]
+    fn frame_rate_parsed_from_rational() {
+        assert_eq!(parse_rational_fps(Some("24000/1001")), Some(24000.0 / 1001.0));
+        assert_eq!(parse_rational_fps(Some("25/1")), Some(25.0));
+        assert_eq!(parse_rational_fps(Some("0/0")), None);
+        assert_eq!(parse_rational_fps(Some("30")), None);
+        assert_eq!(parse_rational_fps(None), None);
+        // End to end: a video stream's avg_frame_rate surfaces on the media row.
+        let w = parse(
+            r#"{
+              "streams": [{ "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080, "avg_frame_rate": "24000/1001" }],
+              "format": {}
+            }"#,
+        );
+        assert!((w.frame_rate.unwrap() - 23.976).abs() < 0.01);
+    }
+
+    #[test]
+    fn no_chapters_is_empty() {
+        let chapters = parse_chapters(
+            r#"{
+              "streams": [{ "codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080 }],
+              "format": {}
+            }"#,
+        );
+        assert!(chapters.is_empty());
     }
 }

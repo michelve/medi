@@ -20,6 +20,8 @@ export type IconName =
   | 'fullscreenExit'
   | 'audio'
   | 'subtitles'
+  | 'nextChapter'
+  | 'prevChapter'
   | 'check';
 
 export interface IconProps {
@@ -118,6 +120,20 @@ export function Icon({ name, size = 20 }: IconProps) {
       return (
         <svg {...common} fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
           <path d="M8.25 9h7.5m-7.5 3h4.5m-4.72 6.03 1.72-1.72h6.75A2.25 2.25 0 0 0 18.75 14V6.75A2.25 2.25 0 0 0 16.5 4.5h-9A2.25 2.25 0 0 0 5.25 6.75V14a2.25 2.25 0 0 0 2.03 2.239v2.008c0 .46.556.69.882.362Z" />
+        </svg>
+      );
+
+    // Heroicons solid `forward` / `backward` (skip to next / previous chapter).
+    case 'nextChapter':
+      return (
+        <svg {...common} fill="currentColor">
+          <path d="M5.055 7.06C3.805 6.347 2.25 7.25 2.25 8.69v6.62c0 1.44 1.555 2.343 2.805 1.63L9 14.688V15.31c0 1.44 1.555 2.343 2.805 1.63l5.856-3.345a1.875 1.875 0 0 0 0-3.256L11.805 7.06C10.555 6.347 9 7.25 9 8.69v.622L5.055 7.06Zm14.445.44a.75.75 0 0 0-.75.75v7.5a.75.75 0 0 0 1.5 0v-7.5a.75.75 0 0 0-.75-.75Z" />
+        </svg>
+      );
+    case 'prevChapter':
+      return (
+        <svg {...common} fill="currentColor">
+          <path d="M18.945 7.06c1.25-.713 2.805.19 2.805 1.63v6.62c0 1.44-1.555 2.343-2.805 1.63L15 14.688V15.31c0 1.44-1.555 2.343-2.805 1.63L6.34 13.595a1.875 1.875 0 0 1 0-3.256L12.195 7.06C13.445 6.347 15 7.25 15 8.69v.622l3.945-2.252ZM4.5 7.5a.75.75 0 0 1 .75.75v7.5a.75.75 0 0 1-1.5 0v-7.5A.75.75 0 0 1 4.5 7.5Z" />
         </svg>
       );
 

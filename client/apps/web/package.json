@@ -11,8 +11,10 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@jellyfin/libass-wasm": "4.2.4",
     "@medi/api-client": "*",
     "hls.js": "1.5.20",
+    "libbitsub": "1.12.1",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-router-dom": "6.30.1"

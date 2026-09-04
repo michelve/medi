@@ -20,14 +20,34 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { usePlayerControls } from '@medi/player/usePlayerControls';
 import type { TrickplayMeta } from '@medi/player/trickplay';
-import { ApiError, type FileAudioTrack, type StreamDecision, type SubtitleStream } from '@medi/api-client';
+import {
+  ApiError,
+  type FileAudioTrack,
+  type FileChapter,
+  type FileSubtitleTrack,
+  type StreamDecision,
+  type SubtitleStream,
+} from '@medi/api-client';
 import { useApi } from '../api';
 import { ResumeChip } from '../components/ResumeChip';
+import { nextChapterMs, previousChapterMs } from '@medi/player/chapters';
+import {
+  autoSelectAudio,
+  autoSelectSubtitle,
+  readRememberedAudio,
+  readRememberedSubtitle,
+  rememberAudio,
+  rememberSubtitle,
+  subtitleLabel,
+  subtitleTrackId,
+} from '../lib/subtitleSelection';
 import { usePlaybackProgress } from '../lib/usePlaybackProgress';
 import { VideoPlayer, type WebTextTrack } from '../components/VideoPlayer';
 import { PlayerEventLog } from '../components/PlayerEventLog';
 import type { PlayerDiagnostics } from '../lib/playerDiagnostics';
-import { PlayerControls } from '../components/PlayerControls';
+import { PlayerControls, SubtitleMenu, type SubtitleMenuEntry } from '../components/PlayerControls';
+import { SubtitleSettings } from '../components/SubtitleSettings';
+import { readAppearance, writeAppearance, type SubtitleAppearance } from '../lib/subtitleAppearance';
 import { NotFound } from '../components/Status';
 
 export function PlayerPage() {
@@ -55,9 +75,43 @@ export function PlayerPage() {
   // The file's tracks (audio menu + subtitle list) from GET /api/files/:id — fixes deep links.
   const [audioTracks, setAudioTracks] = useState<FileAudioTrack[]>([]);
   const [fileSubtitles, setFileSubtitles] = useState<SubtitleStream[] | null>(null);
+  // The raw subtitle track list from GET /api/files/:id (`docs/.tasks/99`): drives the caption
+  // menu (with codec/format for render-path + badges). `fileSubtitles` above stays for the
+  // nav-state `<track>` path.
+  const [subtitleTracks, setSubtitleTracks] = useState<FileSubtitleTrack[]>([]);
+  // The active caption track id (`ext<id>` or a stream_index string), or `null` for Off.
+  const [activeSubtitleId, setActiveSubtitleId] = useState<string | null>(null);
+  // Subtitle sync offset in seconds (`docs/.tasks/99` C5); + = later, - = earlier.
+  const [subtitleOffset, setSubtitleOffset] = useState(0);
+  // A forced burn-in override (`docs/.tasks/99` C1 fallback): set when libass fails on an ASS
+  // track, so we fall back to a server burn-in of that stream_index. Cleared on track change.
+  const [forceBurnIn, setForceBurnIn] = useState<number | null>(null);
+  // Guards the one-shot auto-select so it doesn't re-fire and override a manual choice.
+  const autoSelectedRef = useRef(false);
+  const autoSelectedAudioRef = useRef(false);
+  // Embedded chapters (`docs/.tasks/99`) — scrub-bar ticks + prev/next nav.
+  const [chapters, setChapters] = useState<FileChapter[]>([]);
+  // Video frame rate (`docs/.tasks/99`) for libass `targetFps`; undefined until known.
+  const [videoFps, setVideoFps] = useState<number | undefined>(undefined);
+  // Subtitle appearance (`docs/.tasks/99` C4): loaded from localStorage, editable in a panel.
+  const [subtitleAppearance, setSubtitleAppearance] = useState<SubtitleAppearance>(() => readAppearance());
+  const [appearanceOpen, setAppearanceOpen] = useState(false);
   // The base decision's mode, so a non-default audio pick on a `direct` file forces a transcode
   // (a browser <video> can't switch an embedded audio track).
   const [baseMode, setBaseMode] = useState<StreamDecision['mode'] | null>(null);
+
+  // A *stable* onDecision (identity never changes) so the memoized <VideoPlayer> isn't re-run
+  // on every PlayerPage render. `audioTrack` is read through a ref rather than a closure so the
+  // callback needn't be recreated when it changes — the player already re-resolves on an
+  // `audioTrack` prop change, and an unstable callback here would spawn duplicate transcode
+  // sessions (the very bug this fixes).
+  const audioTrackRef = useRef(audioTrack);
+  audioTrackRef.current = audioTrack;
+  const onDecision = useCallback((d: StreamDecision) => {
+    // Remember the *base* (default-track) decision mode so a non-default audio pick on a direct
+    // file forces a transcode. Ignore decisions made while a switch is active.
+    if (audioTrackRef.current == null) setBaseMode(d.mode);
+  }, []);
 
   // Fetch the file's audio + subtitle tracks (deep-link menus, Part C).
   useEffect(() => {
@@ -68,6 +122,22 @@ export function PlayerPage() {
       .then((tracks) => {
         if (controller.signal.aborted) return;
         setAudioTracks(tracks.audio);
+        // Auto-select audio from the remembered cross-title choice (`docs/.tasks/99` C3), once.
+        if (!autoSelectedAudioRef.current) {
+          autoSelectedAudioRef.current = true;
+          const pick = autoSelectAudio(tracks.audio, readRememberedAudio());
+          if (pick != null) setAudioTrack(pick);
+        }
+        setChapters(tracks.chapters ?? []);
+        setVideoFps(tracks.video_fps);
+        setSubtitleTracks(tracks.subtitles);
+        // Auto-select captions once (`docs/.tasks/99` C3): honor the remembered cross-title
+        // choice, else the file's default/forced track. A manual pick later wins (guarded).
+        if (!autoSelectedRef.current) {
+          autoSelectedRef.current = true;
+          const chosen = autoSelectSubtitle(tracks.subtitles, readRememberedSubtitle());
+          setActiveSubtitleId(chosen ? subtitleTrackId(chosen) : null);
+        }
         // Prefer nav-state subtitles (already the full row shape); else map the file endpoint's
         // subtitle rows into the SubtitleStream shape the text-track builder consumes.
         if (!navState?.subtitles) {
@@ -106,12 +176,88 @@ export function PlayerPage() {
         return {
           src: api.subtitleUrl(id, index),
           srclang: s.language ?? 'und',
-          label: s.title ?? subtitleLabel(s),
+          label: s.title ?? textTrackLabel(s),
           default: s.is_default || s.is_forced,
         };
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, id, navState?.subtitles, fileSubtitles]);
+
+  // Caption menu entries (`docs/.tasks/99` A2) from the raw subtitle list — text tracks are
+  // selectable now; image tracks are shown but flagged (client-side render lands in Phase 5).
+  const subtitleEntries = useMemo<SubtitleMenuEntry[]>(
+    () =>
+      subtitleTracks.map((t, i) => ({
+        id: subtitleTrackId(t),
+        label: subtitleLabel(t, i),
+        image: t.format === 'image',
+      })),
+    [subtitleTracks],
+  );
+
+  // Resolve the selected subtitle track (or null for Off).
+  const activeTrack = useMemo(
+    () =>
+      activeSubtitleId == null
+        ? null
+        : subtitleTracks.find((t) => subtitleTrackId(t) === activeSubtitleId) ?? null,
+    [activeSubtitleId, subtitleTracks],
+  );
+
+  // Client-render vs burn-in split (`docs/.tasks/99` C1). All image subs (PGS + VobSub) now
+  // render client-side via libbitsub (VobSub uses the `.idx`+`.sub` raw pair). Server burn-in is
+  // only the fallback when a client renderer fails (`forceBurnIn`).
+  const burnInSubtitle = useMemo<number | null>(
+    () => forceBurnIn, // null unless a libass/libbitsub failure fell back to burn-in
+    [forceBurnIn],
+  );
+
+  // The active caption for the player's CLIENT-SIDE path: plain text (native `<track>`), ASS
+  // (libass), or image PGS/VobSub (libbitsub). A failure-fallback burn-in contributes nothing.
+  const activeSubtitle = useMemo(() => {
+    if (!activeTrack || activeSubtitleId == null || forceBurnIn != null) return null;
+    const codec = (activeTrack.codec ?? '').toLowerCase();
+    // Plain-text (native <track>) vs client-rendered (ASS libass / image libbitsub).
+    const isPlainText = activeTrack.format !== 'image' && codec !== 'ass' && codec !== 'ssa';
+    return {
+      track: activeTrack,
+      id: activeSubtitleId,
+      textTrackSrc: isPlainText ? api.subtitleUrl(id, activeSubtitleId) : null,
+    };
+  }, [api, id, activeSubtitleId, activeTrack, forceBurnIn]);
+
+  // Select a caption track (or Off) and remember the choice for future titles.
+  const selectSubtitle = useCallback(
+    (selId: string | null) => {
+      setActiveSubtitleId(selId);
+      setSubtitleOffset(0); // A fresh track starts un-shifted.
+      setForceBurnIn(null); // Clear any prior libass-failure burn-in fallback.
+      const track = selId == null ? null : subtitleTracks.find((t) => subtitleTrackId(t) === selId);
+      rememberSubtitle({
+        off: selId == null,
+        language: track?.language ?? null,
+        title: track?.title ?? null,
+        forced: track?.is_forced ?? false,
+      });
+    },
+    [subtitleTracks],
+  );
+
+  // Select an audio track (by stream_index) and remember it for future titles (`docs/.tasks/99`).
+  const selectAudio = useCallback(
+    (streamIndex: number) => {
+      setAudioTrack(streamIndex);
+      const track = audioTracks.find((t) => t.stream_index === streamIndex);
+      rememberAudio({ language: track?.language ?? null, title: track?.title ?? null });
+    },
+    [audioTracks],
+  );
+
+  // Persist subtitle appearance as it's edited (`docs/.tasks/99` C4).
+  const changeAppearance = useCallback((next: SubtitleAppearance) => {
+    setSubtitleAppearance(next);
+    writeAppearance(next);
+  }, []);
 
   const videoElRef = useRef<HTMLVideoElement | null>(null);
   const [trickplay, setTrickplay] = useState<TrickplayMeta | undefined>(undefined);
@@ -180,6 +326,19 @@ export function PlayerPage() {
     navigate(-1);
   }, [navigate]);
 
+  // Chapter navigation (`docs/.tasks/99`): seek to the next / previous chapter based on the
+  // live playback position. Read from the <video> directly so the target is always current.
+  const goNextChapter = useCallback(() => {
+    const posMs = Math.round((videoElRef.current?.currentTime ?? 0) * 1000);
+    const target = nextChapterMs(chapters, posMs);
+    if (target != null && videoElRef.current) videoElRef.current.currentTime = target / 1000;
+  }, [chapters]);
+  const goPrevChapter = useCallback(() => {
+    const posMs = Math.round((videoElRef.current?.currentTime ?? 0) * 1000);
+    const target = previousChapterMs(chapters, posMs);
+    if (target != null && videoElRef.current) videoElRef.current.currentTime = target / 1000;
+  }, [chapters]);
+
   // DOM keyboard transport + Esc-to-back (the RN remote's web analogue).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -199,6 +358,26 @@ export function PlayerPage() {
         case 'ArrowDown':
           handleRemote('up');
           break;
+        case 'PageUp':
+          // Next chapter (`docs/.tasks/99`), mirroring Jellyfin's PageUp/PageDown.
+          if (chapters.length > 0) {
+            e.preventDefault();
+            goNextChapter();
+          }
+          break;
+        case 'PageDown':
+          if (chapters.length > 0) {
+            e.preventDefault();
+            goPrevChapter();
+          }
+          break;
+        case 'g':
+          // Subtitle sync (`docs/.tasks/99` C5): g = earlier, h = later (Jellyfin's keys).
+          if (activeSubtitleId != null) setSubtitleOffset((o) => Math.round((o - 0.5) * 10) / 10);
+          break;
+        case 'h':
+          if (activeSubtitleId != null) setSubtitleOffset((o) => Math.round((o + 0.5) * 10) / 10);
+          break;
         case 'Escape':
           // A menu's own capture-phase handler swallows Escape when it's open, so reaching here
           // means nothing is open: exit fullscreen (if any) and navigate back.
@@ -213,7 +392,7 @@ export function PlayerPage() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [handleRemote, goBack]);
+  }, [handleRemote, goBack, chapters, goNextChapter, goPrevChapter, activeSubtitleId]);
 
   const seekTo = useCallback((positionMs: number) => {
     if (videoElRef.current) videoElRef.current.currentTime = positionMs / 1000;
@@ -259,12 +438,18 @@ export function PlayerPage() {
           forceTranscodeForAudio={baseMode !== 'hls'}
           onSwitchingAudio={setSwitchingAudio}
           initialResumeMs={progress.resumeMs}
-          onDecision={(d) => {
-            // Remember the *base* (default-track) decision mode so a non-default audio pick on
-            // a direct file forces a transcode. Ignore decisions made while a switch is active.
-            if (audioTrack == null) setBaseMode(d.mode);
-          }}
+          onDecision={onDecision}
           textTracks={textTracks}
+          activeSubtitle={activeSubtitle}
+          subtitleOffsetSeconds={subtitleOffset}
+          videoFps={videoFps}
+          subtitleAppearance={subtitleAppearance}
+          burnInSubtitle={burnInSubtitle}
+          onSubtitleBurnIn={(track) => {
+            // A libass failure on an ASS track (image tracks already burn in via `burnInSubtitle`)
+            // → fall back to a server burn-in of that track's embedded stream_index, if any.
+            if (track.stream_index != null) setForceBurnIn(track.stream_index);
+          }}
           diagnostics={false}
           onDiagnostics={setDiag}
         />
@@ -334,6 +519,34 @@ export function PlayerPage() {
         </div>
       )}
 
+      {/* Subtitle sync indicator (`docs/.tasks/99` C5): shows the current offset while non-zero
+          and the overlay is up, so g/h adjustments are visible. */}
+      {overlayVisible && subtitleOffset !== 0 && (
+        <div
+          style={{
+            position: 'absolute',
+            top: 20,
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 20,
+            padding: '9px 18px',
+            borderRadius: 12,
+            background: 'rgba(28,28,32,0.42)',
+            backdropFilter: 'blur(22px) saturate(160%)',
+            WebkitBackdropFilter: 'blur(22px) saturate(160%)',
+            border: '1px solid rgba(255,255,255,0.14)',
+            color: '#fff',
+            fontSize: 13,
+            pointerEvents: 'none',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.3)',
+            fontVariantNumeric: 'tabular-nums',
+          }}
+        >
+          Subtitle offset {subtitleOffset > 0 ? '+' : ''}
+          {subtitleOffset.toFixed(1)}s
+        </div>
+      )}
+
       {/* Resume chip (`docs/.tasks/98`): a non-blocking "Resuming from mm:ss / Start over" that
           auto-dismisses. Playback already resumes via `initialResumeMs`; the chip just offers
           the start-over escape hatch. */}
@@ -362,8 +575,29 @@ export function PlayerPage() {
           fullscreenTarget={containerRef.current}
           audioTracks={audioTracks}
           activeAudioTrack={audioTrack}
-          onSelectAudio={(idx) => setAudioTrack(idx)}
+          onSelectAudio={selectAudio}
+          subtitlesMenu={
+            subtitleEntries.length > 0 ? (
+              <SubtitleMenu
+                entries={subtitleEntries}
+                active={activeSubtitleId}
+                onSelect={selectSubtitle}
+                onOpenSettings={() => setAppearanceOpen(true)}
+              />
+            ) : undefined
+          }
+          chapters={chapters}
+          onNextChapter={goNextChapter}
+          onPrevChapter={goPrevChapter}
         />
+        {/* Subtitle appearance panel (`docs/.tasks/99` C4). */}
+        {appearanceOpen && (
+          <SubtitleSettings
+            value={subtitleAppearance}
+            onChange={changeAppearance}
+            onClose={() => setAppearanceOpen(false)}
+          />
+        )}
       </div>
 
       {/* Diagnostics: collapsed by default and pinned bottom-left so it never occupies the
@@ -381,10 +615,11 @@ export function PlayerPage() {
 }
 
 /**
- * A caption-menu label for a subtitle track with no explicit title (`docs/.tasks/90`):
- * uppercased language, marked `(forced)` for a forced track, else a generic fallback.
+ * A `<track>` label for a subtitle stream with no explicit title (`docs/.tasks/90`):
+ * uppercased language, marked `(forced)` for a forced track, else a generic fallback. (The
+ * richer caption-menu label lives in `lib/subtitleSelection.ts`.)
  */
-function subtitleLabel(s: SubtitleStream): string {
+function textTrackLabel(s: SubtitleStream): string {
   const lang = s.language ? s.language.toUpperCase() : 'Subtitles';
   return s.is_forced ? `${lang} (forced)` : lang;
 }

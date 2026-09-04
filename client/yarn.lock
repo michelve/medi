@@ -1278,6 +1278,11 @@
   resolved "https://registry.yarnpkg.com/@istanbuljs/schema/-/schema-0.1.6.tgz#8dc9afa2ac1506cb1a58f89940f1c124446c8df3"
   integrity sha512-+Sg6GCR/wy1oSmQDFq4LQDAhm3ETKnorxN+y5nbLULOR3P0c14f2Wurzj3/xqPXtasLFfHd5iRFQ7AJt4KH2cw==
 
+"@jellyfin/libass-wasm@4.2.4":
+  version "4.2.4"
+  resolved "https://registry.yarnpkg.com/@jellyfin/libass-wasm/-/libass-wasm-4.2.4.tgz#8dfe223f7676cc047949b61f4d3e1de581bbea18"
+  integrity sha512-xgOxp0Lmg7djdRpC+RRFaN28QeoMr46tOgL9/xbXqM46RjjVruFC3iK7K8AuGNUZ11Ysil23p0kACQw06GuaRw==
+
 "@jest/create-cache-key-function@^29.7.0":
   version "29.7.0"
   resolved "https://registry.yarnpkg.com/@jest/create-cache-key-function/-/create-cache-key-function-29.7.0.tgz#793be38148fab78e65f40ae30c36785f4ad859f0"
@@ -1817,6 +1822,11 @@
     "@babel/plugin-transform-react-jsx-source" "^7.25.9"
     "@types/babel__core" "^7.20.5"
     react-refresh "^0.14.2"
+
+"@webgpu/types@^0.1.71":
+  version "0.1.72"
+  resolved "https://registry.yarnpkg.com/@webgpu/types/-/types-0.1.72.tgz#d182969c26197e0072e9a887991faeb75cc7d9fb"
+  integrity sha512-0cF7RFM2edNoiIS1ODJp0/Gzv4/xSXhwoR0YCza+OWpJWtn4wmo9DvK91aLlH9+uUnwIriP7ZiC3WitmyhuzBw==
 
 "@xmldom/xmldom@^0.8.8":
   version "0.8.15"
@@ -3194,6 +3204,13 @@ leven@^3.1.0:
   version "3.1.0"
   resolved "https://registry.yarnpkg.com/leven/-/leven-3.1.0.tgz#77891de834064cccba82ae7842bb6b14a13ed7f2"
   integrity sha512-qsda+H8jTaUaN/x5vzW2rzc+8Rw4TAQ/4KjB46IwK5VH+IlVeeeje/EoZRpiXvIqjFgK84QffqPztGI3VBLG1A==
+
+libbitsub@1.12.1:
+  version "1.12.1"
+  resolved "https://registry.yarnpkg.com/libbitsub/-/libbitsub-1.12.1.tgz#c6ab194c4f9f804743200ef87e9018141142c75c"
+  integrity sha512-5OzJzT5wufax1IQYGknTC3p8DkkcmZbqpNEMdyqK3BCqrFMgrvaKg3CYBFYaGjkgAuTRgBKP8T9FoTgFP+1/OA==
+  dependencies:
+    "@webgpu/types" "^0.1.71"
 
 lighthouse-logger@^1.0.0:
   version "1.4.2"

@@ -224,6 +224,8 @@ pub struct MediaFileWrite {
     pub dv_bl_compatible_id: Option<i64>,
     pub dv_level: Option<i64>,
     pub hw_decode_unsupported: bool,
+    /// Video frame rate (from ffprobe `avg_frame_rate`), for the player's libass `targetFps`.
+    pub frame_rate: Option<f64>,
 }
 
 /// Insert or update the `media_files` row for `path` (its unique key), attaching it to
@@ -247,10 +249,10 @@ pub fn upsert_media_file(
              path, movie_id, episode_id, container, size_bytes, duration_ms, \
              video_codec, video_profile, width, height, bit_depth, bitrate, \
              transfer_characteristics, color_space, hdr_type, \
-             dv_profile, dv_bl_compatible_id, dv_level, hw_decode_unsupported \
+             dv_profile, dv_bl_compatible_id, dv_level, hw_decode_unsupported, frame_rate \
          ) VALUES ( \
              ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
-             ?16, ?17, ?18, ?19 \
+             ?16, ?17, ?18, ?19, ?20 \
          ) \
          ON CONFLICT(path) DO UPDATE SET \
              movie_id = excluded.movie_id, \
@@ -270,7 +272,8 @@ pub fn upsert_media_file(
              dv_profile = excluded.dv_profile, \
              dv_bl_compatible_id = excluded.dv_bl_compatible_id, \
              dv_level = excluded.dv_level, \
-             hw_decode_unsupported = excluded.hw_decode_unsupported",
+             hw_decode_unsupported = excluded.hw_decode_unsupported, \
+             frame_rate = excluded.frame_rate",
         params![
             path,
             movie_id,
@@ -291,6 +294,7 @@ pub fn upsert_media_file(
             data.dv_bl_compatible_id,
             data.dv_level,
             data.hw_decode_unsupported as i64,
+            data.frame_rate,
         ],
     )?;
 
@@ -426,6 +430,41 @@ pub fn replace_subtitle_streams(
                 s.is_external as i64,
                 s.external_path,
             ],
+        )?;
+    }
+    Ok(())
+}
+
+/// A chapter marker to persist (`docs/.tasks/99`). `ordinal` is the 0-based order; `start_ms`
+/// / `end_ms` are milliseconds from ffprobe's fractional-second chapter times; `title` is the
+/// chapter name (may be absent).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChapterWrite {
+    pub ordinal: i64,
+    pub start_ms: i64,
+    pub end_ms: Option<i64>,
+    pub title: Option<String>,
+}
+
+/// Replace all `chapters` rows of a media file with a freshly probed set.
+///
+/// Delete-then-insert so a re-probe overwrites cleanly, mirroring
+/// [`replace_subtitle_streams`] / [`replace_audio_streams`]. Call this **inside the same
+/// transaction** as `upsert_media_file`, passing the media file id it returned.
+pub fn replace_chapters(
+    conn: &Connection,
+    media_file_id: i64,
+    chapters: &[ChapterWrite],
+) -> DbResult<()> {
+    conn.execute(
+        "DELETE FROM chapters WHERE media_file_id = ?1",
+        params![media_file_id],
+    )?;
+    for c in chapters {
+        conn.execute(
+            "INSERT INTO chapters (media_file_id, ordinal, start_ms, end_ms, title) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![media_file_id, c.ordinal, c.start_ms, c.end_ms, c.title],
         )?;
     }
     Ok(())
@@ -1395,6 +1434,54 @@ mod tests {
         // And they surface on the MediaFile read model.
         let mf = crate::queries::get_media_file(&conn, file_id).unwrap();
         assert_eq!(mf.subtitle_streams.len(), 1);
+    }
+
+    #[test]
+    fn chapters_replace_and_read_back() {
+        // Chapters persist in ordinal order, a re-probe replaces the whole set, and they
+        // surface on the MediaFile read model (Task 99).
+        let (db, _dir) = db();
+        let conn = db.conn().unwrap();
+        let movie = find_or_create_movie(&conn, "T", "t", None, 0).unwrap();
+        let data = MediaFileWrite {
+            container: Some("mkv".into()),
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        };
+        let file_id = upsert_media_file(&conn, "/media/c.mkv", FileOwner::Movie(movie), &data).unwrap();
+
+        let chapters = vec![
+            ChapterWrite { ordinal: 0, start_ms: 0, end_ms: Some(60_000), title: Some("Intro".into()) },
+            ChapterWrite { ordinal: 1, start_ms: 60_000, end_ms: Some(120_000), title: None },
+            ChapterWrite { ordinal: 2, start_ms: 120_000, end_ms: None, title: Some("Finale".into()) },
+        ];
+        replace_chapters(&conn, file_id, &chapters).unwrap();
+
+        let read = crate::queries::chapters_for(&conn, file_id).unwrap();
+        assert_eq!(read.len(), 3);
+        assert_eq!(read[0].ordinal, 0);
+        assert_eq!(read[0].start_ms, 0);
+        assert_eq!(read[0].title.as_deref(), Some("Intro"));
+        assert_eq!(read[1].title, None);
+        assert_eq!(read[2].end_ms, None, "nullable end_ms round-trips as NULL");
+        assert_eq!(read[2].title.as_deref(), Some("Finale"));
+
+        // A re-probe with fewer chapters replaces the whole set.
+        replace_chapters(
+            &conn,
+            file_id,
+            &[ChapterWrite { ordinal: 0, start_ms: 0, end_ms: Some(5_000), title: Some("Only".into()) }],
+        )
+        .unwrap();
+        let read2 = crate::queries::chapters_for(&conn, file_id).unwrap();
+        assert_eq!(read2.len(), 1, "re-probe replaces the whole set");
+        assert_eq!(read2[0].title.as_deref(), Some("Only"));
+
+        // And they surface on the MediaFile read model.
+        let mf = crate::queries::get_media_file(&conn, file_id).unwrap();
+        assert_eq!(mf.chapters.len(), 1);
+        assert_eq!(mf.chapters[0].start_ms, 0);
     }
 
     #[test]

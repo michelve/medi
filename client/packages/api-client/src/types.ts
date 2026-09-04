@@ -393,6 +393,12 @@ export interface FileSubtitleTrack {
   id: number;
   stream_index?: number;
   external: boolean;
+  /**
+   * ffprobe `codec_name` (subrip, ass, ssa, webvtt, hdmv_pgs_subtitle, dvd_subtitle, …).
+   * The player keys its render path on this (`docs/.tasks/99`): `ass`/`ssa` → libass,
+   * PGS/VobSub → libbitsub, plain text → native `<track>`.
+   */
+  codec?: string;
   format: SubtitleFormat;
   language?: string;
   title?: string;
@@ -401,13 +407,29 @@ export interface FileSubtitleTrack {
 }
 
 /**
- * `GET /api/files/:file_id` — a file's audio + subtitle tracks (`docs/.tasks/97` Part C).
- * Lets a deep link to `/play/:file_id` (no router state) populate the player's menus.
+ * One chapter marker in `GET /api/files/:file_id` (`docs/.tasks/99`). `ordinal` is the 0-based
+ * order; `start_ms`/`end_ms` are milliseconds (`end_ms` may be absent when the file omits it).
+ */
+export interface FileChapter {
+  ordinal: number;
+  start_ms: number;
+  end_ms?: number;
+  title?: string;
+}
+
+/**
+ * `GET /api/files/:file_id` — a file's audio + subtitle tracks + chapters (`docs/.tasks/97`
+ * Part C; chapters added by `99`). Lets a deep link to `/play/:file_id` (no router state)
+ * populate the player's menus and scrub-bar chapter ticks.
  */
 export interface FileTracks {
   file_id: number;
   audio: FileAudioTrack[];
   subtitles: FileSubtitleTrack[];
+  chapters: FileChapter[];
+  /** Video frame rate (`docs/.tasks/99`), for the player's libass `targetFps`. Absent until
+   * the file has been (re)probed since the frame-rate column was added. */
+  video_fps?: number;
 }
 
 /** The client platform selecting a static per-device capability default (`docs/.tasks/70`). */

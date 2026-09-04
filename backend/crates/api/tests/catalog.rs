@@ -381,7 +381,11 @@ fn audio_app() -> (axum::Router, tempfile::TempDir) {
                 VALUES (202, 1, 'aac', 2, 'none', 1);
              INSERT INTO audio_streams (media_file_id, stream_index, codec, channels, language, title, immersive, is_default) \
                 VALUES (203, 1, 'ac3', 6, 'eng', 'English', 'none', 1), \
-                       (203, 2, 'ac3', 2, 'fre', 'Français', 'none', 0);",
+                       (203, 2, 'ac3', 2, 'fre', 'Français', 'none', 0);
+             -- Embedded chapters (`docs/.tasks/99`) so GET /api/files/:id lists them.
+             INSERT INTO chapters (media_file_id, ordinal, start_ms, end_ms, title) \
+                VALUES (203, 0, 0, 30000, 'Opening'), \
+                       (203, 1, 30000, NULL, 'Act One');",
         )
         .unwrap();
     }
@@ -529,6 +533,15 @@ async fn files_endpoint_lists_audio_and_subtitle_tracks() {
     assert_eq!(audio[1]["title"], "Français");
     // No subtitle streams on this file → an empty (but present) list.
     assert!(json["subtitles"].as_array().unwrap().is_empty());
+    // Chapters (`docs/.tasks/99`) are listed in ordinal order; a missing end_ms is omitted.
+    let chapters = json["chapters"].as_array().unwrap();
+    assert_eq!(chapters.len(), 2, "both chapters listed");
+    assert_eq!(chapters[0]["ordinal"], 0);
+    assert_eq!(chapters[0]["start_ms"], 0);
+    assert_eq!(chapters[0]["end_ms"], 30000);
+    assert_eq!(chapters[0]["title"], "Opening");
+    assert_eq!(chapters[1]["title"], "Act One");
+    assert!(chapters[1].get("end_ms").is_none(), "NULL end_ms is omitted from JSON");
 }
 
 #[tokio::test]

@@ -134,6 +134,11 @@ pub struct FileSubtitleTrack {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_index: Option<i64>,
     pub external: bool,
+    /// ffprobe `codec_name` (subrip, ass, ssa, webvtt, hdmv_pgs_subtitle, dvd_subtitle, …).
+    /// The client keys its render path on this: `ass`/`ssa` → libass, PGS/VobSub → libbitsub,
+    /// plain text → native `<track>` (`docs/.tasks/99`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub codec: Option<String>,
     /// `"text"` | `"image"`.
     pub format: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,6 +155,7 @@ impl From<medi_db::models::SubtitleStream> for FileSubtitleTrack {
             id: s.id,
             stream_index: s.stream_index,
             external: s.is_external,
+            codec: s.codec,
             format: s.format,
             language: s.language,
             title: s.title,
@@ -159,16 +165,43 @@ impl From<medi_db::models::SubtitleStream> for FileSubtitleTrack {
     }
 }
 
+/// One chapter marker of a file (`docs/.tasks/99`), projected for the player's scrub bar.
+#[derive(Debug, Serialize)]
+pub struct FileChapter {
+    pub ordinal: i64,
+    pub start_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl From<medi_db::models::Chapter> for FileChapter {
+    fn from(c: medi_db::models::Chapter) -> Self {
+        Self {
+            ordinal: c.ordinal,
+            start_ms: c.start_ms,
+            end_ms: c.end_ms,
+            title: c.title,
+        }
+    }
+}
+
 /// `GET /api/files/:file_id` — a file's audio + subtitle tracks (`docs/.tasks/97` Part C).
 ///
 /// Lets a **deep link** to `/play/:file_id` (with no router state) populate the player's
-/// audio-track and caption menus. Shared with `99` (which extends it with chapters); defined
-/// once here and consumed by both specs.
+/// audio-track and caption menus, and (Task 99) chapter ticks on the scrub bar. Defined once
+/// here and consumed by both specs.
 #[derive(Debug, Serialize)]
 pub struct FileTracks {
     pub file_id: i64,
     pub audio: Vec<FileAudioTrack>,
     pub subtitles: Vec<FileSubtitleTrack>,
+    pub chapters: Vec<FileChapter>,
+    /// Video frame rate (`docs/.tasks/99`), for the web player's libass `targetFps`. Absent
+    /// until the file has been (re)probed since V13.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub video_fps: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------

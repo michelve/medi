@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Semaphore};
 
 use medi_db::writes::{
-    self, AudioStreamWrite, FileOwner, FileStat, MediaFileWrite, SubtitleStreamWrite,
+    self, AudioStreamWrite, ChapterWrite, FileOwner, FileStat, MediaFileWrite, SubtitleStreamWrite,
 };
 use medi_db::Db;
 
@@ -223,7 +223,7 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
             // Acquire before spawning ffprobe so at most `concurrency` run at once.
             let _permit = permit_sem.acquire_owned().await.expect("semaphore open");
             match ffprobe::probe(&file.path).await {
-                Ok((data, audio, mut subtitles)) => {
+                Ok((data, audio, mut subtitles, chapters)) => {
                     // External sidecars (`docs/.tasks/90`) are discovered by filename next
                     // to the video and merged with the embedded subtitle tracks.
                     subtitles.extend(scanner::discover_sidecars(&file.path));
@@ -235,6 +235,7 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
                         hw_decode_unsupported = data.hw_decode_unsupported,
                         audio_tracks = audio.len(),
                         subtitle_tracks = subtitles.len(),
+                        chapters = chapters.len(),
                         "probed file",
                     );
                     // A successful probe clears any prior recorded failure for this path
@@ -243,7 +244,7 @@ pub async fn run_scan(db: &Db, cfg: &WorkerConfig, invalidate: &Invalidator) -> 
                     let path = file.path.to_string_lossy().into_owned();
                     let _ = clear_probe_failure(&probe_db, path).await;
                     // A closed receiver just means we're shutting down.
-                    let _ = tx.send(Probed { file, data, audio, subtitles }).await;
+                    let _ = tx.send(Probed { file, data, audio, subtitles, chapters }).await;
                 }
                 Err(err) => {
                     tracing::warn!(path = %file.path.display(), error = %err, "ffprobe failed; skipping");
@@ -328,13 +329,14 @@ async fn clear_probe_failure(db: &Db, path: String) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A probed file plus its parsed metadata (video row + audio tracks), on its way to the
-/// writer task.
+/// A probed file plus its parsed metadata (video row + audio/subtitle/chapter children), on
+/// its way to the writer task.
 struct Probed {
     file: DiscoveredFile,
     data: MediaFileWrite,
     audio: Vec<AudioStreamWrite>,
     subtitles: Vec<SubtitleStreamWrite>,
+    chapters: Vec<ChapterWrite>,
 }
 
 /// Diff discovered files against `scan_state`: keep only those never seen, changed
@@ -397,6 +399,8 @@ async fn write_one(db: &Db, probed: Probed) -> anyhow::Result<()> {
         // same transaction so a re-probe replaces each whole set atomically.
         writes::replace_audio_streams(&tx, media_file_id, &probed.audio)?;
         writes::replace_subtitle_streams(&tx, media_file_id, &probed.subtitles)?;
+        // Chapters (Task 99) — same atomic replace-on-reprobe contract.
+        writes::replace_chapters(&tx, media_file_id, &probed.chapters)?;
         writes::mark_probed(&tx, &path, now)?;
 
         tx.commit()?;
@@ -625,6 +629,7 @@ mod tests {
                 ..Default::default()
             }],
             subtitles: Vec::new(),
+            chapters: Vec::new(),
         }
     }
 
@@ -720,6 +725,7 @@ mod tests {
             },
             audio: Vec::new(),
             subtitles: Vec::new(),
+            chapters: Vec::new(),
         };
         write_one(&db, probed).await.unwrap();
 

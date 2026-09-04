@@ -8,7 +8,8 @@
       "@medi/ui/theme": ["../../packages/ui/src/theme"],
       "@medi/ui/types": ["../../packages/ui/src/types"],
       "@medi/player/usePlayerControls": ["../../packages/player/src/usePlayerControls"],
-      "@medi/player/trickplay": ["../../packages/player/src/trickplay"]
+      "@medi/player/trickplay": ["../../packages/player/src/trickplay"],
+      "@medi/player/chapters": ["../../packages/player/src/chapters"]
     }
   },
   "include": ["vite.config.ts", "src/**/*.ts", "src/**/*.tsx"]

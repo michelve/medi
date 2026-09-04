@@ -14,12 +14,14 @@
  * the resolved decision via callbacks so the page can attach controls.
  */
 
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { ApiError, type StreamDecision } from '@medi/api-client';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
+import { ApiError, type FileSubtitleTrack, type StreamDecision } from '@medi/api-client';
 import { useApi } from '../api';
 import { theme } from '../theme';
 import { Loading } from './Status';
 import { PlayerEventLog } from './PlayerEventLog';
+import { createSubtitleRenderer, type SubtitleRenderHandle } from '../lib/subtitles/renderer';
+import { cueCss } from '../lib/subtitleAppearance';
 import {
   PlayerDiagnostics,
   mediaErrorName,
@@ -37,6 +39,16 @@ export interface WebTextTrack {
   label: string;
   /** Show this track by default (a forced/default subtitle). */
   default?: boolean;
+}
+
+/** The selected caption track (`docs/.tasks/99`): the full track row plus its addressing id
+ * (`ext<id>` / `stream_index` string) and, for a plain-text track, its `<track>` src. */
+export interface ActiveSubtitle {
+  track: FileSubtitleTrack;
+  /** `ext<id>` or the `stream_index` as a string — for `/raw` + `/api/subtitles` URLs. */
+  id: string;
+  /** The WebVTT `<track>` src for a plain-text track; `null` for ASS/image (client-rendered). */
+  textTrackSrc: string | null;
 }
 
 export interface VideoPlayerProps {
@@ -80,6 +92,35 @@ export interface VideoPlayerProps {
    * are burned in server-side (via the stream decision) and never appear here.
    */
   textTracks?: WebTextTrack[];
+  /**
+   * The caption track to display (`docs/.tasks/99` A2). Since native `<video>` controls are off
+   * (the browser's caption menu is hidden), the player renders the selection itself:
+   *  - **plain text** (srt/vtt) → the matching `<track>`'s `mode` is set to `showing`
+   *  - **ASS/SSA** → libass-wasm client renderer (native-res styling, zero transcode)
+   *  - **image (PGS/VobSub)** → falls back to server burn-in via {@link onSubtitleBurnIn}
+   * `null`/`undefined` shows none.
+   */
+  activeSubtitle?: ActiveSubtitle | null;
+  /** Subtitle sync offset in seconds (`docs/.tasks/99` C5); applied to whichever renderer. */
+  subtitleOffsetSeconds?: number;
+  /** Video frame rate for libass `targetFps` (`docs/.tasks/99`); falls back to 24 when absent. */
+  videoFps?: number;
+  /** Viewer subtitle appearance (`docs/.tasks/99` C4) applied to the native `<track>` via a
+   * scoped `::cue` stylesheet. Omit to use the browser defaults. */
+  subtitleAppearance?: import('../lib/subtitleAppearance').SubtitleAppearance;
+  /**
+   * Called when the selected subtitle can only be shown by a server burn-in (an image track,
+   * or a libass failure). The parent sets {@link burnInSubtitle} to the track's `stream_index`
+   * in response, which re-resolves the stream with `sub`/`sub_burn`.
+   */
+  onSubtitleBurnIn?: (track: FileSubtitleTrack) => void;
+  /**
+   * Burn an image subtitle into the video (`docs/.tasks/99` C1 fallback): the embedded
+   * `stream_index` to burn, or `null`/`undefined` for none. Setting it re-resolves the stream
+   * with `sub`/`sub_burn` (a distinct transcode session), captures position, and re-seeks —
+   * the same switch mechanic as an audio-track change.
+   */
+  burnInSubtitle?: number | null;
   /**
    * Show the on-screen diagnostics event log below the player (default true). It logs the
    * stream decision, every hls.js event/error, and `<video>` state transitions — both to the
@@ -138,7 +179,7 @@ function mediaErrorMessage(err: MediaError | null): string {
   }
 }
 
-export function VideoPlayer({
+function VideoPlayerInner({
   fileId,
   onVideoRef,
   onDecision,
@@ -148,12 +189,27 @@ export function VideoPlayer({
   onSwitchingAudio,
   initialResumeMs,
   textTracks,
+  activeSubtitle,
+  subtitleOffsetSeconds = 0,
+  videoFps,
+  subtitleAppearance,
+  onSubtitleBurnIn,
+  burnInSubtitle,
   diagnostics = true,
   diagnosticsOpen = false,
   onDiagnostics,
 }: VideoPlayerProps) {
   const api = useApi();
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  // The live client-side subtitle renderer (libass/libbitsub), so the sync-offset effect can
+  // reach it without rebuilding (`docs/.tasks/99` C1/C5).
+  const rendererRef = useRef<SubtitleRenderHandle | null>(null);
+  // The subtitle offset (seconds) currently applied to native `<track>` cues, so a nudge shifts
+  // by the delta rather than re-shifting from the original times (`docs/.tasks/99` C5).
+  const appliedOffsetRef = useRef(0);
+  // Latest known video FPS (read at renderer creation without forcing an effect re-run).
+  const videoFpsRef = useRef(videoFps);
+  videoFpsRef.current = videoFps;
   // The playback position (ms) to restore once a freshly-attached source is ready — set when
   // an audio-track switch tears the current stream down, so the new track resumes in place.
   const resumeToRef = useRef<number | null>(null);
@@ -168,6 +224,11 @@ export function VideoPlayer({
   const prevAudioTrackRef = useRef<number | undefined>(audioTrack);
   // One diagnostics channel per mount — a fresh log for each file/session.
   const diag = useMemo(() => new PlayerDiagnostics(), []);
+  // A stable per-instance class so the `::cue` appearance stylesheet scopes to THIS video.
+  const cueScopeClass = useMemo(
+    () => `medi-cue-${Math.random().toString(36).slice(2, 10)}`,
+    [],
+  );
 
   // Hand the channel to a parent that wants to render the log itself.
   useEffect(() => {
@@ -181,6 +242,22 @@ export function VideoPlayer({
   // drives the re-resolve; the ref guards against looping (we only auto-fall-back once).
   const [forceTranscode, setForceTranscode] = useState(false);
   const didFallbackRef = useRef(false);
+
+  // Keep the latest callback / hint in refs so the decision effect can read them WITHOUT
+  // listing them in its dependency array. `onDecision` is an inline arrow recreated on every
+  // parent render, and `forceTranscodeForAudio` is recomputed from the parent's `baseMode`
+  // — and both change *as a result of* a resolved decision (the parent's `setBaseMode`). If
+  // they were deps, resolving a decision would re-run the effect and fire ANOTHER
+  // `/api/stream`, each one spinning up a fresh transcode session until the server's
+  // capacity cap trips (HTTP 409). Refs break that self-retriggering loop.
+  const onDecisionRef = useRef(onDecision);
+  onDecisionRef.current = onDecision;
+  const forceTranscodeForAudioRef = useRef(forceTranscodeForAudio);
+  forceTranscodeForAudioRef.current = forceTranscodeForAudio;
+  // The key of the decision request currently in flight or already resolved. Guards against a
+  // duplicate fetch for an identical request — chiefly React StrictMode's dev double-mount,
+  // which otherwise allocates two server sessions before the first abort lands.
+  const decisionKeyRef = useRef<string | null>(null);
 
   // Reset the one-shot fallback whenever we switch files.
   useEffect(() => {
@@ -198,46 +275,103 @@ export function VideoPlayer({
     }
   }
 
+  // Same position-capture for a burn-in subtitle *change* (`docs/.tasks/99` C1 fallback): a
+  // burn-in is a distinct transcode session, so we re-seek to the current spot after it attaches.
+  const prevBurnInRef = useRef<number | null | undefined>(burnInSubtitle);
+  if (prevBurnInRef.current !== burnInSubtitle) {
+    prevBurnInRef.current = burnInSubtitle;
+    const t = videoRef.current?.currentTime;
+    if (typeof t === 'number' && Number.isFinite(t) && t > 0) {
+      resumeToRef.current = Math.round(t * 1000);
+    }
+  }
+
   // 1) Resolve the stream decision (direct vs HLS) from the server. Re-runs on an
   // `audioTrack` switch too (the new source is a distinct transcode session).
   useEffect(() => {
+    // A burn-in subtitle (`docs/.tasks/99`) is an image sub the server renders into the video —
+    // it inherently requires a transcode. A non-default audio selection also can't be switched
+    // by a browser `<video>` on a direct stream, so both force the transcode path.
+    const burnIn = burnInSubtitle ?? null;
+    const force =
+      forceTranscode || burnIn != null || (audioTrack != null && forceTranscodeForAudioRef.current);
+    // Identity of this exact request. If it matches the one already in flight / resolved,
+    // don't fire again — this is what absorbs StrictMode's double-mount and any residual
+    // re-render, so one playback allocates exactly one transcode session.
+    const key = `${fileId}|${audioTrack ?? ''}|${force}|${burnIn ?? ''}|${attempt}`;
+    if (decisionKeyRef.current === key) return;
+    decisionKeyRef.current = key;
+
     const controller = new AbortController();
+    // Once the request resolves it "owns" the key for good; until then, an abort (StrictMode's
+    // unmount→remount, a fast fileId change) must release the key so the remount can re-issue
+    // it — otherwise the guard would skip the re-fetch and leave the player stuck loading.
+    let settled = false;
     const switching = resumeToRef.current !== null;
     setPhase({ kind: 'loading' });
     if (switching) onSwitchingAudio?.(true);
-    // A non-default audio selection can't be switched by a browser `<video>` on a direct
-    // stream — force the transcode path so the server maps the chosen track.
-    const force = forceTranscode || (audioTrack != null && forceTranscodeForAudio);
-    diag.info('decision', 'requesting /api/stream', { fileId, platform: 'web', forceTranscode: force, audioTrack, attempt });
+    diag.info('decision', 'requesting /api/stream', { fileId, platform: 'web', forceTranscode: force, audioTrack, burnIn, attempt });
     api
       // `platform: 'web'` selects the browser capability profile so the server transcodes
       // codecs a browser can't decode (HEVC / AC-3 / DTS) instead of handing back a direct
       // stream that would black-screen. `forceTranscode` is set by the fallback below after a
       // `direct` stream failed to play — it demands an HLS transcode hls.js can always play.
-      .stream(fileId, { platform: 'web', forceTranscode: force, audioTrack }, { signal: controller.signal })
+      // `sub`/`subBurn` (when set) ask the server to burn an image subtitle into the video.
+      .stream(
+        fileId,
+        {
+          platform: 'web',
+          forceTranscode: force,
+          audioTrack,
+          ...(burnIn != null ? { sub: burnIn, subBurn: true } : {}),
+        },
+        { signal: controller.signal },
+      )
       .then((decision) => {
         if (controller.signal.aborted) return;
+        settled = true;
         diag.info('decision', `resolved: ${decision.mode}`, decision);
-        onDecision?.(decision);
+        onDecisionRef.current?.(decision);
         setPhase({ kind: 'ready', decision });
       })
       .catch((err: unknown) => {
         if (controller.signal.aborted) return;
+        settled = true;
+        // A failed request must clear the in-flight key so the identical request can be
+        // retried (the Retry button also bumps `attempt`, but clearing here is belt-and-braces).
+        if (decisionKeyRef.current === key) decisionKeyRef.current = null;
         const busy = err instanceof ApiError && err.isBusy;
         const message = err instanceof ApiError ? err.message : String(err);
         diag.error('decision', 'stream request failed', { message, busy, status: err instanceof ApiError ? err.status : undefined });
         setPhase({ kind: 'error', message, busy });
         if (switching) onSwitchingAudio?.(false);
       });
-    return () => controller.abort();
-  }, [api, fileId, attempt, forceTranscode, audioTrack, forceTranscodeForAudio, onDecision, onSwitchingAudio, diag]);
+    return () => {
+      controller.abort();
+      // Aborted before it resolved → release the key so a remount re-issues the request.
+      if (!settled && decisionKeyRef.current === key) decisionKeyRef.current = null;
+    };
+  }, [api, fileId, attempt, forceTranscode, audioTrack, burnInSubtitle, onSwitchingAudio, diag]);
+
+  // The resolved decision, or null while loading/errored. Derived so the attach effect below
+  // can key on the decision's *identity* (its URL/mode) rather than the `phase` object
+  // reference — a re-resolve that yields the same stream must NOT tear down a working hls.js.
+  const decision = phase.kind === 'ready' ? phase.decision : null;
+  // A stable identity for the resolved stream: same mode+URL ⇒ same string ⇒ effect does not
+  // re-run ⇒ the existing hls.js instance keeps playing. For `direct`, the source is
+  // `directUrl(fileId)` (the decision carries no HLS url), so fold `fileId` in.
+  const decisionId = decision ? `${decision.mode}|${decision.url}|${fileId}` : null;
+  // Read the current decision inside the attach effect without listing `decision` (a new
+  // object each resolve) as a dep — the effect keys on `decisionId`, which fully determines it.
+  const decisionRef = useRef(decision);
+  decisionRef.current = decision;
 
   // 2) Attach the resolved source to the <video> (direct src / native HLS / hls.js).
   useEffect(() => {
-    if (phase.kind !== 'ready') return;
+    const decision = decisionRef.current;
+    if (!decision) return;
     const video = videoRef.current;
     if (!video) return;
-    const { decision } = phase;
 
     // Instrument the raw <video> element's own lifecycle for every attach path. These fire
     // regardless of direct/HLS and are the ground truth for "why is it a black screen".
@@ -344,17 +478,39 @@ export function VideoPlayer({
         diag.info('hls', 'MEDIA_ATTACHED → play()');
         void startPlayback(video);
       });
+      // Recover in place instead of tearing down (the jellyfin-web model,
+      // `htmlMediaHelper.js` ERROR handler): a fatal network/media error is usually transient
+      // — a warm-up 404 while ffmpeg writes the first segment, or an MSE buffer hiccup — and
+      // `startLoad()` / `recoverMediaError()` fix it WITHOUT a `destroy()`. A teardown here
+      // would clear the attach effect and re-resolve, spawning a brand-new transcode session,
+      // which is exactly the storm we're fixing. Only give up after a couple of failed
+      // recoveries, or on an error type hls.js can't recover from.
+      let recoveries = 0;
       hls.on(Hls.Events.ERROR, (_evt, data) => {
-        // Only fatal errors abort playback; hls.js recovers from the rest itself.
-        if (data.fatal) {
-          // A fatal HLS error on a *forced* transcode usually means the server couldn't
-          // produce the stream (e.g. ffmpeg unavailable) rather than a browser limitation —
-          // say so instead of blaming the browser.
-          const message = didFallbackRef.current
-            ? `Server transcode is unavailable (${data.details ?? data.type}). The file could not be converted for playback.`
-            : `Stream error (${data.type}). ${data.details ?? ''}`.trim();
-          setPhase({ kind: 'error', message, busy: false });
+        // Non-fatal errors are handled by hls.js itself.
+        if (!data.fatal) return;
+        if (recoveries < 3) {
+          if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            recoveries += 1;
+            diag.info('hls', 'fatal network error → startLoad()', { details: data.details, recoveries });
+            hls.startLoad();
+            return;
+          }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            recoveries += 1;
+            diag.info('hls', 'fatal media error → recoverMediaError()', { details: data.details, recoveries });
+            hls.recoverMediaError();
+            return;
+          }
         }
+        // Unrecoverable (or recovery budget exhausted). A fatal HLS error on a *forced*
+        // transcode usually means the server couldn't produce the stream (e.g. ffmpeg
+        // unavailable) rather than a browser limitation — say so instead of blaming the browser.
+        const message = didFallbackRef.current
+          ? `Server transcode is unavailable (${data.details ?? data.type}). The file could not be converted for playback.`
+          : `Stream error (${data.type}). ${data.details ?? ''}`.trim();
+        diag.error('hls', 'fatal, unrecoverable', { type: data.type, details: data.details, recoveries });
+        setPhase({ kind: 'error', message, busy: false });
       });
     });
     // Destroy the instance on unmount / re-resolve — the task's explicit requirement.
@@ -369,7 +525,125 @@ export function VideoPlayer({
         video.load();
       }
     };
-  }, [api, fileId, phase, diag, onSwitchingAudio]);
+  }, [api, fileId, decisionId, diag, onSwitchingAudio]);
+
+  // 3) Apply the caption selection (`docs/.tasks/99` A2/C1). Native `<video>` controls are off,
+  // so the in-player menu drives display. Three cases:
+  //   - a plain-text track → set the matching `<track>`'s `mode` to `showing`, others disabled
+  //   - an ASS/SSA (or image) track → build the client renderer (libass/libbitsub), disable
+  //     every `<track>`; an image track / libass failure calls back to burn-in
+  //   - nothing selected → all `<track>`s disabled, no client renderer
+  // `<track>` elements map to `video.textTracks` in DOM order == `textTracks` array order.
+  // Re-runs on selection change and after a (re)attach (decisionId) so a new source picks it up.
+  const activeTextTrackSrc = activeSubtitle?.textTrackSrc ?? null;
+  const clientRendered = activeSubtitle != null && activeSubtitle.textTrackSrc === null;
+  const activeSubKey = activeSubtitle ? `${activeSubtitle.id}|${activeSubtitle.textTrackSrc ?? ''}` : '';
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    // Native `<track>` modes (only relevant when a plain-text track is selected).
+    const tt = video.textTracks;
+    const applyModes = () => {
+      if (!textTracks) return;
+      for (let i = 0; i < textTracks.length && i < tt.length; i += 1) {
+        const wanted = !clientRendered && activeTextTrackSrc != null && textTracks[i]?.src === activeTextTrackSrc;
+        tt[i]!.mode = wanted ? 'showing' : 'disabled';
+      }
+    };
+    applyModes();
+    tt.addEventListener?.('addtrack', applyModes);
+    // A freshly (re)shown native track has original cue times, so the applied-offset baseline
+    // resets here; the offset effect below re-shifts from 0 for the new selection.
+    appliedOffsetRef.current = 0;
+
+    // Client renderer (ASS via libass; image → burn-in fallback).
+    let handle: SubtitleRenderHandle | null = null;
+    let disposed = false;
+    if (clientRendered && activeSubtitle) {
+      diag.info('subtitles', 'client render', { codec: activeSubtitle.track.codec, id: activeSubtitle.id });
+      void createSubtitleRenderer({
+        api,
+        fileId,
+        video,
+        track: activeSubtitle.track,
+        trackId: activeSubtitle.id,
+        offsetSeconds: subtitleOffsetSeconds,
+        videoFps: videoFpsRef.current,
+        onUnsupported: (reason) => {
+          diag.info('subtitles', 'client render unsupported → burn-in', { reason });
+          onSubtitleBurnIn?.(activeSubtitle.track);
+        },
+      })
+        .then((h) => {
+          if (disposed) {
+            h?.destroy();
+            return;
+          }
+          handle = h;
+          rendererRef.current = h;
+        })
+        .catch((err: unknown) => {
+          diag.error('subtitles', 'renderer failed', { message: String(err) });
+          onSubtitleBurnIn?.(activeSubtitle.track);
+        });
+    }
+
+    return () => {
+      disposed = true;
+      tt.removeEventListener?.('addtrack', applyModes);
+      handle?.destroy();
+      if (rendererRef.current === handle) rendererRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, fileId, activeSubKey, textTracks, decisionId]);
+
+  // Apply the sync offset (`docs/.tasks/99` C5). A live client renderer (libass) takes an
+  // absolute offset. For a native `<track>` we shift each cue's start/end by the DELTA from the
+  // last-applied offset (tracked in `appliedOffsetRef`) so repeated nudges accumulate correctly.
+  // Maintain a scoped `::cue` stylesheet for the viewer's subtitle appearance (`docs/.tasks/99`
+  // C4). One `<style>` per player instance, updated in place when the settings change.
+  useEffect(() => {
+    if (!subtitleAppearance) return;
+    const el = document.createElement('style');
+    el.textContent = cueCss(subtitleAppearance, `video.${cueScopeClass}`);
+    document.head.appendChild(el);
+    return () => {
+      el.remove();
+    };
+  }, [subtitleAppearance, cueScopeClass]);
+
+  useEffect(() => {
+    // Client renderer: absolute offset.
+    rendererRef.current?.setOffset(subtitleOffsetSeconds);
+
+    // Native <track>: shift the showing track's cues by the delta.
+    const video = videoRef.current;
+    const delta = subtitleOffsetSeconds - appliedOffsetRef.current;
+    if (video && delta !== 0) {
+      const tt = video.textTracks;
+      // Firefox keeps an already-active cue displayed at its old time after a start/end edit;
+      // toggling the track's mode forces it to re-evaluate active cues. Harmless on Chromium.
+      const isFirefox = /firefox/i.test(navigator.userAgent);
+      for (let i = 0; i < tt.length; i += 1) {
+        const track = tt[i];
+        if (track && track.mode === 'showing' && track.cues) {
+          for (let c = 0; c < track.cues.length; c += 1) {
+            const cue = track.cues[c];
+            if (cue) {
+              cue.startTime = Math.max(0, cue.startTime + delta);
+              cue.endTime = Math.max(0, cue.endTime + delta);
+            }
+          }
+          if (isFirefox) {
+            track.mode = 'hidden';
+            track.mode = 'showing';
+          }
+        }
+      }
+    }
+    appliedOffsetRef.current = subtitleOffsetSeconds;
+  }, [subtitleOffsetSeconds]);
 
   const setRef = (el: HTMLVideoElement | null) => {
     videoRef.current = el;
@@ -392,6 +666,7 @@ export function VideoPlayer({
     >
       <video
         ref={setRef}
+        className={cueScopeClass}
         style={{
           width: '100%',
           height: '100%',
@@ -437,7 +712,9 @@ export function VideoPlayer({
         // Controls come from PlayerControls; keep the native ones off.
       >
         {/* Text subtitles as WebVTT tracks (`docs/.tasks/90`). `kind="subtitles"` needs a
-            `srclang`; the browser's own caption menu toggles them. */}
+            `srclang`. Native controls are off, so the in-player caption menu (`99` A2) drives
+            each track's `mode` via effect (3) above — we deliberately DON'T set the `default`
+            attribute here (it would make the browser auto-show a track and fight that effect). */}
         {textTracks?.map((t) => (
           <track
             key={t.src}
@@ -445,7 +722,6 @@ export function VideoPlayer({
             src={t.src}
             srcLang={t.srclang}
             label={t.label}
-            default={t.default}
           />
         ))}
       </video>
@@ -492,6 +768,13 @@ export function VideoPlayer({
     </>
   );
 }
+
+/**
+ * Memoized so a parent re-render (e.g. PlayerPage's overlay show/hide, `setBaseMode`,
+ * `switchingAudio`) does NOT re-run the player and its effects. Combined with the parent
+ * passing a stable `onDecision`, this is what keeps one playback to one transcode session.
+ */
+export const VideoPlayer = memo(VideoPlayerInner);
 
 const overlayCenter: React.CSSProperties = {
   position: 'absolute',

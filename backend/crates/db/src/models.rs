@@ -125,7 +125,8 @@ impl Episode {
 }
 
 /// A row of `media_files`. Belongs to exactly one movie OR one episode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `frame_rate: Option<f64>` (Task 99) means no `Eq` (f64 isn't `Eq`); `PartialEq` is enough.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MediaFile {
     pub id: i64,
     pub movie_id: Option<i64>,
@@ -150,6 +151,8 @@ pub struct MediaFile {
     pub dv_bl_compatible_id: Option<i64>,
     pub dv_level: Option<i64>,
     pub hw_decode_unsupported: bool,
+    /// Video frame rate (Task 99) — for the web player's libass `targetFps`. NULL until probed.
+    pub frame_rate: Option<f64>,
     /// Audio tracks of this file (Task 70). A child table, not `media_files` columns —
     /// a file is 1:N in audio. Empty when unprobed or read without the audio join;
     /// [`MediaFile::from_row`] leaves it empty and the query layer fills it in.
@@ -160,6 +163,10 @@ pub struct MediaFile {
     /// without the subtitle join; the query layer fills it in.
     #[serde(default)]
     pub subtitle_streams: Vec<SubtitleStream>,
+    /// Embedded chapter markers of this file (Task 99). A child table, 1:N like the stream
+    /// lists. Empty when unprobed or read without the chapter join; the query layer fills it.
+    #[serde(default)]
+    pub chapters: Vec<Chapter>,
 }
 
 impl MediaFile {
@@ -188,8 +195,10 @@ impl MediaFile {
             dv_level: row.get(18)?,
             // stored as 0/1
             hw_decode_unsupported: row.get::<_, i64>(19)? != 0,
+            frame_rate: row.get(20)?,
             audio_streams: Vec::new(),
             subtitle_streams: Vec::new(),
+            chapters: Vec::new(),
         })
     }
 
@@ -318,6 +327,35 @@ impl SubtitleStream {
             is_forced: row.get::<_, i64>(8)? != 0,
             is_external: row.get::<_, i64>(9)? != 0,
             external_path: row.get(10)?,
+        })
+    }
+}
+
+/// A row of `chapters` — one embedded chapter marker of a media file (Task 99).
+///
+/// `ordinal` is the 0-based order; `start_ms`/`end_ms` are milliseconds. `end_ms` may be
+/// `None` (some files omit chapter end times — the player bounds a chapter by the next
+/// chapter's `start_ms` then). `title` is the chapter name, may be `None`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Chapter {
+    pub id: i64,
+    pub media_file_id: i64,
+    pub ordinal: i64,
+    pub start_ms: i64,
+    pub end_ms: Option<i64>,
+    pub title: Option<String>,
+}
+
+impl Chapter {
+    /// Column order: id, media_file_id, ordinal, start_ms, end_ms, title.
+    pub fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            media_file_id: row.get(1)?,
+            ordinal: row.get(2)?,
+            start_ms: row.get(3)?,
+            end_ms: row.get(4)?,
+            title: row.get(5)?,
         })
     }
 }
@@ -652,7 +690,8 @@ impl ScanState {
 /// extensions) its trailers + franchise collection. The **other** in-library movies of the
 /// collection are assembled and shaped by the API layer (as poster tiles), not here. Backs
 /// `GET /api/movies/:id` (see `02-api-contract.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: embeds `Vec<MediaFile>`, which carries `frame_rate: f64` (Task 99).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MovieDetail {
     #[serde(flatten)]
     pub movie: Movie,
@@ -676,7 +715,8 @@ pub struct MovieDetail {
 /// same shape `MovieDetail` uses. Carrying the files here lets the web/TV clients play
 /// an episode directly (Task 82): the primary file's `id` is the `file_id` handed to
 /// `GET /api/stream/:file_id`. Empty until the episode's file is ingested/probed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: embeds `Vec<MediaFile>` (carries `frame_rate: f64`, Task 99).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EpisodeWithFiles {
     #[serde(flatten)]
     pub episode: Episode,
@@ -684,7 +724,8 @@ pub struct EpisodeWithFiles {
 }
 
 /// A season together with its ordered episodes (each with its media files).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: transitively embeds `MediaFile` (carries `frame_rate: f64`, Task 99).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeasonWithEpisodes {
     #[serde(flatten)]
     pub season: Season,
@@ -693,7 +734,8 @@ pub struct SeasonWithEpisodes {
 
 /// Full series detail: the series plus its seasons/episodes and billed credits.
 /// Backs `GET /api/series/:id` (see `02-api-contract.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// No `Eq`: transitively embeds `MediaFile` (carries `frame_rate: f64`, Task 99).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SeriesDetail {
     #[serde(flatten)]
     pub series: Series,

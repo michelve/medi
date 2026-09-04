@@ -1,6 +1,23 @@
 # 99 — Subtitles (in-player) & Chapters
 
-> **Status: SPEC (not started).** New web-player phase. Depends on
+> **Status: IN PROGRESS.** Revised for production readiness after studying jellyfin-web:
+> subtitles render **client-side** (libass-wasm for ASS/SSA, libbitsub for PGS/VobSub) with
+> server **burn-in as a fallback** — this costs zero transcode sessions, switches instantly,
+> and renders at native resolution (burn-in doesn't scale — every styled/image sub would eat a
+> GPU session). Plain SRT/VTT stays native `<track>`. All four enhancements are in scope
+> (persist+auto-select, appearance, chapter nav+keyboard, sync/offset).
+>
+> **Shipped:** chapters end-to-end (ffprobe→V12→`/api/files/:id`, scrub ticks + hover names +
+> prev/next + PageUp/PageDown); caption menu (Off/text/ASS/image, Forced/Default/SDH badges)
+> with programmatic `<track>` selection; persist + cross-episode auto-select; raw subtitle +
+> font endpoints (`/api/subtitles/:id/:index/raw`, `/api/files/:id/fonts[/:name]`); libass-wasm
+> ASS rendering; subtitle sync (`g`/`h` + indicator) for both render paths.
+> **Remaining:** libbitsub image rendering + a working burn-in fallback re-request (Phase 5);
+> subtitle appearance panel (deferred). See the tracking checklist in the plan.
+>
+> Original spec below (kept for reference; A1 deep-link loading was already done in `97`).
+>
+> New web-player phase. Depends on
 > `90-format-coverage-and-subtitles.md` (the subtitle subsystem: `subtitle_streams` V5,
 > `/api/subtitles/...`, image-sub burn-in), `97-web-player-shell-and-controls.md` (the control
 > bar + `GET /api/files/:id`), and `20`/ingest for the ffprobe pass.

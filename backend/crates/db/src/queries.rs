@@ -12,8 +12,8 @@
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::models::{
-    AudioStream, Credit, Episode, EpisodeWithFiles, LibraryCard, MediaFile, Movie, MovieDetail,
-    Season, SeasonWithEpisodes, Series, SeriesDetail, SubtitleStream, TrickplayAsset,
+    AudioStream, Chapter, Credit, Episode, EpisodeWithFiles, LibraryCard, MediaFile, Movie,
+    MovieDetail, Season, SeasonWithEpisodes, Series, SeriesDetail, SubtitleStream, TrickplayAsset,
 };
 use crate::{DbError, DbResult};
 
@@ -28,7 +28,7 @@ pub const MEDIA_FILE_COLUMNS: &str = "\
     id, movie_id, episode_id, path, container, size_bytes, duration_ms, \
     video_codec, video_profile, width, height, bit_depth, bitrate, \
     transfer_characteristics, color_space, hdr_type, \
-    dv_profile, dv_bl_compatible_id, dv_level, hw_decode_unsupported";
+    dv_profile, dv_bl_compatible_id, dv_level, hw_decode_unsupported, frame_rate";
 
 /// Column list for the series catalog rows (also the shared head of the movie list).
 const CATALOG_COLUMNS: &str =
@@ -688,12 +688,30 @@ pub fn get_subtitle_streams(
     Ok(rows)
 }
 
-/// Attach each file's `audio_streams` and `subtitle_streams` child rows (Tasks 70 / 90).
-/// Kept in one place so every path that hydrates a `MediaFile` returns both track lists.
+/// Explicit `chapters` column list, in the order [`Chapter::from_row`] reads (Task 99).
+const CHAPTER_COLUMNS: &str = "id, media_file_id, ordinal, start_ms, end_ms, title";
+
+/// All chapter markers of a media file, ordered by `ordinal` (Task 99). Empty when the file
+/// has no chapters or was probed before Task 99. Uses `idx_chapters_file`.
+pub fn chapters_for(conn: &Connection, media_file_id: i64) -> DbResult<Vec<Chapter>> {
+    let sql = format!(
+        "SELECT {CHAPTER_COLUMNS} FROM chapters WHERE media_file_id = ?1 ORDER BY ordinal"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params![media_file_id], Chapter::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Attach each file's `audio_streams`, `subtitle_streams`, and `chapters` child rows
+/// (Tasks 70 / 90 / 99). Kept in one place so every path that hydrates a `MediaFile` returns
+/// all child lists.
 fn attach_audio_streams(conn: &Connection, mut files: Vec<MediaFile>) -> DbResult<Vec<MediaFile>> {
     for f in &mut files {
         f.audio_streams = get_audio_streams(conn, f.id)?;
         f.subtitle_streams = get_subtitle_streams(conn, f.id)?;
+        f.chapters = chapters_for(conn, f.id)?;
     }
     Ok(files)
 }
@@ -741,6 +759,7 @@ pub fn get_media_file(conn: &Connection, id: i64) -> DbResult<MediaFile> {
         .ok_or(DbError::NotFound)?;
     file.audio_streams = get_audio_streams(conn, file.id)?;
     file.subtitle_streams = get_subtitle_streams(conn, file.id)?;
+    file.chapters = chapters_for(conn, file.id)?;
     Ok(file)
 }
 

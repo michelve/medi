@@ -13,6 +13,8 @@
 
 import { useRef, useState } from 'react';
 import { tileForPosition, type TrickplayMeta } from '@medi/player/trickplay';
+import type { FileChapter } from '@medi/api-client';
+import { chapterAt } from '@medi/player/chapters';
 import { theme } from '../theme';
 
 export interface ScrubBarProps {
@@ -22,9 +24,11 @@ export interface ScrubBarProps {
   onSeek: (positionMs: number) => void;
   /** Mosaic URL + grid geometry; undefined ⇒ plain bar, no thumbnails. */
   trickplay?: TrickplayMeta;
+  /** Embedded chapters (`docs/.tasks/99`): ticks on the track + name in the hover bubble. */
+  chapters?: FileChapter[];
 }
 
-export function ScrubBar({ positionMs, durationMs, onSeek, trickplay }: ScrubBarProps) {
+export function ScrubBar({ positionMs, durationMs, onSeek, trickplay, chapters }: ScrubBarProps) {
   const trackRef = useRef<HTMLDivElement | null>(null);
   // Hover position in ms (for the thumbnail), and its x within the track (for placement).
   const [hover, setHover] = useState<{ ms: number; x: number } | null>(null);
@@ -40,6 +44,10 @@ export function ScrubBar({ positionMs, durationMs, onSeek, trickplay }: ScrubBar
   };
 
   const tile = hover && trickplay ? tileForPosition(trickplay, hover.ms) : null;
+  // The chapter under the hover point, for a label above the thumbnail (or above the bar when
+  // there's no trickplay sheet). Only meaningful when the title actually has chapters.
+  const hoverChapter =
+    hover && chapters && chapters.length > 0 ? chapterAt(chapters, hover.ms) : null;
 
   return (
     <div style={{ position: 'relative', width: '100%' }}>
@@ -62,6 +70,35 @@ export function ScrubBar({ positionMs, durationMs, onSeek, trickplay }: ScrubBar
             pointerEvents: 'none',
           }}
         />
+      )}
+      {/* Chapter name above the hovered point — sits over the thumbnail when there is one, or
+          just above the bar otherwise. `textContent` via a child string is XSS-safe in React. */}
+      {hoverChapter?.title && hover && (
+        <div
+          style={{
+            position: 'absolute',
+            bottom: tile ? 20 + tile.height + 6 : 20,
+            left: hover.x,
+            transform: 'translateX(-50%)',
+            maxWidth: 240,
+            padding: '4px 10px',
+            borderRadius: 8,
+            background: 'rgba(20,20,24,0.82)',
+            backdropFilter: 'blur(12px)',
+            WebkitBackdropFilter: 'blur(12px)',
+            border: '1px solid rgba(255,255,255,0.12)',
+            color: '#fff',
+            fontSize: 12,
+            fontWeight: 500,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            pointerEvents: 'none',
+            boxShadow: '0 4px 16px rgba(0,0,0,0.5)',
+          }}
+        >
+          {hoverChapter.title}
+        </div>
       )}
       <div
         ref={trackRef}
@@ -87,6 +124,29 @@ export function ScrubBar({ positionMs, durationMs, onSeek, trickplay }: ScrubBar
             background: theme.colors.accent,
           }}
         />
+        {/* Chapter ticks (`docs/.tasks/99`): a small mark at each chapter start (skipping the
+            0ms opening edge). Watched ticks (before the playhead) dim; unwatched stay bright. */}
+        {durationMs > 0 &&
+          chapters?.map((c) =>
+            c.start_ms <= 0 || c.start_ms >= durationMs ? null : (
+              <div
+                key={c.ordinal}
+                aria-hidden
+                style={{
+                  position: 'absolute',
+                  top: 0,
+                  bottom: 0,
+                  left: `${(c.start_ms / durationMs) * 100}%`,
+                  width: 2,
+                  marginLeft: -1,
+                  borderRadius: 1,
+                  background:
+                    c.start_ms <= positionMs ? 'rgba(255,255,255,0.45)' : 'rgba(255,255,255,0.85)',
+                  pointerEvents: 'none',
+                }}
+              />
+            ),
+          )}
       </div>
     </div>
   );

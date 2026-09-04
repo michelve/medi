@@ -168,6 +168,13 @@ impl AppConfig {
         self.config_dir.join("subs")
     }
 
+    /// Directory holding raw subtitle extracts and dumped font attachments (`docs/.tasks/99`).
+    /// Client-side subtitle rendering needs the ORIGINAL bytes (ASS/SSA, PGS, VobSub) plus the
+    /// file's embedded fonts; both are extracted here (jellyfin-ffmpeg) and served from cache.
+    pub fn subs_raw_dir(&self) -> PathBuf {
+        self.config_dir.join("subs-raw")
+    }
+
     /// Whether `hour` (0–23, local) falls inside the configured off-peak window during
     /// which the background assets worker may run (`docs/.tasks/30` §Off-peak).
     ///
