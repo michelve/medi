@@ -22,7 +22,8 @@ pub mod tmdb;
 
 pub use enrich::{
     backfill_genres_people, candidates_for, enrich_movie, enrich_series, enrich_with_id,
-    BackfillReport, EnrichContext, EnrichOutcome, HttpFetcher, ImageFetcher,
+    movie_recommendations, BackfillReport, EnrichContext, EnrichOutcome, HttpFetcher,
+    ImageFetcher,
 };
 pub use fanart::{
     parse_movie_logo, parse_movie_wallpaper, FanartArt, FanartClient, MovieArt,

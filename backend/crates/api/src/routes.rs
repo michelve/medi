@@ -490,7 +490,32 @@ pub fn spawn_backfill(
     if !already_running {
         let flag = state.backfill_running.clone();
         let cache = state.cache.clone();
+        let db = state.db.clone();
+        let status = state.status.clone();
         tokio::spawn(async move {
+            // First, drain the *pending match* backlog: the same enrichment pass a scan runs,
+            // covering titles never matched (e.g. imported before a scan finished draining, or
+            // whose earlier pass stalled). `backfill_genres_people` below only re-touches
+            // already-`matched` titles, so without this a pending title would never get matched
+            // from a manual/periodic backfill — only from a scan or restart. Idempotent
+            // (matched/unmatched rows are skipped), so this is cheap once the library is fully
+            // enriched. Best-effort: a failure is logged, then the genre/art backfill still runs.
+            let invalidate: medi_ingest::Invalidator = {
+                let cache = cache.clone();
+                std::sync::Arc::new(move || cache.invalidate_all())
+            };
+            if let Err(err) = medi_ingest::run_enrichment(
+                &db,
+                &ctx,
+                BACKFILL_ENRICH_CONCURRENCY,
+                &invalidate,
+                status.as_ref(),
+            )
+            .await
+            {
+                tracing::error!(error = %err, "pending-title sweep during backfill failed");
+            }
+
             match medi_metadata::backfill_genres_people(&ctx, force).await {
                 Ok(report) => {
                     tracing::info!(
@@ -512,6 +537,11 @@ pub fn spawn_backfill(
     }
     already_running
 }
+
+/// Concurrency for the pending-title enrichment sweep run from a backfill — mirrors the
+/// worker's `enrich_concurrency` default (`WorkerConfig`), a small multiple that respects the
+/// provider's rate limits during a large drain.
+const BACKFILL_ENRICH_CONCURRENCY: usize = 4;
 
 // ---------------------------------------------------------------------------
 // GET /api/movies/:id  and  GET /api/series/:id
@@ -537,6 +567,10 @@ async fn movie_detail(
 
     let key = format!("movie/{id}");
     let db = state.db.clone();
+    // The provider (if configured) drives the "More like this" fallback; captured so the
+    // render closure can do a best-effort recommendations fetch. Cloned out of the borrow so
+    // it can move into the async closure alongside `db`.
+    let enrich = state.enrich.clone();
     state
         .cache
         .get_or_render(key, &headers, move || async move {
@@ -551,9 +585,38 @@ async fn movie_detail(
                 Ok((detail, cards))
             })
             .await?;
+
+            // "More like this" fallback: only when the Collection row is empty (standalone
+            // movie, or a franchise with no other in-library entry). Best-effort — a missing
+            // provider or a failed provider call yields an empty row, never a 500. One extra
+            // TMDB call per uncached detail load, amortized by this ETag cache.
+            let more_like_this = if collection_cards.is_empty() {
+                let rec_ids = match &enrich {
+                    Some(ctx) => medi_metadata::movie_recommendations(ctx, id)
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                };
+                if rec_ids.is_empty() {
+                    Vec::new()
+                } else {
+                    let db = db.clone();
+                    run_blocking(&db, move |conn| {
+                        queries::movies_by_tmdb_ids(conn, &rec_ids, id, MORE_LIKE_THIS_LIMIT)
+                    })
+                    .await?
+                }
+            } else {
+                Vec::new()
+            };
+
             let body = crate::dto::MovieDetailResponse {
                 detail,
                 collection_movies: collection_cards
+                    .into_iter()
+                    .map(LibraryItem::from_card)
+                    .collect(),
+                more_like_this: more_like_this
                     .into_iter()
                     .map(LibraryItem::from_card)
                     .collect(),
@@ -562,6 +625,10 @@ async fn movie_detail(
         })
         .await
 }
+
+/// Cap on the movie-detail "More like this" fallback row — enough to fill a scroll row
+/// without over-fetching (matches the client's row rendering).
+const MORE_LIKE_THIS_LIMIT: u32 = 12;
 
 /// Series detail: series + seasons + episodes + credits. Cached with ETag.
 ///

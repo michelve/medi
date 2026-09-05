@@ -326,6 +326,12 @@ export interface MovieDetail extends Movie {
   trailers: Trailer[];
   collection: Collection | null;
   collection_movies: LibraryItem[];
+  /**
+   * In-library movies the provider recommends for this one, in relevance order — the "More
+   * like this" fallback row. Only populated when there is no Collection row to show (a
+   * standalone movie, or a franchise with no other in-library entry); empty otherwise.
+   */
+  more_like_this: LibraryItem[];
   /** Genres this movie belongs to, in name order. Empty when unmatched. */
   genres: Genre[];
 }

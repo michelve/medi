@@ -188,6 +188,26 @@ pub async fn candidates_for(
     ctx.provider.search(&query, year, media_kind).await
 }
 
+/// The provider's recommended **movie** tmdb ids for an in-library movie (by internal id),
+/// in relevance order — backs the detail page's "More like this" row. Reads the movie's
+/// stored `tmdb_id`; returns an empty list (never an error to the caller's row) when the movie
+/// is unmatched / has no TMDB linkage. Read-only: no DB writes, no downloads. The caller
+/// filters these ids to the local library, so ids for unowned titles are harmless.
+pub async fn movie_recommendations(ctx: &EnrichContext, movie_id: i64) -> Result<Vec<i64>> {
+    let tmdb_id = db_read(&ctx.db, move |conn| {
+        medi_db::queries::get_title_tmdb_id(conn, TitleKind::Movie, movie_id)
+    })
+    .await?;
+    let Some(tmdb_id) = tmdb_id else {
+        return Ok(Vec::new());
+    };
+    let provider_id = ProviderId::Tmdb {
+        id: tmdb_id,
+        kind: MediaKind::Movie,
+    };
+    ctx.provider.recommendations(&provider_id).await
+}
+
 /// Enrich a title against a specific, already-chosen provider id — the shared body of an
 /// auto-match and a manual `POST /api/movies/:id/match`. Fetches details, downloads
 /// artwork atomically, writes the row, and returns the outcome.

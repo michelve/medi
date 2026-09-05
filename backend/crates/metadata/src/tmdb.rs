@@ -173,6 +173,31 @@ impl MetadataProvider for TmdbProvider {
         let profile_base = self.profile_base().await;
         Ok(Some(parse_person(&json, person_tmdb_id, &profile_base)))
     }
+
+    async fn recommendations(&self, id: &ProviderId) -> Result<Vec<i64>> {
+        // Movie-only: the "More like this" row is on the movie detail page. A TV/OMDb id or a
+        // bare IMDb id has no TMDB movie recommendations endpoint we use → empty (not fatal).
+        let tmdb_id = match id {
+            ProviderId::Tmdb { id, kind: MediaKind::Movie } => *id,
+            _ => return Ok(Vec::new()),
+        };
+        // `/movie/{id}/recommendations` is TMDB's curated "recommended" list; fall back to the
+        // broader `/similar` list when it comes back empty.
+        let recs = self
+            .get(&format!("/movie/{tmdb_id}/recommendations"), &[])
+            .await
+            .map(|v| parse_recommendations(&v))
+            .unwrap_or_default();
+        if !recs.is_empty() {
+            return Ok(recs);
+        }
+        let similar = self
+            .get(&format!("/movie/{tmdb_id}/similar"), &[])
+            .await
+            .map(|v| parse_recommendations(&v))
+            .unwrap_or_default();
+        Ok(similar)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +426,20 @@ pub fn parse_trailers(v: &Value) -> Vec<TrailerIn> {
         .collect();
     ranked.sort_by_key(|(rank, _)| *rank);
     ranked.into_iter().map(|(_, t)| t).collect()
+}
+
+/// Extract the movie ids from a `/movie/{id}/recommendations` (or `/similar`) response's
+/// `results: [{ id, ... }]` array, preserving TMDB's relevance order. Ids missing/malformed
+/// are skipped; an absent `results` block yields an empty list. The caller filters these to
+/// the local library, so returning ids for titles the user doesn't own is harmless.
+pub fn parse_recommendations(v: &Value) -> Vec<i64> {
+    let Some(results) = v.get("results").and_then(|r| r.as_array()) else {
+        return Vec::new();
+    };
+    results
+        .iter()
+        .filter_map(|r| r.get("id").and_then(|i| i.as_i64()))
+        .collect()
 }
 
 /// Extract the top-level `genres: [{id, name}]` array from a `/movie/{id}` or `/tv/{id}`
@@ -692,6 +731,23 @@ mod tests {
         assert_eq!(g.len(), 1);
         assert_eq!(g[0].tmdb_id, 28);
         assert_eq!(g[0].name, "Action");
+    }
+
+    #[test]
+    fn parse_recommendations_extracts_ids_in_order() {
+        let resp = json!({
+            "results": [
+                { "id": 10138, "title": "Iron Man 2" },
+                { "id": 68721, "title": "Iron Man 3" },
+                { "title": "No Id" },
+                { "id": 1726, "title": "Iron Man" }
+            ]
+        });
+        // Ids preserved in order; the id-less entry is skipped.
+        assert_eq!(parse_recommendations(&resp), vec![10138, 68721, 1726]);
+        // Absent / empty results → empty.
+        assert!(parse_recommendations(&json!({})).is_empty());
+        assert!(parse_recommendations(&json!({ "results": [] })).is_empty());
     }
 
     #[test]

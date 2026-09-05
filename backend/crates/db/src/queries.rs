@@ -219,6 +219,57 @@ pub fn collection_movies(conn: &Connection, collection_id: i64, exclude_movie_id
     Ok(rows)
 }
 
+/// The in-library movies whose `tmdb_id` is one of `tmdb_ids` (the given movie excluded),
+/// as [`LibraryCard`]s — backs the detail page's "More like this" fallback row (provider
+/// recommendations filtered to what the user actually owns). Rows are returned in the same
+/// order as `tmdb_ids` (the provider's relevance order), capped at `limit`. An empty
+/// `tmdb_ids` yields an empty result with no query.
+pub fn movies_by_tmdb_ids(
+    conn: &Connection,
+    tmdb_ids: &[i64],
+    exclude_movie_id: i64,
+    limit: u32,
+) -> DbResult<Vec<LibraryCard>> {
+    if tmdb_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = clamp_limit(limit);
+    // Build `?1,?2,…` placeholders for the IN clause, and a matching CASE that maps each
+    // tmdb_id back to its position so results keep the provider's relevance order.
+    let placeholders = (1..=tmdb_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let order_case = tmdb_ids
+        .iter()
+        .enumerate()
+        .map(|(pos, _)| format!("WHEN ?{} THEN {pos}", pos + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let select = library_select(0, "movies", "mf.movie_id = t.id");
+    // `?{exclude}` and `?{limit}` follow the tmdb-id params.
+    let exclude_idx = tmdb_ids.len() + 1;
+    let limit_idx = tmdb_ids.len() + 2;
+    let sql = format!(
+        "SELECT kind_tag, id, title, sort_title, year, added_at, poster_path, hdr, tmdb_id \
+         FROM ( {select} WHERE t.tmdb_id IN ({placeholders}) AND t.id != ?{exclude_idx} ) \
+         ORDER BY CASE tmdb_id {order_case} ELSE {} END \
+         LIMIT ?{limit_idx}",
+        tmdb_ids.len()
+    );
+    let mut params: Vec<&dyn rusqlite::ToSql> = tmdb_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
+    params.push(&exclude_movie_id);
+    params.push(&limit);
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt
+        .query_map(params.as_slice(), LibraryCard::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 // ---------------------------------------------------------------------------
 // Unified library (movies + series) — backs GET /api/library
 // ---------------------------------------------------------------------------

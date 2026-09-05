@@ -327,8 +327,10 @@ pub struct LibraryRows {
 
 /// `GET /api/movies/:id` response (Task 91 detail extensions): the DB movie detail (which
 /// carries the movie row, files, credits, trailers, and collection) plus the collection's
-/// **other** in-library movies as poster tiles. The DB `MovieDetail` is flattened in, so the
-/// existing fields keep their positions; `collection_movies` is the only added key.
+/// **other** in-library movies as poster tiles, and — when there is no collection row to show
+/// — a "More like this" fallback of provider-recommended movies filtered to the local library.
+/// The DB `MovieDetail` is flattened in, so the existing fields keep their positions;
+/// `collection_movies` and `more_like_this` are the added keys.
 #[derive(Debug, Serialize)]
 pub struct MovieDetailResponse {
     #[serde(flatten)]
@@ -336,6 +338,11 @@ pub struct MovieDetailResponse {
     /// The other in-library movies of this movie's franchise (this movie excluded), newest
     /// first — the "Collection" row. Empty when standalone.
     pub collection_movies: Vec<LibraryItem>,
+    /// In-library movies the provider recommends for this one, in relevance order — the "More
+    /// like this" fallback row. Only populated when the Collection row is empty (a standalone
+    /// movie, or a franchise with no other in-library entry); empty otherwise or when the
+    /// provider has no recommendations we own / is unavailable.
+    pub more_like_this: Vec<LibraryItem>,
 }
 
 /// `GET /api/people/:id` — a person page (`docs/.tasks/91` Phase B): the enriched person

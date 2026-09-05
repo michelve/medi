@@ -187,6 +187,17 @@ pub trait MetadataProvider: Send + Sync {
         let _ = person_tmdb_id;
         Ok(None)
     }
+
+    /// Fetch the provider's recommended/similar **movie** ids for a title — used to build the
+    /// detail page's "More like this" row (filtered to the local library by the caller). The
+    /// returned ids are provider ids (TMDB movie ids); order is the provider's own relevance
+    /// order. Best-effort: the caller treats an `Err` as "no recommendations", never fatal.
+    /// The default returns an empty list for providers without a recommendations endpoint
+    /// (OMDb).
+    async fn recommendations(&self, id: &ProviderId) -> Result<Vec<i64>> {
+        let _ = id;
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]

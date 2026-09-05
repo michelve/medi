@@ -266,3 +266,36 @@ fn continue_watching_orders_joins_and_excludes() {
     let after: Vec<i64> = queries::list_continue_watching(&conn, 50).unwrap().iter().map(|i| i.file_id).collect();
     assert_eq!(after, vec![104, 100]);
 }
+
+/// `movies_by_tmdb_ids` returns only in-library movies whose `tmdb_id` matches, excludes the
+/// given movie, preserves the input (relevance) order, and caps at `limit` — backs the detail
+/// page's "More like this" recommendations row.
+#[test]
+fn movies_by_tmdb_ids_filters_orders_and_excludes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("library.db");
+    let db = medi_db::open(&path, 2).unwrap();
+    let conn = db.conn().unwrap();
+
+    conn.execute_batch(
+        "INSERT INTO movies (id, tmdb_id, title, sort_title, added_at, metadata_state) VALUES \
+            (1, 1726,  'Iron Man',   'iron man',   100, 'matched'), \
+            (2, 10138, 'Iron Man 2', 'iron man 2', 200, 'matched'), \
+            (3, 68721, 'Iron Man 3', 'iron man 3', 300, 'matched');",
+    )
+    .unwrap();
+
+    // Ask (as if for Iron Man, id 1) for recs [68721 (IM3), 10138 (IM2), 999999 (not owned)].
+    // Result: the two owned movies, in that order; the not-owned id and the excluded self drop.
+    let cards = queries::movies_by_tmdb_ids(&conn, &[68721, 10138, 999999], 1, 12).unwrap();
+    let ids: Vec<i64> = cards.iter().map(|c| c.id).collect();
+    assert_eq!(ids, vec![3, 2], "owned recs in provider order, self & not-owned excluded");
+
+    // `limit` bounds the list.
+    let one = queries::movies_by_tmdb_ids(&conn, &[68721, 10138], 1, 1).unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!(one[0].id, 3);
+
+    // Empty input → empty (no query).
+    assert!(queries::movies_by_tmdb_ids(&conn, &[], 1, 12).unwrap().is_empty());
+}

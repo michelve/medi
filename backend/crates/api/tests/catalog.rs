@@ -774,6 +774,43 @@ async fn movie_detail_returns_collection_and_siblings() {
     assert_eq!(siblings.len(), 1);
     assert_eq!(siblings[0]["id"], 40);
     assert_eq!(siblings[0]["title"], "Thor");
+    // A non-empty Collection row suppresses the "More like this" fallback.
+    assert_eq!(json["more_like_this"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn movie_detail_more_like_this_is_present_and_empty_without_provider() {
+    // A standalone matched movie (no collection) with no metadata provider configured returns
+    // the `more_like_this` key as an empty array — the recommendations fallback degrades
+    // gracefully (no 500) when no provider can be queried.
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = AppConfig::default();
+    config.config_dir = dir.path().to_path_buf();
+    let db = medi_db::open(config.db_path(), 4).unwrap();
+    {
+        let conn = db.conn().unwrap();
+        conn.execute_batch(
+            "INSERT INTO movies (id, tmdb_id, title, sort_title, year, added_at, metadata_state) \
+                VALUES (50, 12345, 'Interstellar', 'interstellar', 2014, 700, 'matched');",
+        )
+        .unwrap();
+    }
+    let caps = medi_transcode::HwCaps::software_only();
+    let transcode = medi_transcode::SessionManager::new(dir.path().join("hls"), 2, caps.clone());
+    // AppState::new leaves `enrich = None` (no provider) → recommendations are skipped.
+    let state = AppState::new(db, ResponseCache::new(64), config, transcode, caps);
+    let app = router(state);
+
+    let resp = app
+        .oneshot(Request::get("/api/movies/12345").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json["collection"].is_null(), "standalone movie has no collection");
+    assert_eq!(json["collection_movies"].as_array().unwrap().len(), 0);
+    // The key exists and is an (empty) array — never absent, never a 500.
+    assert_eq!(json["more_like_this"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

@@ -65,6 +65,7 @@ export function MovieDetailPage() {
   const trailers = movie.trailers ?? [];
   const credits = movie.credits ?? [];
   const collectionMovies = movie.collection_movies ?? [];
+  const moreLikeThis = movie.more_like_this ?? [];
   const mediaFiles = movie.media_files ?? [];
   // The best copy drives the banner Play button + the runtime (a movie may carry several
   // files at different resolutions; `pickBestFile` picks the highest quality).
@@ -187,18 +188,37 @@ export function MovieDetailPage() {
           minWidth: 0,
         }}
       >
-        {movie.collection && collectionMovies.length > 0 && (
-          <CategoryRow
-            captionless
-            row={{
-              key: `collection:${movie.collection.id}`,
-              title: movie.collection.name,
-              items: collectionMovies,
-            }}
-          />
-        )}
-
-        <SuggestedRow credits={credits} excludeKind="movie" excludeId={movie.id} captionless />
+        {(() => {
+          // Precedence for the "related" row above the cast:
+          //   1. Collection — the movie's franchise siblings you own (e.g. Iron Man 1/2/3).
+          //   2. More like this — provider recommendations filtered to your library, shown
+          //      only when there is no collection row (the backend already gates this).
+          //   3. You might also like — the cast/director-derived last-resort fallback.
+          const hasCollectionRow = Boolean(movie.collection) && collectionMovies.length > 0;
+          if (hasCollectionRow) {
+            return (
+              <CategoryRow
+                captionless
+                row={{
+                  key: `collection:${movie.collection!.id}`,
+                  title: movie.collection!.name,
+                  items: collectionMovies,
+                }}
+              />
+            );
+          }
+          if (moreLikeThis.length > 0) {
+            return (
+              <CategoryRow
+                captionless
+                row={{ key: `more-like-this:${movie.id}`, title: 'More like this', items: moreLikeThis }}
+              />
+            );
+          }
+          return (
+            <SuggestedRow credits={credits} excludeKind="movie" excludeId={movie.id} captionless />
+          );
+        })()}
 
         <CreditsList credits={credits} />
 
